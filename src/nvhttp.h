@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,10 @@
 
 // local includes
 #include "crypto.h"
+
+namespace rtsp_stream {
+  struct launch_session_t;
+}
 
 /**
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
@@ -88,9 +93,22 @@ namespace nvhttp {
   void setup(const std::string &pkey, const std::string &cert);
 
   /**
+   * @brief Paired identity authenticated by one TLS connection.
+   */
+  struct verified_client_t {
+    std::string uuid;  ///< Persistent pairing UUID, independent of client-supplied query identifiers.
+    std::string cert;  ///< Canonical PEM of the exact authenticated client certificate.
+    std::string name;  ///< Friendly client name recorded during pairing.
+  };
+
+  /**
    * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.
    */
   class SunshineHTTPS: public SimpleWeb::HTTPS {
+    friend class SimpleWeb::Server<SunshineHTTPS>;
+
+    std::optional<verified_client_t> verified_client;  ///< Immutable handshake identity shared by every request on this connection.
+
   public:
     /**
      * @brief Construct an HTTPS connection using Sunshine's TLS context.
@@ -109,6 +127,58 @@ namespace nvhttp {
     }
   };
 
+}  // namespace nvhttp
+
+namespace SimpleWeb {
+  /**
+   * @brief Sunshine HTTPS server with connection-bound client authentication.
+   * @details Specialization grants access to each request's connection, including keepalive requests.
+   */
+  template<>
+  class Server<nvhttp::SunshineHTTPS>: public ServerBase<nvhttp::SunshineHTTPS> {
+  public:
+    /**
+     * @brief Load the server certificate and private key using Sunshine's TLS policy.
+     * @param certification_file Path to the server certificate PEM file.
+     * @param private_key_file Path to the matching private key PEM file.
+     */
+    Server(const std::string &certification_file, const std::string &private_key_file);
+
+    /**
+     * @brief Copy the original authenticated identity associated with a request's TLS connection.
+     * @param request Request whose connection carries the handshake identity.
+     * @return Handshake identity, or no value for a missing, expired or unauthenticated connection.
+     * @note Callers must revalidate the original pairing against current authorization state.
+     */
+    static std::optional<nvhttp::verified_client_t> connection_identity(const std::shared_ptr<Request> &request);
+
+    std::function<std::optional<nvhttp::verified_client_t>(SSL *)> verify;  ///< Returns the exact paired identity after a successful TLS handshake.
+    std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Pairing challenge handler for failed client authorization.
+
+  protected:
+    boost::asio::ssl::context context {boost::asio::ssl::context::tls_server};  ///< Server credentials and TLS protocol policy.
+
+    /**
+     * @brief Request a client certificate while allowing an HTTP authorization error.
+     */
+    void after_bind() override;
+
+    /**
+     * @brief Bind the verified identity and begin reading under the caller's lifetime guard.
+     * @param session Session whose TLS handshake has completed.
+     * @param ec Result of the asynchronous TLS handshake.
+     * @pre The caller holds the session's handler scope guard.
+     */
+    void handle_handshake(const std::shared_ptr<Session> &session, const error_code &ec);
+
+    /**
+     * @brief Accept the next connection while retaining callback lifetime guards.
+     */
+    void accept() override;
+  };
+}  // namespace SimpleWeb
+
+namespace nvhttp {
   /**
    * @brief Enumerates supported pAIR PHASE options.
    */
@@ -398,13 +468,35 @@ namespace nvhttp {
      * @param certificate_file Path to the server certificate PEM file.
      * @param private_key_file Path to the matching private key PEM file.
      * @param handler_scope Receives the scope runner that prevents destruction during callbacks.
+     * @param authenticate_clients Whether to configure production paired-client authorization.
      * @return HTTPS server ready for test endpoint configuration.
      */
-    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_https_server(
+    std::unique_ptr<SimpleWeb::Server<SunshineHTTPS>> make_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,
-      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope
+      std::shared_ptr<SimpleWeb::ScopeRunner> &handler_scope,
+      bool authenticate_clients = false
     );
+
+    /**
+     * @brief Register a test endpoint through the production per-request authorization wrapper.
+     * @param server Server that will dispatch the request.
+     * @param path Resource regular expression for the endpoint.
+     * @param handler Handler receiving the request's currently authorized paired identity.
+     */
+    void set_authenticated_handler(
+      SimpleWeb::ServerBase<SunshineHTTPS> &server,
+      const std::string &path,
+      std::function<void(std::shared_ptr<SimpleWeb::ServerBase<SunshineHTTPS>::Response>, std::shared_ptr<SimpleWeb::ServerBase<SunshineHTTPS>::Request>, const verified_client_t &)> handler
+    );
+
+    /**
+     * @brief Construct production launch metadata for an authenticated test request.
+     * @param identity Verified identity supplied by the production authorization wrapper.
+     * @param args Protocol query arguments, including the untrusted uniqueid value.
+     * @return Launch metadata prepared for RTSP admission.
+     */
+    std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(const verified_client_t &identity, const SimpleWeb::CaseInsensitiveMultimap &args);
 
     /**
      * @brief Dispatch a plain-HTTP pairing request through the production handler.

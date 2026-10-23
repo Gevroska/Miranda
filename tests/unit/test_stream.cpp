@@ -18,6 +18,8 @@
 
 // local includes
 #include <src/network.h>
+#include <src/rtsp.h>
+#include <src/stream.h>
 
 namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
@@ -84,4 +86,25 @@ TEST(ControlPacketTests, AcceptsTypeAndPayload) {
   ASSERT_TRUE(message);
   EXPECT_EQ(message->first, 0x0206);
   EXPECT_EQ(message->second, "abc");
+}
+
+/**
+ * @brief Stream allocation retains authenticated pairing metadata independently of protocol uniqueid.
+ */
+TEST(StreamSessionIdentityTests, AllocationRetainsAuthenticatedUuidAndCertificate) {
+  rtsp_stream::launch_session_t launch_session {};
+  launch_session.id = 42;
+  launch_session.gcm_key.resize(16);
+  launch_session.iv.resize(16);
+  launch_session.client_uuid = "authenticated-pairing-uuid";
+  launch_session.client_cert = "authenticated-paired-certificate";
+  launch_session.unique_id = "forged-protocol-client";
+  stream::config_t config {};
+
+  const auto session = stream::session::alloc(config, launch_session);
+
+  ASSERT_NE(session, nullptr);
+  EXPECT_EQ(stream::session::client_uuid(*session), launch_session.client_uuid);
+  EXPECT_EQ(stream::session::client_cert(*session), launch_session.client_cert);
+  EXPECT_NE(stream::session::client_uuid(*session), launch_session.unique_id);
 }

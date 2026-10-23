@@ -564,6 +564,7 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    std::string client_uuid;  ///< Persistent UUID of the authenticated pairing owning the stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
@@ -2201,6 +2202,13 @@ namespace stream {
     }
 
     /**
+     * @brief Return the authenticated paired-client UUID for this session.
+     */
+    const std::string &client_uuid(session_t &session) {
+      return session.client_uuid;
+    }
+
+    /**
      * @brief Return the paired client certificate for this session.
      */
     const std::string &client_cert(session_t &session) {
@@ -2327,6 +2335,7 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->client_uuid = launch_session.client_uuid;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
