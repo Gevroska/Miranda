@@ -29,10 +29,13 @@ The Web UI documentation/shortcut regression originally failed with Windows CRLF
 | Web UI build | P0 candidate | Pass | Native Windows Node.js 24.22.1; `npm ci --ignore-scripts` and `npm run build`. |
 | Web UI tests | P0 candidate with line-ending correction | Pass | `npm test`: 12 files, 213 tests. These are component tests, not client interoperability. |
 | Workflow syntax/source | CI candidate | Pass; independently reviewed | actionlint 1.7.12 and yamllint 1.38.0; local actionlint excludes unavailable ShellCheck/Pyflakes subprocesses. No hosted execution claimed. |
-| Native Windows build/test | P0 candidate | Pending | MSYS2 UCRT64 toolchain preparation underway; no native pass claimed. |
-| Hosted platform CI | P0 candidate | Not run | Exact-head results required after reviewed publication. |
+| Homebrew formula | P0 candidate | Template checks pass | Ruby 4.0.7 syntax, CMake 4.4.4 ON/OFF/unset expansions and 12 repository/flag cases. No installed Homebrew runtime claimed. |
+| Windows native configuration | P0 working candidate | Pass | MSYS2 UCRT64, GCC 16.2.0, CMake 4.4.4, static Qt 6.12.0; pinned FFmpeg asset checksum verified. Documentation and WiX packaging excluded locally; the installed .NET runtime has no SDK. |
+| Native Windows build/test | P0 candidate | Pending | Configuration is not compilation or test execution; no native pass claimed. |
+| Hosted platform CI | `9647c51a5c9a7cac2db050d3c3c540b4a7e6c179` | Corrections reviewed; full pass pending | Web UI tests/build and PowerShell passed. Missing issue-form document markers and npm publication dry-run version rejection are corrected for the next candidate. Windows ARM64 dependency installation failed on MSYS2 mirror low-speed timeouts; this is an environment failure, not a native test result. Other platform results remain pending. |
+| Local package assembly | Corrected P0 workflow | Pass | `npm pack --dry-run --json` checks local package contents without publication/version policy; 79 files including 76 built Web UI files. Package metadata/lockfile unchanged. |
 | Clean VM and physical streaming | No candidate qualified | Not run | VM preparation pending; no GPU, HDR, controller or stream acceptance claimed. |
 
 ## Delivery
 
-No Miranda feature, preview package or stable release is delivered by this record. P0 remains in progress until its build/test evidence and review are established. Next: complete native/hosted checks, resolve concrete baseline defects, then define the shared client/session ownership boundary before permission/display integration.
+The candidate is published in [draft PR #1](https://github.com/Gevroska/Miranda/pull/1); it is not merged. No Miranda feature, preview package or stable release is delivered by this record. P0 remains in progress until its build/test evidence and review are established. Next: complete native/hosted checks, resolve concrete baseline defects, then implement request-bound client identity before permission/display integration. DEC-44 confirms explicit administrator grants for every paired device; that policy is not implemented by this baseline.

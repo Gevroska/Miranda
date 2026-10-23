@@ -50,7 +50,7 @@ The file-upload/download bits `0x00040000` and `0x00080000` are reserved by Apol
 
 Server commands are also deferred: retain knowledge of their permission bit but do not grant or advertise a functioning command feature in the first release.
 
-Newly paired family/friend devices must start with no access until the owner grants permissions. Enforce this on the host for both client families, including clients that do not show Apollo's permission UI. Pairing is not itself a grant to list/launch applications, view, send input or access clipboard contents. Owner-device bootstrap remains an open policy detail.
+Every newly paired device, including the first owner device, must start with no access until an administrator grants permissions in the authenticated Web UI (DEC-21/DEC-44). Enforce this on the host for both client families, including clients that do not show Apollo's permission UI. Pairing is not itself a grant to list/launch applications, view, send input or access clipboard contents. Pairing order grants no owner authority.
 
 ## Shared video session contract
 

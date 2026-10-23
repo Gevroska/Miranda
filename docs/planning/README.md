@@ -26,7 +26,7 @@ The decision log takes precedence over proposed recommendations elsewhere. Unans
 
 The first release centers on Windows virtual displays, Artemis and Moonlight compatibility, per-device permissions, bidirectional text clipboard access, and Input Only mode. It also includes QR/one-time-code pairing, Artemis application launch shortcuts (links and `.art` files), custom app ordering, Web UI launch and per-app controller-type overrides. Application/settings migration is required; preserving existing pairings is not. New session automation and Artemis-triggered manual server commands are deferred. SudoVDA is the first driver to implement; VDD remains the sole comparison alternative.
 
-Native-display streaming must keep that display on. Virtual-display streaming offers Apollo-style choices for keeping physical displays active or disabling them. A second video client joins the existing session without changing its active display mode. New family/friend devices receive no access until permissions are granted.
+Native-display streaming must keep that display on. Virtual-display streaming offers Apollo-style choices for keeping physical displays active or disabling them. A second video client joins the existing session without changing its active display mode. Every newly paired device, including the first owner device, receives no access until an administrator explicitly grants permissions in the authenticated Web UI (DEC-44).
 
 Every shipped feature must be available without a paid license or subscription. Nonary/libvirtualgamepad is the selected Windows modern-controller driver; integration and runtime qualification remain to do. Available physical-controller testing covers Xbox One and Switch Pro through Android, Windows and Fedora clients.
 

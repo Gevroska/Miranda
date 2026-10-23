@@ -26,7 +26,7 @@ Updated: 2026-10-23. This file is the authoritative scope record. Confirmed mean
 | DEC-18 | Initial host: Windows 11 25H2 and RTX 3080. Available GPU testing covers recent NVIDIA models only. | Record exact Windows/GPU-driver builds during tests. Preserve inherited support for other vendors, but do not claim hardware validation. |
 | DEC-19 | Use the latest available Artemis and Moonlight clients, including Moonlight on Fedora and Windows. | Resolve and record exact client release/build versions per test campaign. The analyzed source snapshot is not a permanent client-version target. |
 | DEC-20 | Support all resolutions and varied refresh rates, with tests including 60, 120 and 165 Hz. | No small mode whitelist. Accept arbitrary valid requests within driver/GPU/codec/client capabilities and report unsupported combinations explicitly. Test rates are examples, not limits. |
-| DEC-21 | Newly paired family/friend devices get no access until permissions are explicitly granted. | Pairing alone grants no viewing, input, launch or clipboard access. The initial owner-device bootstrap remains a separate question. |
+| DEC-21 | Newly paired family/friend devices get no access until permissions are explicitly granted. | Pairing alone grants no viewing, input, launch or clipboard access. DEC-44 subsequently resolves the initial owner-device policy. |
 | DEC-22 | A second viewer must not change the active display mode. | Keep its resolution, refresh rate and HDR state while another client joins. Negotiate each stream within capabilities without reconfiguring the shared display. |
 | DEC-23 | Include QR/one-time-code pairing in the first release. | Implement the Apollo-compatible Artemis pairing flow and its UI, retaining standard PIN pairing. A successfully paired guest still has no access until permissions are granted. |
 | DEC-24 | Include Artemis application launch shortcuts in the first release. | Generate Artemis launch links and `.art` files using stable host/application identities; launches obey the paired client's permissions and current session policy. |
@@ -49,6 +49,7 @@ Updated: 2026-10-23. This file is the authoritative scope record. Confirmed mean
 | DEC-41 | Periodically integrate selected Sunshine revisions after testing. | Pin the initial Miranda baseline, review upstream changes and qualify deliberate updates. Do not continuously track untested upstream master or restrict updates to stable tags only. |
 | DEC-42 | The owner will prepare a clean Windows VM for implementation testing. | Begin with fresh-install validation; side-by-side Apollo installation is not a current test requirement. VM version, hypervisor, resources and exposed GPU remain test-environment metadata to collect. A planned VM is not an available or qualified environment yet. |
 | DEC-43 | Use Apollo's handling of Sunshine as the reference for Miranda's eventual installation transition. The owner leans toward replacement rather than a separate test installation. | Adopt an Apollo-like service handover direction, while defining Miranda's own identity and explicit application/settings migration. This does not authorize deleting existing installations or data during analysis, nor establish a fully specified automatic cross-product uninstaller. |
+| DEC-44 | On 2026-10-23, require an explicit permission grant in the authenticated Web UI for every paired device, including the first owner device. | Pairing order never grants authority. All newly paired devices remain blocked until an administrator grants rights; no automatic first-client owner bootstrap. |
 
 ## Resolved questions
 
@@ -56,6 +57,7 @@ Updated: 2026-10-23. This file is the authoritative scope record. Confirmed mean
 |---|---|
 | Q01: physical display behavior | DEC-16: native on; virtual user-selectable, with Apollo-style controls. |
 | Q02: second video client | DEC-17 and DEC-22: join the current session and preserve its active display mode. |
+| Q03: owner-device permission bootstrap | DEC-44: every paired device, including the first owner device, requires explicit rights granted in the authenticated Web UI. |
 | Q06: Moonlight support | DEC-19: required, including Fedora and Windows. |
 | Q07: test platform and versions | DEC-18 through DEC-20 settle host/GPU and client-version policy; exact build numbers and device models are test-run metadata still to collect. |
 | Q14: conflicting requests from a joining viewer | DEC-22: the active display mode wins. |
@@ -74,7 +76,6 @@ Updated: 2026-10-23. This file is the authoritative scope record. Confirmed mean
 
 | ID | Question | Current recommendation / dependency |
 |---|---|---|
-| Q03 | How is the owner's first device identified and granted permissions? | Guest defaults are settled by DEC-21. Proposed: explicit grant in the authenticated administration UI; Apollo's first-client-full rule is not selected. |
 | Q04 | In which later milestones should the remaining display/rendering conveniences land? | DEC-38 selects full coverage and DEC-39 keeps v1 focused. Use the queue below to settle behavior and delivery order. |
 | Q05 | Which Artemis Warp modes and fractional-rate cases should be certified first? | General high-rate support is confirmed, including 60/120/165 Hz test cases. Warp support is a long-term target; specific mode/hardware coverage needs a test plan. |
 | Q08 | Which physical/virtual display arrangements and HDR modes are used today? | Establish real mode/topology cases and migration expectations. |
@@ -83,14 +84,14 @@ Updated: 2026-10-23. This file is the authoritative scope record. Confirmed mean
 
 ## Remaining feature review queue
 
-DEC-38 selects all reference-project functionality over time; DEC-39 preserves the focused first release. The queue now records delivery order and behavioral details for the remaining features. Do not ask again whether to include each one. Owner bootstrap, migration and release policy need concrete choices before their affected work is finalized; they do not block starting the source/build baseline. See [the readiness assessment](05-implementation-plan.md#readiness-assessment).
+DEC-38 selects all reference-project functionality over time; DEC-39 preserves the focused first release. The queue now records delivery order and behavioral details for the remaining features. Do not ask again whether to include each one. DEC-44 resolves owner bootstrap. Remaining migration and release details need concrete choices before their affected work is finalized; they do not block starting the source/build baseline. See [the readiness assessment](05-implementation-plan.md#readiness-assessment).
 
 | Group | Remaining choices | Inventory references | Review status |
 |---|---|---|---|
 | Applications and controls | Manual commands from Artemis; custom app ordering; launch from Miranda's Web UI; controller type per application. | C03, L02, L03, L05 | Resolved by DEC-25 through DEC-30. The [controller review](08-free-controller-feasibility.md) tracks Nonary integration and hardware qualification. |
 | Display preferences | Optional bottom-right virtual-display isolation. | D12 (isolation only) | Later target. Define placement/interaction behavior; existing v1 topology controls remain required. |
 | Advanced rendering | Render at a different resolution from the stream; double display refresh rate; additional scaled modes/color-depth options; specific Artemis Warp modes. | D08, D10, D11, V02 | Later targets. Define priority and hardware/client coverage; general v1 mode/HDR interoperability remains required. |
-| Pairing and administration | Owner-device permission bootstrap; switch to disable new pairings; dedicated/remembered Web UI login; individual tray, quit and discovery controls. | A04 (owner bootstrap only), A05, A07, V09 | Additional controls are later targets. Owner bootstrap remains a v1 behavioral decision; guest defaults and QR/OTP are settled. |
+| Pairing and administration | Switch to disable new pairings; dedicated/remembered Web UI login; individual tray, quit and discovery controls. | A05, A07, V09 | Additional controls are later targets. A04 owner bootstrap is settled for v1 by DEC-44; guest defaults and QR/OTP are also settled. |
 | Audio, feedback and migration compatibility | Additional audio recapture/default-output controls; host rumble forwarding switch; extra environment variables. | V07, L06, C07 | Later targets, with existing Sunshine behavior preserved. Required migration handling remains v1 work even when execution support is deferred. |
 | Experimental/diagnostic options | Encoder-probe bypass and Apollo's GPU-priority experiment. | D16, V06 | Later targets subject to qualification. Keep experimental behavior explicitly optional; measure effects before exposing production defaults. |
 

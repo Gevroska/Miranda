@@ -44,8 +44,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Publish (dry run)
-        run: npm publish --dry-run
+      - name: Validate package contents
+        run: npm pack --dry-run --json
 
       - name: Upload coverage artifact
         if: >-
