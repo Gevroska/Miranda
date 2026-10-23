@@ -34,4 +34,4 @@ Independent review of the seven source/test files found no actionable defect. Re
 
 ## Delivery
 
-The candidate is unintegrated and unpublished. Native evidence applies to the reviewed source/test manifest; bringing forward the CI/documentation-only base correction does not change those files. Next: publish the bounded candidate for applicable platform validation. This work item does not deliver device permission enforcement, a preview or a stable release.
+The candidate is published as [draft PR #2](https://github.com/Gevroska/Miranda/pull/2), dependent on the unmerged P0 baseline. Native evidence applies to the reviewed source/test manifest; bringing forward the CI/documentation-only base correction does not change those files. Applicable platform validation remains pending. This work item does not deliver device permission enforcement, a preview or a stable release.

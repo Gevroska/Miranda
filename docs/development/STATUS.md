@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated: 2026-10-23. Candidate: [draft PR #1](https://github.com/Gevroska/Miranda/pull/1), branch `codex/p0-baseline`, based on `d0b4a88ef727f8dabf80cc970a14739b55c885de`. Upstream functionality is not counted as a Miranda feature implementation.
+Updated: 2026-10-23. Candidates: [P0 baseline PR #1](https://github.com/Gevroska/Miranda/pull/1) and dependent [P1a identity PR #2](https://github.com/Gevroska/Miranda/pull/2), both draft and unmerged. The foundation is `d0b4a88ef727f8dabf80cc970a14739b55c885de`. Upstream functionality is not counted as a Miranda feature implementation.
 
 | Work | State | Evidence / next action |
 |---|---|---|
