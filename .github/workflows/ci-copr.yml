@@ -18,11 +18,13 @@ on:
 
 jobs:
   call-copr-ci:
+    # P0: upstream integration is inactive in Miranda until its destination is reviewed.
+    if: github.repository == 'LizardByte/Sunshine'
     permissions:
       contents: read
-    uses: LizardByte/copr-ci/.github/workflows/copr-ci.yml@master
+    uses: LizardByte/copr-ci/.github/workflows/copr-ci.yml@b0512664b4a797d3d7a5b3bfc479941231c605b7
     with:
-      copr_pr_webhook_token: "05fc9b07-a19b-4f83-89b2-ae1e7e0b5282"
+      copr_pr_webhook_token: ''  # Reconfigure only with an audited Miranda Copr destination.
       github_org_owner: LizardByte
       copr_ownername: lizardbyte
       auto_update_package: true
@@ -36,7 +38,7 @@ jobs:
     name: Release
     if:
       github.event_name == 'release' &&
-      startsWith(github.repository, 'LizardByte/') &&
+      github.repository == 'LizardByte/Sunshine' &&
       github.event.release.prerelease == true
     needs:
       - call-copr-ci

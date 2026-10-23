@@ -66,7 +66,7 @@ jobs:
     steps:
       - name: Install Apple certificate
         uses: apple-actions/import-codesign-certs@77ba2a2a8f5cfc8c405ebf3159f767c323e238f9  # v7.1.0
-        if: inputs.publish_release == 'true'
+        if: github.repository == 'LizardByte/Sunshine' && inputs.publish_release == 'true'
         with:
           p12-file-base64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
           p12-password: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_CERTIFICATE_P12_PASSWORD }}
@@ -74,6 +74,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Select Xcode 16.2
@@ -98,7 +99,7 @@ jobs:
             qtsvg
 
       - name: Configure macOS screen recording
-        uses: LizardByte/tray/.github/actions/configure-macos-screen-recording@master
+        uses: LizardByte/tray/.github/actions/configure-macos-screen-recording@8d49be1f9ea1a5cb40668e8651cf02300abd4b49
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -157,7 +158,7 @@ jobs:
         env:
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
           MATRIX_NAME: ${{ matrix.name }}
-          SHOULD_SIGN: ${{ inputs.publish_release }}
+          SHOULD_SIGN: ${{ github.repository == 'LizardByte/Sunshine' && inputs.publish_release == 'true' }}
         run: |
           # build DMG and sign everything (see cmake/packaging/macos.cmake)
           # cpack can rarely fail with "hdiutil: create failed - Resource busy"
@@ -175,7 +176,7 @@ jobs:
 
       - name: Submit for notarization
         id: notarize_submit
-        if: inputs.publish_release == 'true'
+        if: github.repository == 'LizardByte/Sunshine' && inputs.publish_release == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -260,7 +261,7 @@ jobs:
   notarize_dmg:
     name: Notarize ${{ matrix.name }}
     needs: build_dmg
-    if: inputs.publish_release == 'true'
+    if: github.repository == 'LizardByte/Sunshine' && inputs.publish_release == 'true'
     permissions:
       contents: read
     runs-on: ${{ matrix.os }}

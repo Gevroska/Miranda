@@ -14,9 +14,11 @@ on:
 
 jobs:
   localize:
+    # P0: upstream integration is inactive in Miranda until its destination is reviewed.
+    if: github.repository == 'LizardByte/Sunshine'
     name: Update Localization
     permissions:
       contents: read
-    uses: LizardByte/lizardbyte-common/.github/workflows/localize.yml@master
+    uses: LizardByte/lizardbyte-common/.github/workflows/localize.yml@cdc291c8e844741365582262f5d64b5378d75134
     secrets:
       GH_TOKEN: ${{ secrets.GH_BOT_TOKEN }}

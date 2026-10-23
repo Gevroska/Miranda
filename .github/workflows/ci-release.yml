@@ -17,16 +17,18 @@ jobs:
     name: NPM
     if: >-
       github.event.action == 'released' &&
-      github.repository_owner == 'LizardByte'
+      github.repository == 'LizardByte/Sunshine'
     permissions:
       contents: read
       id-token: write  # required for provenance and OIDC
       packages: write
-    uses: LizardByte/.github/.github/workflows/__call-update-npm.yml@master
+    uses: LizardByte/.github/.github/workflows/__call-update-npm.yml@e5b768985d9c5addc082bda9a1274ab064cbf0d9
     with:
       release_version: ${{ github.event.release.tag_name }}
 
   copr:
+    # P0: upstream integration is inactive in Miranda until its destination is reviewed.
+    if: github.repository == 'LizardByte/Sunshine'
     name: Copr
     permissions:
       contents: write  # needed to update releases
@@ -39,7 +41,7 @@ jobs:
 
   cloudsmith:
     name: Cloudsmith
-    if: startsWith(github.repository, 'LizardByte/')
+    if: github.repository == 'LizardByte/Sunshine'
     needs: copr
     permissions:
       contents: read

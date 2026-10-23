@@ -1,7 +1,6 @@
 ---
-# This workflow is centrally managed in https://github.com/LizardByte/.github/
-# Don't make changes to this file in this repo as they will be overwritten with changes made to the same file in
-# the above-mentioned repo.
+# Inherited from LizardByte/.github; maintained locally for Miranda.
+# Upstream publication integrations remain restricted to their original repository.
 
 name: Update changelog
 permissions: {}
@@ -21,9 +20,9 @@ concurrency:
 jobs:
   update-changelog:
     name: Update Changelog
-    uses: LizardByte/.github/.github/workflows/__call-update-changelog.yml@master
+    uses: LizardByte/.github/.github/workflows/__call-update-changelog.yml@e5b768985d9c5addc082bda9a1274ab064cbf0d9
     if: >-
-      github.repository_owner == 'LizardByte' &&
+      github.repository == 'LizardByte/Sunshine' &&
       (github.event_name == 'workflow_dispatch' ||
       (!github.event.release.prerelease && !github.event.release.draft))
     permissions:

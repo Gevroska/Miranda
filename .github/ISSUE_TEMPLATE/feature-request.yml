@@ -1,0 +1,22 @@
+---
+name: Feature request
+description: Propose behavior or clarify a planned capability.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the user scenario and the problem to solve.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Clients, host and existing behavior
+      description: Link a roadmap item if this is already planned.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: What would success look like?
+      description: Include compatibility or accessibility requirements that matter.

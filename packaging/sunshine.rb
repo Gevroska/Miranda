@@ -16,6 +16,9 @@ class Sunshine < Formula
   TEST_BINARY = "test_sunshine".freeze
   TEST_RESULTS_XML = "tests/test_results.xml".freeze
   IS_UPSTREAM_REPO = ENV.fetch("GITHUB_REPOSITORY", "") == "LizardByte/Sunshine"
+  # Bake the CI opt-in into the formula so test-bot environment filtering cannot disable its fixtures.
+  MIRANDA_HOMEBREW_VALIDATION = "@MIRANDA_HOMEBREW_VALIDATION@".freeze
+  BUILD_VALIDATION_TESTS = (IS_UPSTREAM_REPO || MIRANDA_HOMEBREW_VALIDATION == "ON").freeze
 
   desc "@PROJECT_DESCRIPTION@"
   homepage "@PROJECT_HOMEPAGE_URL@"
@@ -52,7 +55,7 @@ class Sunshine < Formula
   option "without-static-boost", "Disable static link of Boost libraries" # default option
 
   # Keep coverage instrumentation in the test binary after test-bot rebuilds the formula from its bottle.
-  skip_clean "bin/#{TEST_BINARY}" if IS_UPSTREAM_REPO
+  skip_clean "bin/#{TEST_BINARY}" if BUILD_VALIDATION_TESTS
 
   depends_on "cmake" => :build
   depends_on "doxygen" => :build if build.with? "docs"
@@ -193,7 +196,7 @@ class Sunshine < Formula
   end
 
   def add_test_args(args)
-    if IS_UPSTREAM_REPO
+    if BUILD_VALIDATION_TESTS
       args << "-DBUILD_TESTS=ON"
       test_runtime = opt_libexec/"tests"
       args << "-DSUNSHINE_TEST_SOURCE_DIR=#{test_runtime}"
@@ -426,7 +429,7 @@ class Sunshine < Formula
 
   def collect_test_artifacts
     artifact_dir = release_homebrew_testpath
-    return unless IS_UPSTREAM_REPO
+    return unless BUILD_VALIDATION_TESTS
     return unless artifact_dir
 
     coverage_buildpath = OS.mac? ? buildpath.realpath : HOMEBREW_TEMP/"coverage"
@@ -453,7 +456,7 @@ class Sunshine < Formula
   end
 
   def install_platform_specific_files
-    if IS_UPSTREAM_REPO
+    if BUILD_VALIDATION_TESTS
       bin.install "build/tests/#{TEST_BINARY}"
 
       test_runtime = libexec/"tests"
@@ -550,7 +553,7 @@ class Sunshine < Formula
       assert_path_exists lib/"modules-load.d/60-sunshine.conf"
     end
 
-    if IS_UPSTREAM_REPO
+    if BUILD_VALIDATION_TESTS
       artifact_dir = release_homebrew_testpath
       if artifact_dir
         coverage_buildpath = artifact_dir/COVERAGE_BUILDPATH_FILE

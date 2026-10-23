@@ -1,7 +1,6 @@
 ---
-# This workflow is centrally managed in https://github.com/LizardByte/.github/
-# Don't make changes to this file in this repo as they will be overwritten with changes made to the same file in
-# the above-mentioned repo.
+# Inherited from LizardByte/.github; maintained locally for Miranda.
+# Upstream publication integrations remain restricted to their original repository.
 
 # To use, add the `rtd` repository label to identify repositories that should trigger this workflow.
 # If the project slug is not the repository name, add a repository variable named `READTHEDOCS_SLUG` with the value of
@@ -26,8 +25,8 @@ concurrency:
 jobs:
   update-docs:
     name: Update docs
-    uses: LizardByte/.github/.github/workflows/__call-update-docs.yml@master
-    if: github.repository_owner == 'LizardByte'
+    uses: LizardByte/.github/.github/workflows/__call-update-docs.yml@e5b768985d9c5addc082bda9a1274ab064cbf0d9
+    if: github.repository == 'LizardByte/Sunshine'
     permissions: {}
     with:
       readthedocs_slug: ${{ vars.READTHEDOCS_SLUG }}

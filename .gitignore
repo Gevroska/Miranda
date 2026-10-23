@@ -61,3 +61,10 @@ junit.xml
 *.pyc
 .venv/
 venv/
+
+# Local working material
+.local/
+.codex/
+cmake-build-*/
+.venv/
+__pycache__/
