@@ -12,6 +12,7 @@ permissions: {}
 jobs:
   publish:
     if: >-
+      github.repository == 'LizardByte/Sunshine' &&
       github.event.workflow_run.event == 'pull_request' &&
       (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
     permissions:

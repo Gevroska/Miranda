@@ -59,8 +59,9 @@ describe('externally managed audio configuration', () => {
     wrapper.unmount()
   })
 
-  it('provides the standard documentation table and a working configuration shortcut', () => {
-    const section = configDocumentation.split('### external_audio\n')[1].split('\n### ')[0]
+  it.each(['\n', '\r\n'])('provides the standard documentation table and a working configuration shortcut with %j line endings', newline => {
+    const documentation = configDocumentation.replace(/\r?\n/g, newline)
+    const section = documentation.split(/### external_audio\r?\n/)[1].split(/\r?\n### /)[0]
     // Doxygen emits configuration headings as h2 and gives tables this class.
     document.body.innerHTML = '<input id="host-authority" value="localhost:47990">'
       + '<h2>external_audio</h2>' + section.replace('<table>', '<table class="doxtable">')

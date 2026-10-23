@@ -15,12 +15,16 @@ concurrency:
 
 jobs:
   prep:
+    # P0: upstream integration is inactive in Miranda until its destination is reviewed.
+    if: github.repository == 'LizardByte/Sunshine'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
@@ -32,10 +36,12 @@ jobs:
           retention-days: 1
 
   call-jekyll-build:
+    # P0: upstream integration is inactive in Miranda until its destination is reviewed.
+    if: github.repository == 'LizardByte/Sunshine'
     needs: prep
     permissions:
       contents: read
-    uses: LizardByte/LizardByte.github.io/.github/workflows/jekyll-build.yml@master
+    uses: LizardByte/LizardByte.github.io/.github/workflows/jekyll-build.yml@3134cab07d38a7e59871cc3de2ac9eedd79dc526
     secrets:
       GH_BOT_EMAIL: ${{ secrets.GH_BOT_EMAIL }}
       GH_BOT_TOKEN: ${{ secrets.GH_BOT_TOKEN }}

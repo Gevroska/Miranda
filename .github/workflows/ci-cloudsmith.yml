@@ -19,6 +19,8 @@ on:
 
 jobs:
   cloudsmith:
+    # P0: upstream integration is inactive in Miranda until its destination is reviewed.
+    if: github.repository == 'LizardByte/Sunshine'
     name: Cloudsmith
     permissions:
       contents: read

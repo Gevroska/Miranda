@@ -11,13 +11,16 @@ permissions: {}
 
 jobs:
   publish:
-    if: github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
+    # P0: artifacts remain available on the CI run; branch/comment publishing is upstream-only.
+    if: >-
+      github.repository == 'LizardByte/Sunshine' &&
+      (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')
     permissions:
       actions: read
       contents: write
       pull-requests: write
       statuses: write
-    uses: LizardByte/tray/.github/workflows/_publish-screenshots.yml@master
+    uses: LizardByte/tray/.github/workflows/_publish-screenshots.yml@8d49be1f9ea1a5cb40668e8651cf02300abd4b49
     with:
       artifact-name-prefix: sunshine-screenshots-
       source-run-id: ${{ github.event.workflow_run.id }}

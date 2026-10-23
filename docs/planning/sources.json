@@ -1,0 +1,702 @@
+{
+  "observed_date": "2026-10-23",
+  "timezone": "Europe/Paris",
+  "analysis_kind": "Functional source comparison and project planning; runtime validation not performed",
+  "repositories": {
+    "miranda": {
+      "repository": "Gevroska/Miranda",
+      "ref": "master",
+      "commit": "d0b4a88ef727f8dabf80cc970a14739b55c885de"
+    },
+    "sunshine": {
+      "repository": "LizardByte/Sunshine",
+      "ref": "master",
+      "commit": "d0b4a88ef727f8dabf80cc970a14739b55c885de"
+    },
+    "apollo": {
+      "repository": "ClassicOldSong/Apollo",
+      "ref": "master",
+      "commit": "adc5c5a0bd80831ce495434bb16aee2cd4175fb8"
+    },
+    "artemis": {
+      "repository": "ClassicOldSong/moonlight-android",
+      "ref": "moonlight-noir",
+      "commit": "c5cf27f4dc822db0e863c4691e7a70c74bea977a"
+    },
+    "sudovda": {
+      "repository": "SudoMaker/SudoVDA",
+      "ref": "master",
+      "commit": "a4b09fa2aa731a964d0cb5d139cb1e6240e4da12"
+    },
+    "vdd": {
+      "repository": "VirtualDrivers/Virtual-Display-Driver",
+      "ref": "master",
+      "commit": "d7244969b2aa8bb38e76d79505eda217996cefea"
+    },
+    "libvirtualhid": {
+      "repository": "LizardByte/libvirtualhid",
+      "ref": "Miranda pinned submodule",
+      "commit": "dfff3ea8c34022c915799740806c17c0ed5c2492"
+    },
+    "libvirtualgamepad": {
+      "repository": "Nonary/libvirtualgamepad",
+      "ref": "main",
+      "commit": "998deebd15d0991562dec812dc62c52853463779"
+    },
+    "hidmaestro": {
+      "repository": "hifihedgehog/HIDMaestro",
+      "ref": "v2.0.3",
+      "commit": "63cc6481f9e82fc8600bda8aaa65cb3271113a19"
+    },
+    "vibepollo": {
+      "repository": "Nonary/Vibepollo",
+      "ref": "master",
+      "commit": "8a753af16dcf1d752781ef4e6350da6146553e55"
+    },
+    "vibeshine": {
+      "repository": "Nonary/vibeshine",
+      "ref": "master",
+      "commit": "af1a0842048584af90308d86b2a12acb20c5ad1b"
+    },
+    "vibeshine_canary": {
+      "repository": "Nonary/vibeshine",
+      "ref": "refs/heads/canary",
+      "commit": "abd0b8aa79fd4fcfe08838a91caa030898d5f788"
+    },
+    "libvirtualgamepad_host_pin": {
+      "repository": "Nonary/libvirtualgamepad",
+      "ref": "Shared Vibepollo/Vibeshine master dependency",
+      "commit": "7b000a2b060b4daeb0b5c6aa7b77ae1d81857e7a"
+    }
+  },
+  "comparison": {
+    "merge_base": "1a96d135140ddfe5255516971c88f112b9da5beb",
+    "sunshine_unique_commits": 874,
+    "apollo_unique_commits": 457,
+    "apollo_unique_non_merge_commits": 389,
+    "apollo_changed_paths_from_merge_base": 218,
+    "sunshine_changed_paths_from_merge_base": 551,
+    "apollo_changed_test_paths_from_merge_base": 0
+  },
+  "source_paths": {
+    "A-DISPLAY": [
+      "apollo",
+      "src/platform/windows/virtual_display.cpp"
+    ],
+    "A-DISPLAY-OPTIONS": [
+      "apollo",
+      "src_assets/common/assets/web/configs/tabs/audiovideo/DisplayDeviceOptions.vue"
+    ],
+    "A-PROCESS": [
+      "apollo",
+      "src/process.cpp"
+    ],
+    "A-MAIN": [
+      "apollo",
+      "src/main.cpp"
+    ],
+    "A-NVHTTP": [
+      "apollo",
+      "src/nvhttp.cpp"
+    ],
+    "A-CRYPTO": [
+      "apollo",
+      "src/crypto.h"
+    ],
+    "A-CONFIG": [
+      "apollo",
+      "src/config.cpp"
+    ],
+    "A-INPUT": [
+      "apollo",
+      "src/input.cpp"
+    ],
+    "A-STREAM": [
+      "apollo",
+      "src/stream.cpp"
+    ],
+    "A-CONFIGHTTP": [
+      "apollo",
+      "src/confighttp.cpp"
+    ],
+    "A-CLIPBOARD": [
+      "apollo",
+      "src/platform/windows/misc.cpp"
+    ],
+    "A-PIN": [
+      "apollo",
+      "src_assets/common/assets/web/pin.html"
+    ],
+    "A-APPS": [
+      "apollo",
+      "src_assets/common/assets/web/apps.html"
+    ],
+    "A-ZWPAD": [
+      "apollo",
+      "src/zwpad.h"
+    ],
+    "A-WININPUT": [
+      "apollo",
+      "src/platform/windows/input.cpp"
+    ],
+    "A-RTSP": [
+      "apollo",
+      "src/rtsp.cpp"
+    ],
+    "A-VIDEO": [
+      "apollo",
+      "src/video.cpp"
+    ],
+    "A-WGC": [
+      "apollo",
+      "src/platform/windows/display_wgc.cpp"
+    ],
+    "A-NVENC": [
+      "apollo",
+      "src/nvenc/nvenc_base.cpp"
+    ],
+    "A-WINCAPTURE": [
+      "apollo",
+      "src/platform/windows/display_base.cpp"
+    ],
+    "A-AUDIO": [
+      "apollo",
+      "src/audio.cpp"
+    ],
+    "A-LOGGING": [
+      "apollo",
+      "src/logging.cpp"
+    ],
+    "A-TRAY": [
+      "apollo",
+      "src/system_tray.cpp"
+    ],
+    "A-SUDOAPI": [
+      "apollo",
+      "third-party/sudovda/sudovda.h"
+    ],
+    "A-DRIVER-INSTALL": [
+      "apollo",
+      "src_assets/windows/drivers/sudovda/install.bat"
+    ],
+    "A-PACKAGING": [
+      "apollo",
+      "cmake/packaging/windows_nsis.cmake"
+    ],
+    "A-LINUX-CLIPBOARD": [
+      "apollo",
+      "src/platform/linux/misc.cpp"
+    ],
+    "A-MAC-CLIPBOARD": [
+      "apollo",
+      "src/platform/macos/misc.mm"
+    ],
+    "S-DISPLAY": [
+      "miranda",
+      "src/display_device.cpp"
+    ],
+    "S-NVHTTP": [
+      "miranda",
+      "src/nvhttp.cpp"
+    ],
+    "S-CONFIGHTTP": [
+      "miranda",
+      "src/confighttp.cpp"
+    ],
+    "S-CONFIG": [
+      "miranda",
+      "src/config.h"
+    ],
+    "S-STREAM": [
+      "miranda",
+      "src/stream.cpp"
+    ],
+    "S-VIDEO": [
+      "miranda",
+      "src/video.cpp"
+    ],
+    "S-RTSP": [
+      "miranda",
+      "src/rtsp.cpp"
+    ],
+    "S-WGC": [
+      "miranda",
+      "src/platform/windows/display_wgc.cpp"
+    ],
+    "S-NVENC": [
+      "miranda",
+      "src/nvenc/nvenc_base.cpp"
+    ],
+    "S-WINCAPTURE": [
+      "miranda",
+      "src/platform/windows/display_base.cpp"
+    ],
+    "S-WININPUT": [
+      "miranda",
+      "src/platform/windows/input.cpp"
+    ],
+    "S-AUDIO": [
+      "miranda",
+      "src/platform/windows/audio.cpp"
+    ],
+    "S-LOGGING": [
+      "miranda",
+      "src/logging.cpp"
+    ],
+    "S-AGENTS": [
+      "miranda",
+      "AGENTS.md"
+    ],
+    "T-HTTP": [
+      "artemis",
+      "app/src/main/java/com/limelight/nvstream/http/NvHTTP.java"
+    ],
+    "T-DETAILS": [
+      "artemis",
+      "app/src/main/java/com/limelight/nvstream/http/ComputerDetails.java"
+    ],
+    "T-PAIR": [
+      "artemis",
+      "app/src/main/java/com/limelight/nvstream/http/PairingManager.java"
+    ],
+    "T-CONNECTION": [
+      "artemis",
+      "app/src/main/java/com/limelight/nvstream/NvConnection.java"
+    ],
+    "T-GAME": [
+      "artemis",
+      "app/src/main/java/com/limelight/Game.java"
+    ],
+    "T-MANIFEST": [
+      "artemis",
+      "app/src/main/AndroidManifest.xml"
+    ],
+    "V-SUDO": [
+      "sudovda",
+      "README.md"
+    ],
+    "V-VDD": [
+      "vdd",
+      "README.md"
+    ],
+    "V-VDD-SOURCE": [
+      "vdd",
+      "Virtual Display Driver (HDR)/MttVDD/Driver.cpp"
+    ],
+    "G-LVH-MAP": [
+      "libvirtualhid",
+      "LICENSES/license-map.md"
+    ],
+    "G-LVH-MIT": [
+      "libvirtualhid",
+      "LICENSES/MIT.md"
+    ],
+    "G-LVH-SAL": [
+      "libvirtualhid",
+      "LICENSES/LicenseRef-LizardByte-SAL-1.0.md"
+    ],
+    "G-NONARY": [
+      "libvirtualgamepad",
+      "README.md"
+    ],
+    "G-NONARY-LICENSE": [
+      "libvirtualgamepad",
+      "LICENSE"
+    ],
+    "G-HIDMAESTRO": [
+      "hidmaestro",
+      "README.md"
+    ],
+    "G-HIDMAESTRO-LICENSE": [
+      "hidmaestro",
+      "LICENSE"
+    ],
+    "B-README": [
+      "vibepollo",
+      "README.md"
+    ],
+    "B-DISPLAY": [
+      "vibepollo",
+      "src/platform/windows/virtual_display.cpp"
+    ],
+    "B-RECOVERY": [
+      "vibepollo",
+      "src/platform/windows/display_helper_v2/state_machine.cpp"
+    ],
+    "B-MAINTENANCE": [
+      "vibepollo",
+      "src_assets/common/assets/web/views/MaintenanceView.vue"
+    ],
+    "B-CAPTURE": [
+      "vibepollo",
+      "src/platform/windows/display_base.cpp"
+    ],
+    "B-HDR-PROFILE": [
+      "vibepollo",
+      "src/platform/windows/virtual_display_sunshine.cpp"
+    ],
+    "B-MODULES": [
+      "vibepollo",
+      ".gitmodules"
+    ],
+    "B-REMOTE": [
+      "vibepollo",
+      "src/remote_session.cpp"
+    ],
+    "B-REMOTE-DOC": [
+      "vibepollo",
+      "docs/configuration.md"
+    ],
+    "B-TOPOLOGY": [
+      "vibepollo",
+      "src/remote_display_topology.cpp"
+    ],
+    "B-LEASE": [
+      "vibepollo",
+      "docs/remote-target-lease-prototype.md"
+    ],
+    "B-WGC": [
+      "vibepollo",
+      "src/platform/windows/display_wgc.cpp"
+    ],
+    "B-WGC-HELPER": [
+      "vibepollo",
+      "tools/sunshine_wgc_capture.cpp"
+    ],
+    "B-FRAMEPUSH": [
+      "vibepollo",
+      "src/platform/windows/display_frame_push.cpp"
+    ],
+    "B-FRAMEGEN": [
+      "vibepollo",
+      "src/framegen_policy.h"
+    ],
+    "B-APP-FRAMEGEN": [
+      "vibepollo",
+      "src/app_framegen_config.cpp"
+    ],
+    "B-LIMITER": [
+      "vibepollo",
+      "src/platform/windows/frame_limiter.cpp"
+    ],
+    "B-RTSS": [
+      "vibepollo",
+      "src/platform/windows/rtss_integration.cpp"
+    ],
+    "B-LOSSLESS": [
+      "vibepollo",
+      "tools/playnite_launcher/lossless_scaling.cpp"
+    ],
+    "B-RTXHDR": [
+      "vibepollo",
+      "src/platform/windows/rtx_hdr_policy.cpp"
+    ],
+    "B-RTXHDR-LINUX": [
+      "vibepollo",
+      "docs/linux/rtx-hdr.md"
+    ],
+    "B-COLOR": [
+      "vibepollo",
+      "src/hdr_request_policy.h"
+    ],
+    "B-PYRO": [
+      "vibepollo",
+      "docs/pyrowave-protocol.md"
+    ],
+    "B-PYRO-HOST": [
+      "vibepollo",
+      "src/pyrowave_host.cpp"
+    ],
+    "B-PROBE": [
+      "vibepollo",
+      "src/pyrowave_udp_probe.h"
+    ],
+    "B-BITRATE": [
+      "vibepollo",
+      "src/nvhttp_bitrate_policy.h"
+    ],
+    "B-NVHTTP": [
+      "vibepollo",
+      "src/nvhttp.cpp"
+    ],
+    "B-AMF": [
+      "vibepollo",
+      "src/amf/amf_d3d11.cpp"
+    ],
+    "B-ENCODERS": [
+      "vibepollo",
+      "src/video.cpp"
+    ],
+    "B-PLAYNITE": [
+      "vibepollo",
+      "plugins/playnite/SunshinePlaynite/README.md"
+    ],
+    "B-PLAYNITE-SYNC": [
+      "vibepollo",
+      "src/platform/windows/playnite_sync.cpp"
+    ],
+    "B-STEAM": [
+      "vibepollo",
+      "src/steam_integration.cpp"
+    ],
+    "B-STEAM-SYNC": [
+      "vibepollo",
+      "src/steam_sync_policy.cpp"
+    ],
+    "B-LUTRIS": [
+      "vibepollo",
+      "src/lutris_integration.cpp"
+    ],
+    "B-FOCUS": [
+      "vibepollo",
+      "src/managed_app_focus.cpp"
+    ],
+    "B-PROCESS": [
+      "vibepollo",
+      "src/process.cpp"
+    ],
+    "B-DEVICES": [
+      "vibepollo",
+      "src_assets/common/assets/web/views/DevicesView.vue"
+    ],
+    "B-GAMEPAD": [
+      "vibepollo",
+      "src/platform/windows/vhf_gamepad.cpp"
+    ],
+    "B-GAMEPAD-POLICY": [
+      "vibepollo",
+      "src/platform/windows/vhf_gamepad_policy.cpp"
+    ],
+    "B-HAPTICS": [
+      "vibepollo",
+      "docs/windows-dualsense-haptics.md"
+    ],
+    "B-SPEAKER": [
+      "vibepollo",
+      "docs/controller_speaker_pcm.md"
+    ],
+    "B-INPUT": [
+      "vibepollo",
+      "src/input.cpp"
+    ],
+    "B-BROWSER": [
+      "vibepollo",
+      "src_assets/common/assets/web/views/BrowserStreamView.vue"
+    ],
+    "B-WEBRTC": [
+      "vibepollo",
+      "src/webrtc_stream.cpp"
+    ],
+    "B-AUDIO": [
+      "vibepollo",
+      "src/audio_policy.h"
+    ],
+    "B-UI": [
+      "vibepollo",
+      "src_assets/common/assets/web/router.ts"
+    ],
+    "B-AUTH": [
+      "vibepollo",
+      "src/http_auth.cpp"
+    ],
+    "B-API": [
+      "vibepollo",
+      "src/confighttp.cpp"
+    ],
+    "B-STATS": [
+      "vibepollo",
+      "src/session_history.cpp"
+    ],
+    "B-HOST-STATS": [
+      "vibepollo",
+      "src/host_stats_service.cpp"
+    ],
+    "B-METRICS": [
+      "vibepollo",
+      "docs/hardware-metrics.md"
+    ],
+    "B-UPDATES": [
+      "vibepollo",
+      "docs/api-only-update-contract.md"
+    ],
+    "B-INSTALLER": [
+      "vibepollo",
+      "packaging/windows/bootstrap_migration.md"
+    ],
+    "B-POWER": [
+      "vibepollo",
+      "docs/power-actions.md"
+    ],
+    "B-PAIR-RECOVERY": [
+      "vibepollo",
+      "src/pairing_recovery.cpp"
+    ],
+    "B-STATE": [
+      "vibepollo",
+      "src/state_storage_policy.cpp"
+    ],
+    "B-LINUX-INSTALL": [
+      "vibepollo",
+      "docs/linux/install.md"
+    ],
+    "B-LINUX-DISPLAY": [
+      "vibepollo",
+      "src/platform/linux/private_display.cpp"
+    ],
+    "B-LINUX-LIMITER": [
+      "vibepollo",
+      "src/platform/linux/frame_limiter.cpp"
+    ],
+    "B-LINUX-INPUT": [
+      "vibepollo",
+      "docs/linux/playstation-controllers.md"
+    ],
+    "B-STEAMOS": [
+      "vibepollo",
+      "packaging/linux/steamos/AUDIT.md"
+    ],
+    "B-HYPRLAND": [
+      "vibepollo",
+      "docs/linux/hyprland.md"
+    ],
+    "B-CRYPTO": [
+      "vibepollo",
+      "src/crypto.h"
+    ],
+    "B-APPS": [
+      "vibepollo",
+      "src_assets/common/assets/web/apps.html"
+    ],
+    "B-GAMEPAD-README": [
+      "libvirtualgamepad_host_pin",
+      "README.md"
+    ],
+    "H-README": [
+      "vibeshine",
+      "README.md"
+    ],
+    "H-NVHTTP": [
+      "vibeshine",
+      "src/nvhttp.cpp"
+    ],
+    "H-CRYPTO": [
+      "vibeshine",
+      "src/crypto.h"
+    ],
+    "H-DEVICES": [
+      "vibeshine",
+      "src_assets/common/assets/web/views/DevicesView.vue"
+    ],
+    "H-API": [
+      "vibeshine",
+      "src/confighttp.cpp"
+    ],
+    "H-MODULES": [
+      "vibeshine",
+      ".gitmodules"
+    ],
+    "A-PACKAGE-ROOT": [
+      "apollo",
+      "CMakeLists.txt"
+    ],
+    "A-PACKAGE-COMMON": [
+      "apollo",
+      "cmake/packaging/common.cmake"
+    ],
+    "A-PACKAGE-WINDOWS": [
+      "apollo",
+      "cmake/packaging/windows.cmake"
+    ],
+    "A-SERVICE-INSTALL": [
+      "apollo",
+      "src_assets/windows/misc/service/install-service.bat"
+    ],
+    "A-CONFIG-MIGRATE": [
+      "apollo",
+      "src_assets/windows/misc/migration/migrate-config.bat"
+    ]
+  },
+  "official_pages": {
+    "W-DISPLAY": "https://github.com/ClassicOldSong/Apollo/wiki/Display-Mode-Override",
+    "W-PERMISSIONS": "https://github.com/ClassicOldSong/Apollo/wiki/Permission-System",
+    "W-CLIENT-COMMANDS": "https://github.com/ClassicOldSong/Apollo/wiki/Client-Commands",
+    "W-PAUSE": "https://github.com/ClassicOldSong/Apollo/wiki/Auto-pause-resume-games",
+    "W-BEST": "https://github.com/ClassicOldSong/Apollo/wiki/Best-Practices",
+    "W-APP-AUDIO": "https://github.com/ClassicOldSong/Apollo/wiki/Stream-audio-from-only-one-app",
+    "R-030": "https://github.com/ClassicOldSong/Apollo/releases/tag/v0.3.0",
+    "R-037": "https://github.com/ClassicOldSong/Apollo/releases/tag/v0.3.7-hotfix.1",
+    "R-046": "https://github.com/ClassicOldSong/Apollo/releases/tag/v0.4.6",
+    "R-047": "https://github.com/ClassicOldSong/Apollo/releases/tag/v0.4.7-alpha.1",
+    "V-VDD-RELEASE": "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/tag/25.7.23",
+    "GEVROSKA-APOLLO-RELEASE": "https://github.com/Gevroska/Apollo/releases/tag/v0.4.7-beta.4",
+    "B-RELEASE": "https://github.com/Nonary/Vibepollo/releases/tag/2.0.1",
+    "H-RELEASE": "https://github.com/Nonary/vibeshine/releases/tag/2.0.1",
+    "B-SMOOTH": "https://www.nvidia.com/en-us/geforce/news/nvidia-app-global-dlss-overrides-rtx-40-series-smooth-motion/",
+    "B-LS-STORE": "https://store.steampowered.com/app/993090/Lossless_Scaling/",
+    "H-WEB": "https://github.com/Nonary/vibeshine/tree/af1a0842048584af90308d86b2a12acb20c5ad1b/src_assets/common/assets/web"
+  },
+  "nonary_ancestry": {
+    "sunshineHead": "d0b4a88ef727f8dabf80cc970a14739b55c885de",
+    "rows": [
+      {
+        "repository": "Apollo",
+        "head": "adc5c5a0bd80831ce495434bb16aee2cd4175fb8",
+        "sunshineMergeBase": "1a96d135140ddfe5255516971c88f112b9da5beb",
+        "baseInfo": "2025-09-26T11:11:07-04:00 build(linux): update pkg-config systemd variable names (#4303)",
+        "uniqueCounts": "874\t457"
+      },
+      {
+        "repository": "Vibepollo",
+        "head": "8a753af16dcf1d752781ef4e6350da6146553e55",
+        "sunshineMergeBase": "1a96d135140ddfe5255516971c88f112b9da5beb",
+        "baseInfo": "2025-09-26T11:11:07-04:00 build(linux): update pkg-config systemd variable names (#4303)",
+        "uniqueCounts": "874\t2947"
+      },
+      {
+        "repository": "Vibeshine",
+        "head": "af1a0842048584af90308d86b2a12acb20c5ad1b",
+        "sunshineMergeBase": "2db7176f73e8a6b0eb3fcb6696e28234beb56db9",
+        "baseInfo": "2026-05-19T21:01:45-04:00 fix(Windows-installer): move ViGEmBus to ThirdParty group (#5157)",
+        "uniqueCounts": "490\t2121"
+      },
+      {
+        "repository": "Miranda",
+        "head": "d0b4a88ef727f8dabf80cc970a14739b55c885de",
+        "sunshineMergeBase": "d0b4a88ef727f8dabf80cc970a14739b55c885de",
+        "baseInfo": "2026-10-21T10:07:01-04:00 fix(homebrew): pin generated formula to release commit (#5972)",
+        "uniqueCounts": "0\t0"
+      }
+    ],
+    "vibeshineVibepolloBase": "8e6915634a0724b47552924737bf94ad842b93e5",
+    "vibeshineVibepolloCounts": "2086\t2528"
+  },
+  "nonary_tree_difference": {
+    "changed_paths": 976,
+    "src_paths": 182,
+    "web_paths": 123,
+    "test_paths": 181,
+    "note": "Counts include inherited changes, branding, maintenance and tests; not feature counts."
+  },
+  "vibepollo_apollo_comparison": {
+    "merge_base": "bf47fca9e498cd0654950fb713208b220dcc8a76",
+    "vibepollo_unique_commits": 2512,
+    "vibepollo_unique_non_merge_commits": 2430,
+    "apollo_unique_commits": 22,
+    "changed_paths_from_merge_base": 2546,
+    "changed_test_paths_from_merge_base": 433
+  },
+  "shared_nonary_dependencies": {
+    "libdisplaydevice": "18bdadbac2b21f35fe166aa1177db5c4e75829ae",
+    "libvirtualdisplay": "b2946d02a09bc453d9e6d287623390ca1dedf964",
+    "libvirtualgamepad": "7b000a2b060b4daeb0b5c6aa7b77ae1d81857e7a",
+    "moonlight_common_c": "4ea115e8d23d1ca055a2aa8ddcfb601b705b3323"
+  },
+  "nonary_releases": {
+    "vibepollo_stable": "2.0.1",
+    "vibepollo_stable_published": "2026-10-14T03:07:28Z",
+    "vibeshine_stable": "2.0.1",
+    "vibeshine_stable_published": "2026-10-14T03:01:33Z",
+    "vibepollo_prerelease": "2.0.2-nightly.d20261022.83bb31680419",
+    "note": "Source master heads are newer; source presence does not qualify an installer."
+  }
+}

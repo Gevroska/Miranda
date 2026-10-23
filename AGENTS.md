@@ -1,100 +1,66 @@
-## Build and tests
+# Miranda working instructions
 
-On Windows we use msys2 and ucrt64 to compile.
-Prefix Windows build and test commands with `C:\msys64\msys2_shell.cmd -defterm -here -no-start -ucrt64 -c`.
+## Read first
 
-Prefix build directories with `cmake-build-`.
+- Write responses, documentation, notes and comments in English.
+- Read the planning index, the development guide and the implementation status. Then read only the scope, evidence and source sections relevant to the task.
+- Product scope is recorded in docs/planning/06-decisions-and-questions.md. docs/development/STATUS.md records delivery evidence; it does not change requirements.
+- Follow WORKFLOW.md, VALIDATION.md and RELEASING.md under docs/development.
+- Use MCP Context7 for library documentation when useful. Verify version-sensitive behavior against primary documentation and the actual pinned dependency.
+- Inspect repository state and applicable nested instructions before editing. Preserve unrelated work and upstream licenses/notices.
 
-The test executable is named `test_sunshine` and will be located inside the `tests` directory within
-the build directory.
+## Responsibility and coordination
 
-The project uses gtest as a test framework.
+The coordinating agent owns the result, including architecture, integration, validation and accurate reporting. A worker's completion message is evidence to inspect, not acceptance of its patch.
 
-Sunshine tests must include `tests/tests_common.h` using the appropriate relative path, rather than including
-`<gtest/gtest.h>` directly. The common header provides GoogleTest through the shared test support and makes
-`TEST` use `BaseTest`, including its output capture and shared setup/teardown.
+For substantial work, identify the observable outcome, scope, affected interfaces, risks and completion criteria first. Delegate coherent tasks when this improves focus, independent review or overall efficiency. Small tasks may remain with one agent.
 
-Group test headers first under `// test includes`, followed by `// standard includes`, `// lib includes`, and
-`// local includes`, with a blank line between groups. Put shared test helpers in the test group, and omit empty
-groups. Keep platform-specific headers and their group comments inside the appropriate preprocessor guards.
-When a test depends on a particular include order, preserve that order and explain the dependency in a comment;
-do not move the common header ahead of headers whose first-include behavior is being tested.
+Give each worker a bounded mission: candidate revision, owned paths, interfaces, neighboring work, invariants, acceptance cases, commands and expected report. Use fresh task-focused context for a new mission. Retain the same worker for related corrections; use a separate reviewer for significant or critical changes.
 
-Add or update regression tests for new or modified source-code methods and behavior.
-Target 100% coverage on changed source code.
+Use the models and reasoning levels assigned by the launching task. Explain material escalation by complexity, uncertainty or risk. Do not fill every available slot by default.
 
-The regression-test requirement does not apply to build-system files, such as CMake scripts and dependency configuration.
-Validate build-system changes with appropriate configuration, build, and lint checks.
-Do not add dedicated build-system regression-test projects or fixtures for these changes.
+Avoid concurrent writes to the same paths. Use separate branches/worktrees for independent changes when appropriate. Assign one operator to any shared VM, driver installation, capture campaign, CI run or release operation. Do not overlap campaigns that share mutable hardware state.
 
-## Python tooling and formatting
+Optimize the total work required for a verified result: context, implementation, tests, review and rework. Reuse relevant passing evidence when its inputs and scope still match. Diagnose failures before retrying; do not hide defects with repeated retries or relaxed assertions.
 
-From the repository root, run `uv sync --locked` to create or refresh `.venv` from `pyproject.toml` and `uv.lock`.
-Re-run it after switching branches or changing either file or the `third-party/lizardbyte-common` submodule.
-After changing dependency declarations or the submodule revision, run `uv lock` before syncing.
+## Miranda invariants
 
-After native code changes, run `uv run --locked lb-update-clang-format` from the repository root. The command is
-provided by `third-party/lizardbyte-common`; inspect the resulting diff for unrelated formatting changes.
+- Keep the recent Sunshine foundation and preserve inherited platform support.
+- Every delivered feature must work without a paid license or subscription.
+- SudoVDA is the initial display backend. Compare VDD afterward; the selected Nonary controller driver is not a selection of another display driver.
+- A joining video client must not replace the active application/display or change its mode.
+- Newly paired guest devices receive no access until permissions are granted. Enforce rights on the host.
+- Preserve native-display power behavior, user-selected virtual-display topology and recoverable cleanup.
+- Preserve applications/settings during migration and report unsupported fields explicitly.
+- Treat source/display lifetime, application lifetime and individual client connections separately.
+- Deliver the defined first release before the later feature backlog.
 
-## Code style and documentation
+## Implementation conventions
 
-When adding localization do not update any language other than `en`. This also means to exclude en-US or other variants.
+Before introducing a new abstraction, check modern Sunshine's existing implementation. Adapt behavior at clear interfaces; do not transplant an older subsystem wholesale without a present requirement. Record significant architecture decisions with their tradeoffs and validation plan.
 
-Always add or update doxygen documentation.
+For Windows native builds, use MSYS2 UCRT64 and build directories beginning with cmake-build-. The pinned baseline uses the launcher C:\msys64\msys2_shell.cmd with -defterm -here -no-start -ucrt64 -c. Verify that the toolchain exists before running it; the prepared documentation workspace is not yet a source checkout.
 
-The project requires that everything be documented in doxygen or the build will fail.
+The native test executable is test_sunshine under the build directory's tests folder. Use tests/tests_common.h through the correct relative path, not direct GoogleTest includes. Preserve the shared test fixture and required include order. Group test includes, standard includes, library includes and local includes; omit empty groups and respect platform guards.
 
-Primary doxygen comments should be done like so:
+Add or update regressions for changed source behavior; target coverage of all changed behavior. Validate build-system edits with configuration/build/lint checks, without introducing dedicated build-system test projects merely to mirror the implementation.
 
-```cpp
-  /**
-   * @brief Describe the function, structure, etc.
-   *
-   * @param my_param Describe the parameter.
-   * @return Describe the return.
-   */
-```
+Preserve the pinned Python toolchain and lockfile workflow. At the examined baseline, use uv sync --locked, refresh the lock only when dependency declarations require it, and run uv run --locked lb-update-clang-format after native edits. Inspect formatter output for unrelated changes. Reconcile these commands with the checked-out revision before use.
 
-Inline doxygen comments should use `///< ...` instead of `/**< ... */`.
+Follow .clang-format and Doxygen conventions. Document changed APIs with primary block comments and inline member documentation using ///<. Add localization only to en unless project scope explicitly requires another locale. Do not add decorative comment banners.
 
-Always follow the style guidelines defined in .clang-format for c/c++ code.
+## Review and evidence
 
-Do not add decorative separator comments, including dashed banners that label groups of tests. Use descriptive
-test names and code structure to show the grouping instead.
+Critical permission, pairing, session, driver, installer, migration and shared-state changes require independent review of the actual diff. Reviewers report concrete triggers, impacts and corrections, not speculative finding lists. Review relevant test coverage and failure recovery.
 
-## Issues and pull requests
+After integration, validate the resulting candidate and account for changed dependencies or stale results. Keep source inspection, mocks, native execution, VM checks, physical streaming and human acceptance distinct. An unavailable GPU or client is an untested case, not a pass.
 
-When asked to create an issue or pull request, use the templates provided by the LizardByte/.github repo or
-LizardByte/Sunshine repo, with the Sunshine templates taking precedence if both exist. At the end of the issue
-or pull request body, add an attribution naming the AI agent, model, and thinking level used to generate it.
-Repeat that attribution in a separate comment on the created issue or pull request. For example:
+Use repository PR and issue templates. PRs explain the resulting behavior, relevant validation and material limitations. Pending CI is workflow status, not a code defect. Verify the current head and mergeability; an unknown mergeability state is not a confirmed conflict.
 
-```
-> This issue was generated by ChatGPT 6 Sol, extra high thinking level
-```
+## Delivery and stopping
 
-When asked to create an issue, do only enough investigation to verify and accurately describe the problem unless the
-user also asks for an investigation. Keep the issue concise: state the observed behavior, expected behavior, and
-reproduction steps or evidence when available. Do not include an exhaustive root-cause analysis or implementation
-plan in the issue. This limit applies only to creating issues; investigate or fix issues fully when asked.
+Follow applicable publication authority and repository protections. Do not bypass required reviews/checks, rewrite protected history, or manufacture passing statuses. A merge is not a verified release.
 
-## Code Review Rules
+Record the delivered revision, relevant evidence, unresolved limitations and next action. Stop a completed task when its criteria are met. Ask about unresolved product tradeoffs or actions outside the mission; do not repeatedly seek approval for routine work already authorized.
 
-Check new and modified tests for the common-header and include-group conventions above. Request
-`tests_common.h` instead of direct GoogleTest includes, and ensure shared test helpers are in the test include
-group. Verify any documented include-order dependency before asking the author to reorder headers.
-
-Report concrete issues introduced by the change that the contributor can address. For each finding, explain the
-triggering condition, impact, and a practical fix; point to the relevant code or test. Keep workflow status separate
-from code findings.
-
-If GitHub Actions workflows are queued for maintainer approval, or a dependent check times out before its job can run,
-do not leave an inline comment, request changes, or ask the contributor to run the workflows. The maintainer controls
-approval. If the missing results materially limit the review, mention that once in the review summary as a verification
-limit for the maintainer. Review actual failed checks for change-related problems when their logs are available.
-
-For pull request reviews, verify the current PR head and mergeability against its target branch. If conflicts are
-confirmed, tell the author in the review summary that the PR needs to be rebased and the conflicts resolved before
-merging. Do not infer conflicts from an unknown or pending mergeability status.
-
-When approving a pull request, the approval itself is sufficient. Do not add a comment solely to accompany it.
+Keep secrets, local operational state and unsanitized diagnostics out of repository changes and public artifacts. Inspect the actual diff and artifact contents before publication.

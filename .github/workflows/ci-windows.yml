@@ -71,6 +71,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Setup Dependencies Windows
@@ -212,9 +213,9 @@ jobs:
           NODEJS_PATH=$(cygpath "$NODEJS_PATH")
           export PATH="$PATH:$NODEJS_PATH"
 
-          mkdir -p build
+          mkdir -p cmake-build-ci
           cmake \
-            -B build \
+            -B cmake-build-ci \
             -G Ninja \
             -S . \
             -DBUILD_WERROR=ON \
@@ -224,7 +225,7 @@ jobs:
             -DSUNSHINE_PUBLISHER_WEBSITE="https://app.lizardbyte.dev" \
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://app.lizardbyte.dev/support"
           echo "::add-matcher::.github/matchers/gcc.json"
-          ninja -C build
+          ninja -C cmake-build-ci
           echo "::remove-matcher owner=gcc::"
 
       - name: Check Windows linkage
@@ -233,11 +234,11 @@ jobs:
           set -euo pipefail
 
           binaries=(
-            build/sunshine.exe
-            build/tools/audio-info.exe
-            build/tools/dxgi-info.exe
-            build/tools/sunshinesvc.exe
-            build/tests/test_sunshine.exe
+            cmake-build-ci/sunshine.exe
+            cmake-build-ci/tools/audio-info.exe
+            cmake-build-ci/tools/dxgi-info.exe
+            cmake-build-ci/tools/sunshinesvc.exe
+            cmake-build-ci/tests/test_sunshine.exe
           )
 
           unexpected_deps=""
@@ -273,7 +274,11 @@ jobs:
 
       - name: Sign Windows executables
         # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
-        if: inputs.publish_release == 'true' && inputs.azure_signing_account != '' && matrix.name != 'Windows-ARM64'
+        if: >-
+          github.repository == 'LizardByte/Sunshine' &&
+          inputs.publish_release == 'true' &&
+          inputs.azure_signing_account != '' &&
+          matrix.name != 'Windows-ARM64'
         uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
         with:
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -282,10 +287,10 @@ jobs:
           certificate-profile-name: ${{ inputs.azure_signing_cert_profile }}
           endpoint: ${{ inputs.azure_signing_endpoint }}
           files: |
-            ${{ github.workspace }}/build/sunshine.exe
-            ${{ github.workspace }}/build/tools/audio-info.exe
-            ${{ github.workspace }}/build/tools/dxgi-info.exe
-            ${{ github.workspace }}/build/tools/sunshinesvc.exe
+            ${{ github.workspace }}/cmake-build-ci/sunshine.exe
+            ${{ github.workspace }}/cmake-build-ci/tools/audio-info.exe
+            ${{ github.workspace }}/cmake-build-ci/tools/dxgi-info.exe
+            ${{ github.workspace }}/cmake-build-ci/tools/sunshinesvc.exe
           files-folder: src_assets/windows
           files-folder-filter: ps1
           files-folder-recurse: true
@@ -295,7 +300,7 @@ jobs:
         shell: msys2 {0}
         run: |
           mkdir -p artifacts
-          cd build
+          cd cmake-build-ci
 
           # package
           cpack -G WIX
@@ -307,7 +312,11 @@ jobs:
 
       - name: Sign Windows installers
         # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
-        if: inputs.publish_release == 'true' && inputs.azure_signing_account != '' && matrix.name != 'Windows-ARM64'
+        if: >-
+          github.repository == 'LizardByte/Sunshine' &&
+          inputs.publish_release == 'true' &&
+          inputs.azure_signing_account != '' &&
+          matrix.name != 'Windows-ARM64'
         uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
         with:
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -323,10 +332,10 @@ jobs:
       - name: Debug wix
         if: always()
         shell: msys2 {0}
-        run: cat ./build/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log || true
+        run: cat ./cmake-build-ci/cpack_artifacts/_CPack_Packages/win64/WIX/wix.log || true
 
       - name: Initialize tray icon
-        working-directory: build/tests
+        working-directory: cmake-build-ci/tests
         env:
           SUNSHINE_CONFIGURE_TRAY_ICONS: '1'
         run: >-
@@ -335,12 +344,13 @@ jobs:
           --gtest_filter=SystemTrayTest.InitializesTrayForWorkflowConfiguration
 
       - name: Configure Windows tray screenshots
-        uses: LizardByte/tray/.github/actions/configure-windows-tray-screenshots@master
+        # yamllint disable-line rule:line-length
+        uses: LizardByte/tray/.github/actions/configure-windows-tray-screenshots@8d49be1f9ea1a5cb40668e8651cf02300abd4b49
 
       - name: Run tests
         id: test
         shell: msys2 {0}
-        working-directory: build/tests
+        working-directory: cmake-build-ci/tests
         run: ./test_sunshine.exe --gtest_color=yes --gtest_output=xml:test_results.xml
 
       - name: Upload system tray screenshots
@@ -350,7 +360,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: sunshine-screenshots-${{ matrix.name }}
-          path: build/tests/screenshots
+          path: cmake-build-ci/tests/screenshots
           if-no-files-found: error
 
       - name: Generate gcov report
@@ -360,7 +370,7 @@ jobs:
           always() &&
           (steps.test.outcome == 'success' || steps.test.outcome == 'failure')
         shell: msys2 {0}
-        working-directory: build
+        working-directory: cmake-build-ci
         env:
           MSYS2_PATH_TYPE: inherit
         run: |
@@ -380,13 +390,13 @@ jobs:
         with:
           name: coverage-${{ matrix.name }}
           path: |
-            build/coverage.xml
-            build/tests/test_results.xml
+            cmake-build-ci/coverage.xml
+            cmake-build-ci/tests/test_results.xml
           if-no-files-found: error
 
       - name: Package Windows Debug Info
         shell: pwsh
-        working-directory: build
+        working-directory: cmake-build-ci
         run: |
           # use .dbg file extension for binaries to avoid confusion with real packages
           Get-ChildItem -File -Recurse | `

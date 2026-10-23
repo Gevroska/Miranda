@@ -20,11 +20,6 @@ on:
       release_version:
         required: true
         type: string
-    secrets:
-      GH_TOKEN:
-        required: true
-      GIT_EMAIL:
-        required: true
 
 jobs:
   build_homebrew:
@@ -112,6 +107,8 @@ jobs:
           INPUT_RELEASE_COMMIT: ${{ inputs.release_commit }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           MATRIX_RELEASE: ${{ matrix.release }}
+          # Enable fixtures only in validation bottles, never in release-formula artifacts.
+          MIRANDA_HOMEBREW_VALIDATION: ${{ matrix.release != true && 'ON' || 'OFF' }}
           PR_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
           PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -157,6 +154,7 @@ jobs:
             -B build \
             -S . \
             -DGITHUB_DEFAULT_BRANCH="${default_branch}" \
+            -DMIRANDA_HOMEBREW_VALIDATION="${MIRANDA_HOMEBREW_VALIDATION}" \
             -DSUNSHINE_CONFIGURE_HOMEBREW=ON \
             -DSUNSHINE_CONFIGURE_ONLY=ON
 
@@ -180,17 +178,17 @@ jobs:
           echo "DISPLAY=${DISPLAY}" >> "${GITHUB_ENV}"
 
       - run: echo "::add-matcher::.github/matchers/gcc-strip3.json"
+      # The pinned action commits only inside disposable runner checkouts when publish is false.
       - name: Validate Homebrew Formula
         id: test
         if: matrix.release != true
-        uses: LizardByte/actions/actions/release_homebrew@master  # action requires too many updates to pin
+        uses: LizardByte/actions/actions/release_homebrew@28374bf43cc8b6ee88b9b8a3419b2ac7a6573906
         with:
           actionlint_config: "---\n# empty config"
           formula_file: ${{ github.workspace }}/homebrew/sunshine.rb
-          git_email: ${{ secrets.GIT_EMAIL }}
+          git_email: 41898282+github-actions[bot]@users.noreply.github.com
           git_username: ${{ inputs.git_username }}
           publish: false
-          token: ${{ secrets.GH_TOKEN }}
           validate: true
       - run: echo "::remove-matcher owner=gcc-strip3::"
 

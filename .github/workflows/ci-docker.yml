@@ -1,0 +1,159 @@
+---
+# Validation-only adaptation of LizardByte/.github's __call-docker.yml at
+# e5b768985d9c5addc082bda9a1274ab064cbf0d9. Preserve the repository's Bake graph
+# and native platform runners without registry credentials or publication jobs.
+name: CI-Docker
+permissions: {}
+
+on:
+  workflow_call:
+    inputs:
+      release_commit:
+        required: true
+        type: string
+      release_version:
+        required: true
+        type: string
+
+jobs:
+  plan:
+    name: Plan Docker builds
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve Bake graph
+        id: plan
+        env:
+          CI_PR: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          definition_file=$(mktemp)
+          artifacts_file=$(mktemp)
+          docker buildx bake --file docker-bake.hcl --print default > "${definition_file}"
+          docker buildx bake --file docker-bake.hcl --print artifacts > "${artifacts_file}"
+          artifact_targets=$(jq -c '.group.artifacts.targets' "${artifacts_file}")
+          matrix=$(jq -c --argjson artifact_targets "${artifact_targets}" '
+            def runner($platform):
+              if $platform == "linux/amd64" then
+                "ubuntu-24.04"
+              elif $platform == "linux/arm64" or ($platform | startswith("linux/arm64/")) then
+                "ubuntu-24.04-arm"
+              else
+                error("No native runner configured for " + $platform)
+              end;
+            . as $definition
+            | {include: [
+                $definition.group.default.targets[] as $target
+                | if ($target | test("^[A-Za-z0-9_.-]+$")) then $target
+                  else error("Invalid Bake target name") end
+                | ($definition.target[$target].platforms // ["linux/amd64"])[] as $platform
+                | {
+                    target: $target,
+                    platform: $platform,
+                    platform_pair: ($platform | gsub("[^A-Za-z0-9]+"; "-")),
+                    runner: runner($platform),
+                    artifacts: (($artifact_targets | index($target)) != null),
+                    cache: (($definition.target[$target]["no-cache"] // false) == false)
+                  }
+              ]}
+          ' "${definition_file}")
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: ${{ matrix.target }} (${{ matrix.platform }})
+    needs: plan
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: More space
+        uses: LizardByte/actions/actions/more_space@28374bf43cc8b6ee88b9b8a3419b2ac7a6573906  # v2026.928.123224
+        with:
+          analyze-space-savings: true
+          clean-all: true
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - name: Prepare validation outputs
+        id: prepare
+        env:
+          BAKE_TARGET: ${{ matrix.target }}
+          BAKE_PLATFORM: ${{ matrix.platform }}
+          BAKE_PLATFORM_PAIR: ${{ matrix.platform_pair }}
+          EXPORT_ARTIFACTS: ${{ matrix.artifacts }}
+          USE_CACHE: ${{ matrix.cache }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          COMMIT: ${{ inputs.release_commit }}
+          CLONE_URL: ${{ github.event.repository.clone_url }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "set<<EOF"
+            echo "${BAKE_TARGET}.platform=${BAKE_PLATFORM}"
+            echo "${BAKE_TARGET}.args.BRANCH=${BRANCH}"
+            echo "${BAKE_TARGET}.args.BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "${BAKE_TARGET}.args.BUILD_VERSION=${RELEASE_VERSION}"
+            echo "${BAKE_TARGET}.args.COMMIT=${COMMIT}"
+            echo "${BAKE_TARGET}.args.CLONE_URL=${CLONE_URL}"
+            echo "${BAKE_TARGET}.args.RELEASE=false"
+            if [[ "${USE_CACHE}" == "true" ]]; then
+              echo "${BAKE_TARGET}.cache-from=type=gha,scope=docker-${BAKE_TARGET}-${BAKE_PLATFORM_PAIR}"
+              echo "${BAKE_TARGET}.cache-to=type=gha,mode=max,scope=docker-${BAKE_TARGET}-${BAKE_PLATFORM_PAIR}"
+            fi
+            if [[ "${EXPORT_ARTIFACTS}" == "true" ]]; then
+              echo "${BAKE_TARGET}.output=type=local,dest=image"
+            else
+              echo "${BAKE_TARGET}.output=type=cacheonly"
+            fi
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build validation target
+        uses: docker/bake-action@59cb1203cd42bcefd40a1b6d73b589e48c86040e  # v7.5.0
+        env:
+          CI_PR: ${{ github.event_name == 'pull_request' }}
+        with:
+          files: ./docker-bake.hcl
+          source: .
+          targets: ${{ matrix.target }}
+          set: ${{ steps.prepare.outputs.set }}
+          push: false
+          github-token: ''
+
+      - name: Arrange artifacts
+        if: matrix.artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find ./image -mindepth 1 -maxdepth 3 -type d -name artifacts \
+            -exec bash -c 'cp -rv "$1"/* ./artifacts/' _ {} \;
+
+      - name: Upload validation artifacts
+        if: matrix.artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: build-Docker-${{ matrix.target }}-${{ matrix.platform_pair }}
+          path: artifacts/
+          if-no-files-found: error
