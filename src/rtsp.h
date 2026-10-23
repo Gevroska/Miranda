@@ -98,7 +98,8 @@ namespace rtsp_stream {
     std::optional<crypto::cipher::gcm_t> rtsp_cipher;  ///< AES-GCM cipher used once encrypted RTSP is negotiated.
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
-    std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+    std::string client_uuid;  ///< Persistent UUID of the authenticated pairing that requested this launch.
+    std::string client_cert;  ///< Canonical PEM of the authenticated paired Moonlight client certificate.
   };
 
   /**

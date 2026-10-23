@@ -88,6 +88,12 @@ namespace stream {
      */
     state_e state(session_t &session);
     /**
+     * @brief Return the authenticated pairing UUID for a stream session.
+     * @param session Stream session whose authenticated identity is requested.
+     * @return Persistent pairing UUID retained from the HTTPS launch request.
+     */
+    const std::string &client_uuid(session_t &session);
+    /**
      * @brief Return the paired client certificate for a stream session.
      *
      * @param session Active streaming or pairing session for the request.
