@@ -28,6 +28,8 @@ The first release centers on Windows virtual displays, Artemis and Moonlight com
 
 Native-display streaming must keep that display on. Virtual-display streaming offers Apollo-style choices for keeping physical displays active or disabling them. A second video client joins the existing session without changing its active display mode. Every newly paired device, including the first owner device, receives no access until an administrator explicitly grants permissions in the authenticated Web UI (DEC-44).
 
+A device with launch rights may explicitly stop the application for all viewers (DEC-45). Joining and ordinary disconnect must preserve the other viewers' application/display; authenticated administration retains global Stop.
+
 Every shipped feature must be available without a paid license or subscription. Nonary/libvirtualgamepad is the selected Windows modern-controller driver; integration and runtime qualification remain to do. Available physical-controller testing covers Xbox One and Switch Pro through Android, Windows and Fedora clients.
 
 Virtual-display controls include forcing a virtual display globally, per application and per device, plus per-device resolution/refresh-rate overrides. Persistent monitor identities can be per client, per application or per client/application pair. These settings preserve an existing shared session when another viewer joins.

@@ -58,6 +58,7 @@ Every newly paired device, including the first owner device, must start with no 
 - Its requested resolution, refresh rate or HDR state must not change the active source display. Preserve the originating client's mode while the shared session remains active.
 - Per-client stream parameters may differ only where the capture/encoder/client pipeline supports this without changing that source display. Unsupported combinations need explicit negotiation or failure; stable display mode does not guarantee arbitrary simultaneous SDR/HDR or codec combinations.
 - Permissions remain attached to each paired identity. Joining/leaving one stream or an Input Only connection must not destroy another client's app/display. A joining client's saved display settings are retained for its future own session, not applied over the current one.
+- An explicit client Stop requires launch rights and may stop the application for everyone, even with other viewers connected (DEC-45). Keep this operation separate from ordinary disconnect and join; authenticated administration also retains global Stop.
 - Validate Artemis/Artemis, Moonlight/Moonlight and mixed-client joins, including disconnecting the originating viewer while another remains.
 
 ## Important adaptation points

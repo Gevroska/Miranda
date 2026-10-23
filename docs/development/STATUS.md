@@ -6,7 +6,7 @@ Updated: 2026-10-23. Candidate: [draft PR #1](https://github.com/Gevroska/Mirand
 |---|---|---|
 | Product scope and source review | Documented | [Planning index](../planning/README.md); no runtime qualification. |
 | Contribution and development structure | Published for review; not merged | Guides and templates preserve upstream source/history/license; draft PR #1. |
-| P0 source/build baseline | In progress | Source pin/submodules and local Windows configuration established; Web UI build and 213 tests pass locally and hosted. Native execution and full hosted CI remain pending. See [P0 evidence](work-items/P0-baseline.md). |
+| P0 source/build baseline | In progress | Local Windows native build passes. Native suite: 863 passed, 11 skipped and 2 external-download failures. Web UI build and 213 tests pass locally and hosted; remaining platform CI is under validation. See [P0 evidence](work-items/P0-baseline.md). |
 | P1 identity/permissions | Designed next slice; not implemented | Request-bound identity precedes permissions enforcement. DEC-44 confirms explicit administrator grants for all paired devices, including the first owner device. |
 | P2/P3 SudoVDA and displays | Prerequisites inspected; integration planned | A complete reference driver payload exists; source provenance, package distribution and clean-target qualification remain pending. |
 | P4/P4a-P4c client/pairing/apps | Planned | Preserve Artemis/Moonlight contracts. |

@@ -75,6 +75,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Dependencies Windows
+        id: setup-msys2
         # if a dependency needs to be pinned, see https://github.com/LizardByte/build-deps/pull/186
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2.33.0
         with:
@@ -82,6 +83,25 @@ jobs:
           update: true
           install: >-
             wget
+
+      - name: Prefer MSYS2 primary package server
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.setup-msys2.outputs.msys2-location }}
+        run: |
+          # The first server is preferred; keep the remaining mirrors as fallbacks.
+          # https://www.msys2.org/dev/mirrors/
+          $ErrorActionPreference = "Stop"
+          $origins = @{
+            "mirrorlist.mingw" = 'Server = https://repo.msys2.org/mingw/$repo/'
+            "mirrorlist.msys" = 'Server = https://repo.msys2.org/msys/$arch/'
+          }
+          foreach ($entry in $origins.GetEnumerator()) {
+            $mirrorlist = Join-Path $env:MSYS2_LOCATION "etc/pacman.d/$($entry.Key)"
+            $fallbacks = @([System.IO.File]::ReadAllLines($mirrorlist) | Where-Object { $_ -cne $entry.Value })
+            $servers = @($entry.Value) + $fallbacks
+            [System.IO.File]::WriteAllText($mirrorlist, ($servers -join "`n") + "`n")
+          }
 
       - name: Update Windows dependencies
         env:

@@ -17,7 +17,8 @@ class Sunshine < Formula
   TEST_RESULTS_XML = "tests/test_results.xml".freeze
   IS_UPSTREAM_REPO = ENV.fetch("GITHUB_REPOSITORY", "") == "LizardByte/Sunshine"
   # Bake the CI opt-in into the formula so test-bot environment filtering cannot disable its fixtures.
-  BUILD_VALIDATION_TESTS = IS_UPSTREAM_REPO || "@MIRANDA_HOMEBREW_VALIDATION@" == "ON"
+  MIRANDA_HOMEBREW_VALIDATION = "@MIRANDA_HOMEBREW_VALIDATION@".freeze
+  BUILD_VALIDATION_TESTS = (IS_UPSTREAM_REPO || MIRANDA_HOMEBREW_VALIDATION == "ON").freeze
 
   desc "@PROJECT_DESCRIPTION@"
   homepage "@PROJECT_HOMEPAGE_URL@"

@@ -28,6 +28,7 @@ The owner confirmed a small, reliable first release with the scope already defin
 | Multiple video clients | A second viewer joins the current application/display session. Keep the active display resolution, refresh rate and HDR state unchanged when a joining viewer requests different settings. Each client retains its own permissions. |
 | Headless use | Support use without a physical display as part of the intended use cases. |
 | Shared access | Family and friends may connect with restricted permissions. Every newly paired device, including the first owner device, has no access until an administrator explicitly grants rights in the authenticated Web UI (DEC-44). Apollo-style permissions are sufficient initially; per-game restrictions are outside the first release. |
+| Shared Stop | A device with launch rights may explicitly stop the application for all viewers (DEC-45). Joining and ordinary disconnect remain separate and must preserve other viewers' application/display. |
 | Text clipboard | Support PC-to-Artemis and Artemis-to-PC text transfer with separate per-device permissions. |
 | Input Only mode | Allow a phone or other device to supply controls while another client receives the stream. Include this in the first release. |
 | No new session automation initially | Defer Apollo connect/disconnect hooks, pause/resume commands, and automatic game suspension. Preserve Sunshine's existing application functionality. |
