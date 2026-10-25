@@ -1,6 +1,6 @@
 # ADR-002: serialize device authority with session and input effects
 
-- Status: proposed; implemented candidate awaiting independent review and execution
+- Status: accepted; implementation independently reviewed and locally validated; hosted validation pending
 - Date: 2026-10-23
 - Relevant requirement IDs: A01-A04, DEC-21, DEC-22, DEC-44, DEC-45; T07/T08/T17
 

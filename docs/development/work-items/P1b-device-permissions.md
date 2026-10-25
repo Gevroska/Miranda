@@ -27,7 +27,7 @@ Completed revocation invalidates pending and accepted RTSP tokens and waits for 
 
 ## Evidence and remaining work
 
-The final source and correction diffs received independent review. Locked formatting passed, dependency pins are unchanged, and both the Windows application and native test targets built successfully under MSYS2 UCRT64. The final native campaign used the reviewed source without further source changes:
+The source and correction diffs received independent review. Locked formatting passed, dependency pins are unchanged, and both the Windows application and native test targets built successfully under MSYS2 UCRT64. The local native campaign exercised revision `955fd099651778dcfba7dbd51237f5adc5e794c7`:
 
 | Check | Result |
 |---|---|
@@ -37,6 +37,8 @@ The final source and correction diffs received independent review. Locked format
 | Full local native suite | 976 total: 963 passed, 11 skipped, two failed. Both failures are the unchanged external `httpbin.org` download cases with CURL code 7, also present in the baseline. No new failure remains. |
 | Web tests | 224 passed across 12 files; the three affected Web source/test hashes remain unchanged from that run. |
 | Web production build | Passed, including the final combined native build. |
+
+A subsequent Clang build check identified one unused error-message constant. Removing that unread declaration changes no runtime path; both affected production and test compilation paths passed afterward. The local behavioral evidence above is retained, while hosted checks must qualify the resulting revision.
 
 Separate synthetic Windows diagnostics reproduced the repeated-save marker loss and verified a request-flag variant and a modern-setter variant through three protected or inherited saves. The inherited cases retained exact policy against an untouched sibling after parent grant revocation. The candidate uses the narrower request-flag correction and retains strict readback before bytes. The production-seam regressions also passed; these checks do not establish a general Windows filesystem guarantee.
 
