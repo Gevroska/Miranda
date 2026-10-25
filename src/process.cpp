@@ -990,6 +990,7 @@ namespace proc {
         ++i;
         ids.insert(ctx.id);
         ctx.uuid = app_node.get<std::string>("uuid", "");
+        ctx.force_virtual_display = app_node.get<bool>("force-virtual-display", false);
 
         ctx.name = std::move(name);
         ctx.prep_cmds = std::move(prep_cmds);

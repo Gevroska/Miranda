@@ -93,6 +93,7 @@ namespace proc {
     std::string image_path;  ///< Image path.
     std::string id;  ///< Stable identifier for the configured application.
     std::string uuid;  ///< Durable application UUID, separate from paired-client authority.
+    bool force_virtual_display = false;  ///< Saved additive virtual-source preference, applied only to fresh sources.
     bool elevated;  ///< Whether the process should be launched elevated.
     bool auto_detach;  ///< Whether the process should detach automatically.
     bool wait_all;  ///< Whether Sunshine waits for all child processes.

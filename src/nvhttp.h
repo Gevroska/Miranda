@@ -25,6 +25,7 @@
 
 // local includes
 #include "crypto.h"
+#include "display_policy.h"
 #include "permissions.h"
 
 namespace rtsp_stream {
@@ -102,6 +103,8 @@ namespace nvhttp {
     std::string name;  ///< Friendly client name recorded during pairing.
     permissions::mask_t permissions = 0;  ///< Current explicit grants; never an enduring authorization cache.
     std::uint64_t revision = 0;  ///< Authorization revision observed when this identity was resolved.
+    display_policy::device_preferences_t display;  ///< Current administrator-owned fresh-source preferences.
+    bool display_valid = true;  ///< False requires explicit repair before fresh-source preparation.
   };
 
   /**
@@ -117,9 +120,10 @@ namespace nvhttp {
    * @param uuid Paired identity to update.
    * @param enabled Optional enable gate; omission preserves its value.
    * @param permissions Optional complete grant; omission preserves its value.
+   * @param display Optional complete known display preferences; omission preserves their values and typed metadata.
    * @return Whether the update was saved and revocation cleanup completed.
    */
-  bool update_client(std::string_view uuid, std::optional<bool> enabled, std::optional<permissions::mask_t> permissions);
+  bool update_client(std::string_view uuid, std::optional<bool> enabled, std::optional<permissions::mask_t> permissions, std::optional<display_policy::device_preferences_t> display = std::nullopt);
 
   /**
    * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.

@@ -298,6 +298,40 @@ describe('virtual input troubleshooting', () => {
 })
 
 describe('paired device rights', () => {
+  it.each(['success', 'lost response'])('saves display preferences with authoritative readback after %s without changing device grants', async outcome => {
+    const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: false, permissions: 0, display_valid: true,
+      display: { force_virtual: false, resolution: null, refresh_rate: null } }]
+    const wrapper = await mountTroubleshooting('windows', 'none', {}, [], null, clients)
+    const originalFetch = fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/update') {
+        const body = JSON.parse(options.body)
+        expect(body).toEqual({ uuid: 'paired-device', display: { force_virtual: true, resolution: null, refresh_rate: { numerator: 60000, denominator: 1001 } } })
+        clients[0].display = { ...body.display }
+        if (outcome === 'lost response') throw new TypeError('The committed response was lost')
+        return { ok: true, json: async () => ({ status: true }) }
+      }
+      return originalFetch(url, options)
+    }))
+    await wrapper.get('[data-display-force]').setValue(true)
+    await wrapper.get('[data-display-rate]').setValue('60000/1001')
+    await wrapper.get('[data-display-rate]').element.closest('fieldset').querySelector('button').click()
+    await flushPromises()
+    expect(wrapper.get('[data-display-force]').element.checked).toBe(true)
+    expect(wrapper.get('#toggle-paired-device').element.checked).toBe(false)
+    expect(wrapper.findAll('[data-device-right]').every(input => input.element.checked === false)).toBe(true)
+    expect(wrapper.vm.clientUpdateError).toBe('')
+    wrapper.unmount()
+  })
+
+  it('keeps device display preferences absent from non-Windows administration', async () => {
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, [
+      { uuid: 'paired-device', name: 'Paired device', enabled: true, permissions: 0 },
+    ])
+    expect(wrapper.find('[data-display-force]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('shows only implemented explicit grants and saves rights without changing the enabled gate', async () => {
     const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: false, permissions: 0 }]
     const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, clients)

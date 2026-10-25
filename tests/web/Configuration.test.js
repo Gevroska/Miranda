@@ -27,6 +27,17 @@ const globalOptions = {
 }
 
 describe('configuration accessibility', () => {
+  it('persists the selected virtual-monitor identity alongside the existing display controls', async () => {
+    const config = { force_virtual_display: 'disabled', virtual_display_identity: 'client', dd_configuration_option: 'disabled',
+      dd_mode_remapping: { mixed: [], resolution_only: [], refresh_rate_only: [] } }
+    const wrapper = mount(DisplayDeviceOptions, { props: { platform: 'windows', config }, global: globalOptions })
+    await wrapper.get('#virtual_display_identity').setValue('client_application')
+    expect(config.virtual_display_identity).toBe('client_application')
+    expect(wrapper.get('label[for="virtual_display_identity"]').text()).toBe('config.virtual_display_identity')
+    expect(wrapper.text()).toContain('display_preferences.availability')
+    wrapper.unmount()
+  })
+
   it('gives every global prep command input an accessible label', () => {
     const wrapper = mount(General, {
       props: {

@@ -858,6 +858,28 @@ TEST_F(AppCatalogTransactionTest, RenameArtworkAndReorderRetainBothIdentitiesThr
   EXPECT_EQ(restarted["apps"][1]["id"], id);
 }
 
+TEST_F(AppCatalogTransactionTest, VirtualDisplayPreferenceRetainsIdentityAndRejectsInvalidEditsAtomically) {
+  const auto initial = read();
+  auto edit = initial["apps"][0];
+  const auto uuid = edit["uuid"];
+  edit["force-virtual-display"] = true;
+  ASSERT_EQ(proc::save_catalog_app(file.string(), initial["revision"], edit.dump()).status, 200);
+  EXPECT_TRUE(proc::proc.apps_snapshot()[0].force_virtual_display);
+  proc::proc = proc::proc_t {};
+  auto current = read();
+  EXPECT_EQ(current["apps"][0]["uuid"], uuid);
+  EXPECT_TRUE(current["apps"][0]["force-virtual-display"].get<bool>());
+  EXPECT_TRUE(proc::proc.apps_snapshot()[0].force_virtual_display);
+  const auto original = bytes();
+  edit["force-virtual-display"] = "yes";
+  EXPECT_EQ(proc::save_catalog_app(file.string(), current["revision"], edit.dump()).status, 400);
+  EXPECT_EQ(bytes(), original);
+  EXPECT_TRUE(proc::proc.apps_snapshot()[0].force_virtual_display);
+  edit["force-virtual-display"] = false;
+  ASSERT_EQ(proc::save_catalog_app(file.string(), current["revision"], edit.dump()).status, 200);
+  EXPECT_FALSE(proc::proc.apps_snapshot()[0].force_virtual_display);
+}
+
 TEST_F(AppCatalogTransactionTest, StaleSaveAndDeleteAreRejectedAgainstExactBytes) {
   const auto first_tab = read();
   const auto second_tab = first_tab;

@@ -23,6 +23,8 @@
 namespace proc::catalog {
   using json = nlohmann::ordered_json;
 
+  inline constexpr auto desktop_uuid = "3f0c2e18-d464-5c55-8f77-3d6103fefcc2";  ///< Reserved protocol Desktop identity, never a configured app UUID.
+
   /**
    * @brief Reproduce legacy CRC signed magnitude with defined arithmetic, excluding zero and INT32_MIN.
    */
@@ -62,6 +64,7 @@ namespace proc::catalog {
     }
     static const std::set<std::string> reserved {
       "00000000-0000-0000-0000-000000000000",
+      desktop_uuid,
       "8902cb19-674a-403d-a587-41b092e900ba",
       "eaac6159-089a-46a9-9e24-6436885f6610",
       "8cb5c136-da67-4f99-b4a1-f9cd35005cf4",
@@ -196,7 +199,7 @@ namespace proc::catalog {
           throw error {std::string {"apps."} + key + ": expected a string"};
         }
       }
-      for (const auto *key : {"elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all"}) {
+      for (const auto *key : {"elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all", "force-virtual-display"}) {
         if (app.contains(key) && !valid_bool(app[key])) {
           throw error {std::string {"apps."} + key + ": expected a boolean"};
         }
@@ -407,7 +410,7 @@ namespace proc::catalog {
         throw error {"application identity is immutable"};
       }
     }
-    for (const auto *key : {"name", "cmd", "output", "working-dir", "image-path", "elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all", "exit-timeout", "detached"}) {
+    for (const auto *key : {"name", "cmd", "output", "working-dir", "image-path", "elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all", "force-virtual-display", "exit-timeout", "detached"}) {
       if (edit.contains(key)) {
         retained[key] = edit[key];
       }

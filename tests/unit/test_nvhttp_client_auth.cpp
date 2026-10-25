@@ -10,6 +10,7 @@
 // standard includes
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <thread>
 #include <type_traits>
@@ -324,6 +325,97 @@ TEST_F(ClientAuthorizationTest, FailedPersistencePublishesNeitherGrantNorRevocat
   EXPECT_TRUE(nvhttp::update_client(uuid, std::nullopt, 0U));
 }
 
+TEST_F(ClientAuthorizationTest, DisplayPreferencesPersistWithTypedMetadataWithoutGrantingAnyRights) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  const auto foreign = display_policy::json::parse(R"({"flags":[false,null,{},[]],"fraction":1.25,"integer":9007199254740993})");
+  ASSERT_TRUE(http::update_state_file_bytes(config::nvhttp.file_state, [&](const std::string &original) -> std::optional<std::string> {
+    auto tree = proc::catalog::parse(original);
+    tree["foreign"] = foreign;
+    tree["root"]["named_devices"][0]["foreign"] = foreign;
+    tree["root"]["named_devices"][0]["display"]["foreign"] = foreign;
+    return tree.dump();
+  }));
+  auto preferences = display_policy::parse_device(display_policy::json::parse(R"({"force_virtual":true,"resolution":{"width":2560,"height":1440},"refresh_rate":{"numerator":60000,"denominator":1001}})"));
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, std::nullopt, preferences));
+  ASSERT_EQ(http::save_user_creds(config::nvhttp.file_state, "synthetic administrator", "synthetic password"), 0);
+  nvhttp::test_support::reset_client_state();
+  nvhttp::test_support::reload_client_state();
+  const auto paired = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(paired);
+  EXPECT_EQ(paired->permissions, 0U);
+  EXPECT_EQ(paired->display, preferences);
+  EXPECT_TRUE(paired->display_valid);
+  std::ifstream saved {config::nvhttp.file_state, std::ios::binary};
+  const auto tree = display_policy::json::parse(saved);
+  EXPECT_EQ(tree["foreign"], foreign);
+  EXPECT_EQ(tree["root"]["named_devices"][0]["foreign"], foreign);
+  EXPECT_EQ(tree["root"]["named_devices"][0]["display"]["foreign"], foreign);
+  EXPECT_TRUE(tree["root"]["named_devices"][0]["enabled"].is_string());
+  EXPECT_TRUE(tree["root"]["named_devices"][0]["permissions"].is_string());
+  EXPECT_TRUE(tree["root"]["named_devices"][0]["display"]["force_virtual"].is_boolean());
+}
+
+TEST_F(ClientAuthorizationTest, InvalidSavedDisplayPreferencesStayUntouchedUntilExplicitAdminRepair) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  const auto malformed = display_policy::json::parse(R"({"force_virtual":true,"refresh_rate":{"numerator":60000,"denominator":0},"foreign":[false,null]})");
+  ASSERT_TRUE(http::update_state_file_bytes(config::nvhttp.file_state, [&](const std::string &original) -> std::optional<std::string> {
+    auto tree = proc::catalog::parse(original);
+    tree["root"]["named_devices"][0]["display"] = malformed;
+    return tree.dump();
+  }));
+  nvhttp::test_support::reset_client_state();
+  nvhttp::test_support::reload_client_state();
+  auto paired = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(paired);
+  EXPECT_FALSE(paired->display_valid);
+  EXPECT_FALSE(nvhttp::get_all_clients()[0]["display_valid"].get<bool>());
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  {
+    std::ifstream saved {config::nvhttp.file_state, std::ios::binary};
+    const auto tree = display_policy::json::parse(saved);
+    EXPECT_EQ(tree["root"]["named_devices"][0]["display"], malformed);
+  }
+  display_policy::device_preferences_t repaired;
+  repaired.force_virtual = true;
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, std::nullopt, repaired));
+  paired = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(paired);
+  EXPECT_TRUE(paired->display_valid);
+  EXPECT_EQ(paired->display, repaired);
+  EXPECT_EQ(paired->permissions, permissions::view);
+}
+
+TEST_F(ClientAuthorizationTest, FailedDisplayEditPreservesExactBytesAndPreviousAuthorityAndPreferences) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  auto read = [&]() {
+    std::ifstream saved {config::nvhttp.file_state, std::ios::binary};
+    return std::string {std::istreambuf_iterator<char> {saved}, std::istreambuf_iterator<char> {}};
+  };
+  const auto original = read();
+  const auto before = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(before);
+  display_policy::device_preferences_t preferences;
+  preferences.force_virtual = true;
+  http::test_support::set_state_update_hook([]() {
+    throw std::runtime_error {"fixture failure before publication"};
+  });
+  EXPECT_FALSE(nvhttp::update_client(uuid, false, permissions::launch, preferences));
+  http::test_support::set_state_update_hook({});
+  EXPECT_EQ(read(), original);
+  const auto after = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->permissions, before->permissions);
+  EXPECT_EQ(after->revision, before->revision);
+  EXPECT_EQ(after->display, before->display);
+  preferences.refresh_rate = {60, 0};
+  EXPECT_FALSE(nvhttp::update_client(uuid, std::nullopt, permissions::launch, preferences));
+  EXPECT_EQ(read(), original);
+}
+
 TEST_F(ClientAuthorizationTest, CredentialAndPermissionTransactionsPreserveBothUpdatesInEitherOrder) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
   const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
@@ -390,6 +482,30 @@ namespace {
     return nvhttp::test_support::make_launch_session(*nvhttp::current_client(uuid, cert), args);
   }
 }  // namespace
+
+TEST_F(ClientAuthorizationTest, DisplayOnlyEditsPreserveAuthorizationRevisionAndPreparedVideoTokens) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  const auto before = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(before);
+  const auto token = permission_launch(uuid, credentials.x509);
+  ASSERT_EQ(rtsp_stream::prepare_launch(token, []() {
+              return 200;
+            }),
+            200);
+  display_policy::device_preferences_t preferences;
+  preferences.force_virtual = true;
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, std::nullopt, preferences));
+  const auto after = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->revision, before->revision);
+  EXPECT_EQ(after->permissions, before->permissions);
+  EXPECT_EQ(after->display, preferences);
+  EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
+  EXPECT_TRUE(rtsp_stream::test_support::claim_launch(token));
+  rtsp_stream::launch_session_clear(token->id);
+}
 
 TEST_F(ClientAuthorizationTest, ReservationsFailExplicitlyInvalidateHeldTokensAndClaimAnnounceOnce) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();

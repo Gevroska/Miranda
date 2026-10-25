@@ -813,6 +813,8 @@ namespace config {
       3s,  // config_revert_delay
       {},  // config_revert_on_disconnect
       {},  // mode_remapping
+      false,  // force_virtual
+      video_t::dd_t::identity_option_e::client,  // virtual_identity
       {}  // wa
     },  // display_device
 
@@ -1746,6 +1748,20 @@ namespace config {
       }
     }
     bool_f(vars, "dd_config_revert_on_disconnect", video.dd.config_revert_on_disconnect);
+    bool_f(vars, "force_virtual_display", video.dd.force_virtual);
+    generic_f(vars, "virtual_display_identity", video.dd.virtual_identity, [](std::string_view value) {
+      using identity = video_t::dd_t::identity_option_e;
+      if (value == "client") {
+        return identity::client;
+      }
+      if (value == "application") {
+        return identity::application;
+      }
+      if (value == "client_application") {
+        return identity::client_application;
+      }
+      return identity::client;
+    });
     generic_f(vars, "dd_mode_remapping", video.dd.mode_remapping, dd::mode_remapping_from_view);
     {
       int value = 0;

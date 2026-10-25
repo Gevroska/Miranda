@@ -1239,6 +1239,7 @@ namespace confighttp {
       std::string uuid = input_tree.value("uuid", "");
       std::optional<bool> enabled;
       std::optional<permissions::mask_t> grant;
+      std::optional<display_policy::device_preferences_t> display;
       if (input_tree.contains("enabled")) {
         if (!input_tree["enabled"].is_boolean()) {
           bad_request(response, "enabled must be a boolean");
@@ -1254,13 +1255,21 @@ namespace confighttp {
         }
         grant = value.get<permissions::mask_t>();
       }
-      if (uuid.empty() || (!enabled && !grant)) {
+      if (input_tree.contains("display")) {
+        try {
+          display = display_policy::parse_device(input_tree["display"]);
+        } catch (const std::exception &error) {
+          bad_request(response, error.what());
+          return;
+        }
+      }
+      if (uuid.empty() || (!enabled && !grant && !display)) {
         bad_request(response, "A device UUID and at least one update field are required");
         return;
       }
-      output_tree["status"] = nvhttp::update_client(uuid, enabled, grant);
+      output_tree["status"] = nvhttp::update_client(uuid, enabled, grant, display);
       if (!output_tree["status"].get<bool>()) {
-        output_tree["error"] = "Device update was not saved; previous authorization remains in effect";
+        output_tree["error"] = "Device update was not saved; previous authorization and preferences remain in effect";
       }
 
       send_response(response, output_tree);

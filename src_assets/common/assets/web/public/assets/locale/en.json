@@ -1,4 +1,15 @@
 {
+  "display_preferences": {
+    "title": "Display preferences",
+    "availability": "Preferences can be saved now. Virtual display activation is not available in this build. Existing viewers keep their display and mode.",
+    "width": "Source width",
+    "height": "Source height",
+    "refresh_rate": "Source refresh rate (Hz)",
+    "mode_help": "Leave both dimensions blank to use the usual resolution. Leave refresh rate blank to use the usual rate, or enter decimal or fractional hertz, such as 59.94 or 60000/1001. Device overrides apply only when preparing a fresh source.",
+    "invalid": "Enter both positive whole-number dimensions and a positive decimal or fractional refresh rate, or leave the overrides blank.",
+    "invalid_saved": "Saved display preferences are invalid. Save valid preferences before starting a fresh source.",
+    "save": "Save display preferences"
+  },
   "_common": {
     "all": "All",
     "apply": "Apply",
@@ -109,6 +120,12 @@
     "working_dir_desc": "The working directory that should be passed to the process. For example, some applications use the working directory to search for configuration files. If not set, Sunshine will default to the parent directory of the command"
   },
   "config": {
+    "force_virtual_display": "Force a virtual display",
+    "force_virtual_display_desc": "A global, application or device preference can require a virtual display for a fresh source.",
+    "virtual_display_identity": "Persistent virtual display identity",
+    "virtual_display_identity_client": "Per paired device (default)",
+    "virtual_display_identity_application": "Per application",
+    "virtual_display_identity_client_application": "Per device and application",
     "adapter_name": "Adapter Name",
     "adapter_name_desc_linux_1": "Manually specify a GPU to use for capture.",
     "adapter_name_desc_linux_2": "to find all devices capable of VAAPI",
@@ -206,7 +223,7 @@
     "dd_config_revert_delay": "Config revert delay",
     "dd_config_revert_delay_desc": "Additional delay in milliseconds to wait before reverting configuration when the app has been closed or the last session terminated. Main purpose is to provide a smoother transition when quickly switching between apps.",
     "dd_config_revert_on_disconnect": "Config revert on disconnect",
-    "dd_config_revert_on_disconnect_desc": "Revert configuration upon disconnect of all clients instead of app close or last session termination.",
+    "dd_config_revert_on_disconnect_desc": "Revert configuration after all viewers disconnect. Virtual-source policy also removes its virtual screen; otherwise the screen stays while a tracked application runs. Remaining viewers keep their source.",
     "dd_config_verify_only": "Verify that the display is enabled",
     "dd_hdr_option": "HDR",
     "dd_hdr_option_auto": "Switch on/off the HDR mode as requested by the client (default)",

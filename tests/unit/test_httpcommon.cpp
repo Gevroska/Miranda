@@ -35,6 +35,8 @@
 #endif
 
 // local includes
+#include <src/app_catalog.h>
+#include <src/crypto.h>
 #include <src/httpcommon.h>
 #include <src/utility.h>
 
@@ -292,6 +294,30 @@ protected:
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
   }
 };
+
+TEST_F(StateFileTransactionTest, CredentialEditsPreserveTypedSharedStateWithoutRequiringAnAppCatalog) {
+  const auto original = proc::catalog::parse(R"({"username":"old","salt":"old salt","password":"old hash","root":{"uniqueid":"legacy host","named_devices":[{"enabled":"true","permissions":"0","display":{"force_virtual":true,"resolution":{"width":2560,"height":1440},"refresh_rate":{"numerator":60000,"denominator":1001}}}]},"foreign":{"flags":[false,null,{},[]],"fraction":1.25,"integer":9007199254740993}})");
+  std::ofstream {file, std::ios::binary} << original.dump();
+  ASSERT_EQ(http::save_user_creds(file.string(), "synthetic administrator", "synthetic password"), 0);
+  const auto saved = proc::catalog::parse(state_bytes());
+  EXPECT_EQ(saved["root"], original["root"]);
+  EXPECT_EQ(saved["foreign"], original["foreign"]);
+  EXPECT_EQ(saved["username"], "synthetic administrator");
+  const auto salt = saved["salt"].get<std::string>();
+  EXPECT_EQ(saved["password"], util::hex(crypto::hash("synthetic password" + salt)).to_string());
+  const auto standalone = directory / "standalone-credentials.json";
+  EXPECT_EQ(http::save_user_creds(standalone.string(), "standalone", "synthetic password"), 0);
+}
+
+TEST_F(StateFileTransactionTest, FailedCredentialEditLeavesEveryOriginalByteAndTypedState) {
+  const std::string original = R"({"username":"old","salt":"original salt","password":"original hash","foreign":[true,null,{"number":1.25}]})";
+  std::ofstream {file, std::ios::binary} << original;
+  http::test_support::set_state_update_hook([]() {
+    throw std::runtime_error {"fixture failure before replacing shared state"};
+  });
+  EXPECT_NE(http::save_user_creds(file.string(), "must not publish", "synthetic password"), 0);
+  EXPECT_EQ(state_bytes(), original);
+}
 
 TEST_F(StateFileTransactionTest, RestrictsEmptyTemporaryBeforeWritingAndPreservesSecurityMetadata) {
 #ifdef _WIN32

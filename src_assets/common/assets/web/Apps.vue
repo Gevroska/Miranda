@@ -272,6 +272,9 @@
               <div id="appWorkingDirHelp" class="form-text">{{ $t('apps.working_dir_desc') }}</div>
             </div>
             <!-- elevation -->
+            <Checkbox v-if="platform === 'windows'" class="mb-3" id="appForceVirtualDisplay"
+                      label="config.force_virtual_display" desc="display_preferences.availability"
+                      v-model="editForm['force-virtual-display']" :default="false" />
             <Checkbox v-if="platform === 'windows'"
                       class="mb-3"
                       id="appElevation"
@@ -806,6 +809,7 @@
           elevated: false,
           "auto-detach": true,
           "wait-all": true,
+          "force-virtual-display": false,
           "exit-timeout": 5,
           "prep-cmd": [],
           detached: [],
@@ -817,6 +821,9 @@
       editApp(id) {
         this.editForm = structuredClone(toRaw(this.apps[id]));
         this.editForm.index = id;
+        if (this.editForm["force-virtual-display"] === undefined) {
+          this.editForm["force-virtual-display"] = false;
+        }
         if (this.editForm["prep-cmd"] === undefined)
           this.editForm["prep-cmd"] = [];
         if (this.editForm["detached"] === undefined)

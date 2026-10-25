@@ -44,6 +44,7 @@
 #endif
 
 // local includes
+#include "app_catalog.h"
 #include "config.h"
 #include "crypto.h"
 #include "file_handler.h"
@@ -566,10 +567,15 @@ namespace http {
   int save_user_creds(const std::string &file, const std::string &username, const std::string &password, bool run_our_mouth) {
     const auto salt = crypto::rand_alphabet(16);
     const auto hash = util::hex(crypto::hash(password + salt)).to_string();
-    if (!update_state_file(file, [&](auto &tree) {
-          tree.put("username", username);
-          tree.put("salt", salt);
-          tree.put("password", hash);
+    if (!update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
+          auto tree = original.empty() && !fs::exists(file) ? proc::catalog::json::object() : proc::catalog::parse(original);
+          if (!tree.is_object()) {
+            return std::nullopt;
+          }
+          tree["username"] = username;
+          tree["salt"] = salt;
+          tree["password"] = hash;
+          return tree.dump(2) + "\n";
         })) {
       return -1;
     }

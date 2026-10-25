@@ -11,6 +11,7 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -174,6 +175,8 @@ namespace nvhttp {
     bool enabled = true;  ///< Whether this persisted client entry may connect.
     permissions::mask_t permissions = 0;  ///< Explicit implemented rights; pairing alone grants nothing.
     std::uint64_t revision = 0;  ///< Monotonic in-process authorization revision.
+    display_policy::device_preferences_t display;  ///< Typed administrator-owned fresh-source preferences.
+    bool display_valid = true;  ///< Malformed saved preferences are preserved until explicitly repaired.
   };
 
   /**
@@ -255,20 +258,49 @@ namespace nvhttp {
    * @brief Persist the current state to its backing store.
    */
   bool save_state(const client_t &client = client_root) {
-    return http::update_state_file(config::nvhttp.file_state, [&](auto &root) {
-      root.put("root.uniqueid", http::unique_id);
-      root.get_child("root").erase("devices");
-      pt::ptree devices;
-      for (const auto &device : client.named_devices) {
-        pt::ptree node;
-        node.put("name", device.name);
-        node.put("cert", device.cert);
-        node.put("uuid", device.uuid);
-        node.put("enabled", device.enabled);
-        node.put("permissions", device.permissions);
-        devices.push_back(std::make_pair(""s, node));
+    return http::update_state_file_bytes(config::nvhttp.file_state, [&](const std::string &original) -> std::optional<std::string> {
+      auto tree = original.empty() && !fs::exists(config::nvhttp.file_state) ? proc::catalog::json::object() : proc::catalog::parse(original);
+      if (!tree.is_object() || (tree.contains("root") && !tree["root"].is_object())) {
+        return std::nullopt;
       }
-      root.put_child("root.named_devices", devices);
+      auto &root = tree["root"];
+      if (root.is_null()) {
+        root = proc::catalog::json::object();
+      }
+      const auto previous = root.value("named_devices", proc::catalog::json::array());
+      if (!previous.is_array() && previous != "") {
+        return std::nullopt;
+      }
+      root["uniqueid"] = http::unique_id;
+      root.erase("devices");
+      auto devices = proc::catalog::json::array();
+      for (const auto &device : client.named_devices) {
+        auto node = proc::catalog::json::object();
+        bool matched = false;
+        if (previous.is_array()) {
+          for (const auto &saved : previous) {
+            if (saved.is_object() && saved.value("uuid", "") == device.uuid) {
+              if (matched) {
+                return std::nullopt;
+              }
+              node = saved;
+              matched = true;
+            }
+          }
+        }
+        node["name"] = device.name;
+        node["cert"] = device.cert;
+        node["uuid"] = device.uuid;
+        // Retain the inherited property-tree scalar contract for authority fields.
+        node["enabled"] = device.enabled ? "true" : "false";
+        node["permissions"] = std::to_string(device.permissions);
+        if (device.display_valid) {
+          node["display"] = display_policy::serialize_device(device.display, node.value("display", proc::catalog::json::object()));
+        }
+        devices.push_back(std::move(node));
+      }
+      root["named_devices"] = std::move(devices);
+      return tree.dump(2) + "\n";
     });
   }
 
@@ -360,7 +392,7 @@ namespace nvhttp {
         if (client.uuid.empty() || (!original_uuid.empty() && client.uuid != original_uuid)) {
           return std::nullopt;
         }
-        return verified_client_t {client.uuid, crypto::pem(stored_certificate), client.name, client.permissions, client.revision};
+        return verified_client_t {client.uuid, crypto::pem(stored_certificate), client.name, client.permissions, client.revision, client.display, client.display_valid};
       }
     }
     return std::nullopt;
@@ -489,8 +521,16 @@ namespace nvhttp {
     }
 
     pt::ptree tree;
+    proc::catalog::json typed;
     try {
-      pt::read_json(config::nvhttp.file_state, tree);
+      std::ifstream file {config::nvhttp.file_state, std::ios::binary};
+      const std::string bytes {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+      if (!file || file.bad()) {
+        throw std::runtime_error {"State file could not be read"};
+      }
+      typed = proc::catalog::parse(bytes);
+      std::istringstream input {bytes};
+      pt::read_json(input, tree);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
 
@@ -527,6 +567,7 @@ namespace nvhttp {
     }
 
     if (root.count("named_devices")) {
+      std::size_t index = 0;
       for (auto &[_, el] : root.get_child("named_devices")) {
         named_cert_t named_cert;
         named_cert.name = el.get_child("name").get_value<std::string>();
@@ -538,6 +579,17 @@ namespace nvhttp {
         if (!grant) {
           BOOST_LOG(warning) << "Invalid paired-client permission mask requires an explicit administrator grant"sv;
         }
+        try {
+          const auto &devices = typed.at("root").at("named_devices");
+          const auto &node = devices.at(index);
+          if (node.contains("display")) {
+            named_cert.display = display_policy::parse_device(node.at("display"));
+          }
+        } catch (const std::exception &) {
+          named_cert.display_valid = false;
+          BOOST_LOG(warning) << "Invalid paired-client display preferences require an explicit administrator update"sv;
+        }
+        ++index;
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -1463,6 +1515,8 @@ namespace nvhttp {
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
       named_cert_node["permissions"] = named_cert.permissions;
+      named_cert_node["display"] = display_policy::serialize_device(named_cert.display);
+      named_cert_node["display_valid"] = named_cert.display_valid;
       named_cert_nodes.push_back(named_cert_node);
     }
 
@@ -1863,13 +1917,23 @@ namespace nvhttp {
     return true;
   }
 
-  bool update_client(const std::string_view uuid, const std::optional<bool> enabled, const std::optional<permissions::mask_t> grant) {
-    if ((grant && !permissions::valid(*grant)) || (!grant && !enabled)) {
+  bool update_client(const std::string_view uuid, const std::optional<bool> enabled, const std::optional<permissions::mask_t> grant, const std::optional<display_policy::device_preferences_t> display) {
+    if ((grant && !permissions::valid(*grant)) || (!grant && !enabled && !display)) {
       return false;
+    }
+    if (display) {
+      try {
+        if (display_policy::parse_device(display_policy::serialize_device(*display)) != *display) {
+          return false;
+        }
+      } catch (const std::exception &) {
+        return false;
+      }
     }
     std::lock_guard mutation {client_mutation_mutex};
     std::string cert;
     bool destroy = false;
+    const bool authorization_update = enabled.has_value() || grant.has_value();
     {
       std::lock_guard lock {client_auth_mutex()};
       auto candidate = client_root;
@@ -1883,16 +1947,26 @@ namespace nvhttp {
       if (grant) {
         it->permissions = *grant;
       }
-      it->revision = ++authorization_revision;
+      if (display) {
+        it->display = *display;
+        it->display_valid = true;
+      }
+      if (authorization_update) {
+        it->revision = ++authorization_revision;
+      }
       cert = it->cert;
       destroy = !it->enabled;
       if (!save_state(candidate)) {
         return false;
       }
       client_root = std::move(candidate);
-      rebuild_client_cert_chain();
+      if (authorization_update) {
+        rebuild_client_cert_chain();
+      }
     }
-    rtsp_stream::reconcile_client(uuid, cert, destroy);
+    if (authorization_update) {
+      rtsp_stream::reconcile_client(uuid, cert, destroy);
+    }
     return true;
   }
 

@@ -2163,6 +2163,38 @@ TEST_F(DevicePermissionApiTest, FailedPersistenceReturnsFailureAndLeavesPrevious
   config::nvhttp.file_state = valid_file;
 }
 
+TEST_F(DevicePermissionApiTest, OnlyAuthenticatedCsrfProtectedAdministrationCanSaveDisplayPreferences) {
+  const nlohmann::json display = {{"force_virtual", true}, {"resolution", {{"width", 2560}, {"height", 1440}}}, {"refresh_rate", {{"numerator", 120000}, {"denominator", 2002}}}};
+  const auto body = nlohmann::json {{"uuid", uuid}, {"display", display}}.dump();
+  SimpleWeb::CaseInsensitiveMultimap headers {{"Content-Type", "application/json"}};
+  EXPECT_EQ(client->request("POST", "/client-update-test", body, headers)->status_code, "401 Unauthorized");
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", "https://example.invalid");
+  EXPECT_EQ(client->request("POST", "/client-update-test", body, headers)->status_code, "403 Forbidden");
+  EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  const auto response = update({{"uuid", uuid}, {"display", display}});
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  const auto device = nvhttp::get_all_clients()[0];
+  EXPECT_TRUE(device["display"]["force_virtual"].get<bool>());
+  EXPECT_EQ(device["display"]["refresh_rate"]["numerator"], 60000);
+  EXPECT_EQ(device["display"]["refresh_rate"]["denominator"], 1001);
+  EXPECT_EQ(device["permissions"], 0U);
+}
+
+TEST_F(DevicePermissionApiTest, MalformedDisplayEditsCannotPublishCombinedGrant) {
+  for (const auto &display : {
+         nlohmann::json::parse(R"({"force_virtual":"true"})"),
+         nlohmann::json::parse(R"({"resolution":{"width":1920}})"),
+         nlohmann::json::parse(R"({"refresh_rate":{"numerator":60000,"denominator":0}})"),
+       }) {
+    const auto response = update({{"uuid", uuid}, {"permissions", permissions::launch}, {"display", display}});
+    EXPECT_EQ(response->status_code, "400 Bad Request");
+    EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+    EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  }
+}
+
 /**
  * @brief Real authenticated editor endpoints share content preconditions and UUID selectors.
  */

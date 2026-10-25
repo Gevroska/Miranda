@@ -13,6 +13,20 @@ import Apps from '../../src_assets/common/assets/web/Apps.vue'
 beforeEach(() => vi.clearAllMocks())
 afterEach(() => vi.unstubAllGlobals())
 
+describe('application display preferences', () => {
+  it('edits force-virtual without changing stable identities or unknown typed metadata', () => {
+    const app = { name: 'Game', id: '17', uuid: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', foreign: { flags: [false, null] } }
+    const context = { apps: [app], platform: 'windows', openEditModal: vi.fn() }
+    Apps.methods.editApp.call(context, 0)
+    expect(context.editForm['force-virtual-display']).toBe(false)
+    context.editForm['force-virtual-display'] = true
+    expect(context.editForm.uuid).toBe(app.uuid)
+    expect(context.editForm.id).toBe(app.id)
+    expect(context.editForm.foreign).toEqual(app.foreign)
+    expect(app['force-virtual-display']).toBeUndefined()
+  })
+})
+
 /**
  * Build a minimal context object that satisfies
  * the `this` contract of fileBrowserConfirm().
