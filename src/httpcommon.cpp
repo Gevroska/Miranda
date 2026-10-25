@@ -350,7 +350,12 @@ namespace http {
           return false;
         }
         const auto protection = (control & SE_DACL_PROTECTED) ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION;
-        if (!SetFileSecurityW(temporary.c_str(), DACL_SECURITY_INFORMATION | protection, existing_security.data())) {
+        auto restoration_security = existing_security;
+        // Request the captured inheritance model as setter input; keep the readback snapshot immutable.
+        if (!SetSecurityDescriptorControl(restoration_security.data(), SE_DACL_AUTO_INHERIT_REQ, (control & SE_DACL_AUTO_INHERITED) ? SE_DACL_AUTO_INHERIT_REQ : 0)) {
+          return false;
+        }
+        if (!SetFileSecurityW(temporary.c_str(), DACL_SECURITY_INFORMATION | protection, restoration_security.data())) {
           BOOST_LOG(error) << "State update refused because the empty temporary's security policy could not be restored"sv;
           return false;
         }

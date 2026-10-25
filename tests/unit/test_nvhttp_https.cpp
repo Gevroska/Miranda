@@ -270,9 +270,19 @@ namespace {
         client->socket.lowest_layer().close(close_error);
       }
       if (server) {
-        server->stop();
+        // The fixture owns this event loop; SimpleWeb::stop only stops an internal loop.
+        const auto server_io = server->io_service;
+        if (server_io) {
+          server_io->stop();
+        }
         if (server_thread.joinable()) {
           server_thread.join();
+        }
+        handler_scope->stop();
+        server->stop();
+        if (server_io) {
+          server_io->restart();
+          server_io->poll();
         }
         server.reset();
       }
