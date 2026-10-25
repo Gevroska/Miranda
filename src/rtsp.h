@@ -94,6 +94,7 @@ namespace rtsp_stream {
     int fps;  ///< Requested video frame rate.
     int gcmap;  ///< Game controller mapping requested by the client.
     int appid;  ///< Application ID requested for launch or resume.
+    std::string app_uuid;  ///< Server-resolved application UUID, never a client authority token.
     int surround_info;  ///< Encoded GameStream surround-sound capability flags.
     std::string surround_params;  ///< Client-provided surround-sound layout parameters.
     bool continuous_audio;  ///< Whether audio packets continue during silence.
@@ -139,6 +140,13 @@ namespace rtsp_stream {
    * @return Whether current authority allowed dispatch.
    */
   bool authorize_operation(std::string_view uuid, std::string_view cert, permissions::mask_t required, std::function<void()> operation);
+
+  /**
+   * @brief Serialize catalog work with admission/revocation; use direct fallback before owner startup.
+   * @param operation Must never wait for a control worker or acquire authorization from a state-file callback.
+   * @note Never call from stream control workers that owner shutdown can join.
+   */
+  void catalog_operation(std::function<void()> operation);
 
   /**
    * @brief Reconcile a completed authorization mutation on the admission owner thread.
@@ -210,6 +218,10 @@ namespace rtsp_stream {
      * @return Whether a first authorized ANNOUNCE can claim it.
      */
     bool claim_launch(const std::shared_ptr<launch_session_t> &launch);
+    /**
+     * @brief Inspect the actual pending admission for protocol identity and rollback regressions.
+     */
+    std::shared_ptr<launch_session_t> pending_launch();
   }  // namespace test_support
 #endif
 }  // namespace rtsp_stream

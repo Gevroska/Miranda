@@ -484,6 +484,11 @@ namespace nvhttp {
    */
   namespace test_support {
     /**
+     * @brief Substitute fresh-source setup and rollback for protocol fixtures without media hardware.
+     * @note Optional session count supplies an explicitly fake existing-viewer scenario, never real display/capture proof.
+     */
+    void set_source_preparation_hooks(std::function<void(const rtsp_stream::launch_session_t &)> configure = {}, std::function<int()> probe = {}, std::function<void()> rollback = {}, std::function<int()> sessions = {});
+    /**
      * @brief Install the actual protected GameStream routes on a loopback test listener.
      * @param server Production HTTPS specialization.
      * @param host_audio Test-owned host audio preference retained by the route callbacks.

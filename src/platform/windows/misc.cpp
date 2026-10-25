@@ -1043,8 +1043,13 @@ namespace platf {
     }
 
     // Temporarily prepend the specified working directory to PATH to ensure CreateProcess()
-    // will (preferentially) find binaries that reside in the working directory.
-    sunshine_wenv[path_var_name].assign(start_dir + L";" + old_path_val);
+    // will (preferentially) find binaries in that directory, followed by the prepared child PATH.
+    // This existing native override is confined to execution; catalog preparation stays owned and pure.
+    const auto prepared_path = boost::range::find_if(env, [](const auto &entry) {
+      return boost::iequals(entry.get_name(), "PATH");
+    });
+    const auto prepared_path_value = prepared_path == env.cend() ? std::wstring {} : utf_utils::from_utf8(prepared_path->to_string());
+    sunshine_wenv[path_var_name].assign(start_dir + L";" + prepared_path_value);
 
     // Restore the old PATH value for our process when we're done here
     auto restore_path = util::fail_guard([&old_path_val, &sunshine_wenv, &path_var_name]() {

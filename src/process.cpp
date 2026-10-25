@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -26,15 +27,18 @@
 #include <openssl/sha.h>
 
 // local includes
+#include "app_catalog.h"
 #include "config.h"
 #include "crypto.h"
 #include "display_device.h"
+#include "httpcommon.h"
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
 #include "process.h"
 #include "system_tray.h"
 #include "utility.h"
+#include "uuid.h"
 
 #ifdef _WIN32
   // from_utf8() string conversion function
@@ -49,6 +53,17 @@ namespace proc {
   namespace pt = boost::property_tree;
 
   proc_t proc;  ///< Global process registry used to track and terminate child processes.
+#ifdef SUNSHINE_TESTS
+  namespace {
+    std::function<void(const boost::process::v1::environment &)> undo_environment_hook;  ///< Fixture observer installed only when no command consumer is active.
+  }
+
+  namespace test_support {
+    void set_undo_environment_hook(std::function<void(const boost::process::v1::environment &)> hook) {
+      undo_environment_hook = std::move(hook);
+    }
+  }  // namespace test_support
+#endif
 
   /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
@@ -65,6 +80,95 @@ namespace proc {
 
   std::unique_ptr<platf::deinit_t> init() {
     return std::make_unique<deinit_t>();
+  }
+
+  /**
+   * @brief Find an owned environment key using the platform's replacement semantics.
+   */
+  static std::string environment_key([[maybe_unused]] const boost::process::v1::environment &env, const std::string &name) {
+#ifdef _WIN32
+    const auto found = boost::range::find_if(env, [&](const auto &entry) {
+      return boost::iequals(entry.get_name(), name);
+    });
+    if (found != env.cend()) {
+      return found->get_name();
+    }
+#endif
+    return name;
+  }
+
+  /**
+   * @brief Assign an owned value without creating a differently cased Windows duplicate.
+   */
+  void assign_environment(boost::process::v1::environment &env, const std::string &name, const std::string &value) {
+    env[environment_key(env, name)] = value;
+  }
+
+  /**
+   * @brief Read search directories only from the prepared child environment.
+   */
+  static std::vector<boost::filesystem::path> environment_paths(const boost::process::v1::environment &env) {
+    std::vector<boost::filesystem::path> paths;
+    const auto entry = env.find(environment_key(env, "PATH"));
+    if (entry != env.cend()) {
+      for (const auto &path : entry->to_vector()) {
+        paths.emplace_back(path);
+      }
+    }
+    return paths;
+  }
+
+  /**
+   * @brief Resolve a POSIX command prefix without changing the pinned Boost argument grammar or suffix.
+   */
+  static std::optional<std::string> configured_command(const std::string &command, [[maybe_unused]] const boost::process::v1::environment &env) {
+#ifdef _WIN32
+    // Windows keeps its existing association handling and runtime PATH search boundary.
+    return command;
+#else
+    const auto begin = command.find_first_not_of(' ');
+    if (begin == std::string::npos) {
+      return std::nullopt;
+    }
+    auto end = begin;
+    bool quoted = false;
+    for (; end < command.size(); ++end) {
+      if (command[end] == '"') {
+        quoted = !quoted;
+      }
+      if (command[end] == ' ' && !quoted) {
+        break;
+      }
+    }
+    auto target = command.substr(begin, end - begin);
+    if (target.size() >= 2 && target.front() == '"' && target.back() == '"') {
+      target = target.substr(1, target.size() - 2);
+    }
+    boost::replace_all(target, "\\\"", "\"");
+    const boost::filesystem::path executable {target};
+    if (executable.has_parent_path() || executable.is_absolute()) {
+      return command;
+    }
+    const auto found = boost::process::v1::search_path(executable, environment_paths(env));
+    if (found.empty()) {
+      return std::nullopt;
+    }
+    auto absolute = boost::filesystem::absolute(found).string();
+    boost::replace_all(absolute, "\"", "\\\"");
+    return command.substr(0, begin) + '"' + absolute + '"' + command.substr(end);
+#endif
+  }
+
+  /**
+   * @brief Execute using configured lookup while keeping environment references pinned by the process guard.
+   */
+  static boost::process::v1::child run_configured_command(bool elevated, bool interactive, const std::string &command, boost::filesystem::path &directory, const boost::process::v1::environment &env, FILE *output, std::error_code &error, boost::process::v1::group *group) {
+    const auto resolved = configured_command(command, env);
+    if (!resolved) {
+      error = std::make_error_code(std::errc::no_such_file_or_directory);
+      return {};
+    }
+    return platf::run_command(elevated, interactive, *resolved, directory, env, output, error, group);
   }
 
   void terminate_process_group(boost::process::v1::child &child_process, boost::process::v1::group &group, std::chrono::seconds exit_timeout) {
@@ -140,9 +244,9 @@ namespace proc {
     // If the cmd path is not an absolute path, resolve it using our PATH variable
     boost::filesystem::path cmd_path(parts.at(0));
     if (!cmd_path.is_absolute()) {
-      cmd_path = boost::process::v1::search_path(parts.at(0));
+      cmd_path = boost::process::v1::search_path(parts.at(0), environment_paths(env));
       if (cmd_path.empty()) {
-        BOOST_LOG(error) << "Unable to find executable ["sv << parts.at(0) << "]. Is it in your PATH?"sv;
+        BOOST_LOG(error) << "Unable to find executable ["sv << parts.at(0) << "]. Is it in the configured PATH?"sv;
         return boost::filesystem::path();
       }
     }
@@ -171,6 +275,7 @@ namespace proc {
   }
 
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    const auto state = lock_state();
     // Ensure starting from a clean slate
     terminate();
 
@@ -189,29 +294,29 @@ namespace proc {
     _app_prep_it = _app_prep_begin;
 
     // Add Stream-specific environment variables
-    _env["SUNSHINE_APP_ID"] = std::to_string(_app_id);
-    _env["SUNSHINE_APP_NAME"] = _app.name;
-    _env["SUNSHINE_CLIENT_NAME"] = launch_session->client_name;
-    _env["SUNSHINE_CLIENT_WIDTH"] = std::to_string(launch_session->width);
-    _env["SUNSHINE_CLIENT_HEIGHT"] = std::to_string(launch_session->height);
-    _env["SUNSHINE_CLIENT_FPS"] = std::to_string(launch_session->fps);
-    _env["SUNSHINE_CLIENT_HDR"] = launch_session->enable_hdr ? "true" : "false";
-    _env["SUNSHINE_CLIENT_GCMAP"] = std::to_string(launch_session->gcmap);
-    _env["SUNSHINE_CLIENT_HOST_AUDIO"] = launch_session->host_audio ? "true" : "false";
-    _env["SUNSHINE_CLIENT_ENABLE_SOPS"] = launch_session->enable_sops ? "true" : "false";
+    (*_env)["SUNSHINE_APP_ID"] = std::to_string(_app_id);
+    (*_env)["SUNSHINE_APP_NAME"] = _app.name;
+    (*_env)["SUNSHINE_CLIENT_NAME"] = launch_session->client_name;
+    (*_env)["SUNSHINE_CLIENT_WIDTH"] = std::to_string(launch_session->width);
+    (*_env)["SUNSHINE_CLIENT_HEIGHT"] = std::to_string(launch_session->height);
+    (*_env)["SUNSHINE_CLIENT_FPS"] = std::to_string(launch_session->fps);
+    (*_env)["SUNSHINE_CLIENT_HDR"] = launch_session->enable_hdr ? "true" : "false";
+    (*_env)["SUNSHINE_CLIENT_GCMAP"] = std::to_string(launch_session->gcmap);
+    (*_env)["SUNSHINE_CLIENT_HOST_AUDIO"] = launch_session->host_audio ? "true" : "false";
+    (*_env)["SUNSHINE_CLIENT_ENABLE_SOPS"] = launch_session->enable_sops ? "true" : "false";
     int channelCount = launch_session->surround_info & 65535;
     switch (channelCount) {
       case 2:
-        _env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
+        (*_env)["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "2.0";
         break;
       case 6:
-        _env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
+        (*_env)["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "5.1";
         break;
       case 8:
-        _env["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
+        (*_env)["SUNSHINE_CLIENT_AUDIO_CONFIGURATION"] = "7.1";
         break;
     }
-    _env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
+    (*_env)["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
 
     if (!_app.output.empty() && _app.output != "null"sv) {
 #ifdef _WIN32
@@ -244,10 +349,10 @@ namespace proc {
 
       const auto command = prepare_command(cmd.do_cmd);
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
-                                              find_working_directory(command, _env) :
+                                              find_working_directory(command, *_env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing Do Cmd: ["sv << command << ']';
-      auto child = platf::run_command(cmd.elevated, true, command, working_dir, _env, _pipe.get(), ec, nullptr);
+      auto child = run_configured_command(cmd.elevated, true, command, working_dir, *_env, _pipe.get(), ec, nullptr);
 
       if (ec) {
         BOOST_LOG(error) << "Couldn't run ["sv << command << "]: System: "sv << ec.message();
@@ -274,10 +379,10 @@ namespace proc {
     for (auto &cmd : _app.detached) {
       const auto command = prepare_command(cmd);
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
-                                              find_working_directory(command, _env) :
+                                              find_working_directory(command, *_env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Spawning ["sv << command << "] in ["sv << working_dir << ']';
-      auto child = platf::run_command(_app.elevated, true, command, working_dir, _env, _pipe.get(), ec, nullptr);
+      auto child = run_configured_command(_app.elevated, true, command, working_dir, *_env, _pipe.get(), ec, nullptr);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't spawn ["sv << command << "]: System: "sv << ec.message();
       } else {
@@ -291,10 +396,10 @@ namespace proc {
     } else {
       const auto command = prepare_command(_app.cmd);
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
-                                              find_working_directory(command, _env) :
+                                              find_working_directory(command, *_env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing: ["sv << command << "] in ["sv << working_dir << ']';
-      _process = platf::run_command(_app.elevated, true, command, working_dir, _env, _pipe.get(), ec, &_process_group);
+      _process = run_configured_command(_app.elevated, true, command, working_dir, *_env, _pipe.get(), ec, &_process_group);
       if (ec) {
         BOOST_LOG(warning) << "Couldn't run ["sv << command << "]: System: "sv << ec.message();
         return -1;
@@ -309,6 +414,7 @@ namespace proc {
   }
 
   int proc_t::running() {
+    const auto state = lock_state();
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -344,6 +450,7 @@ namespace proc {
   }
 
   void proc_t::terminate() {
+    const auto state = lock_state();
     input::terminate_gamepads();
     std::error_code ec;
     placebo = false;
@@ -360,13 +467,19 @@ namespace proc {
 
       const auto command = prepare_command(cmd.undo_cmd);
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
-                                              find_working_directory(command, _env) :
+                                              find_working_directory(command, *_env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing Undo Cmd: ["sv << command << ']';
-      auto child = platf::run_command(cmd.elevated, true, command, working_dir, _env, _pipe.get(), ec, nullptr);
+#ifdef SUNSHINE_TESTS
+      if (undo_environment_hook) {
+        undo_environment_hook(*_env);
+      }
+#endif
+      auto child = run_configured_command(cmd.elevated, true, command, working_dir, *_env, _pipe.get(), ec, nullptr);
 
       if (ec) {
         BOOST_LOG(warning) << "System: "sv << ec.message();
+        continue;
       }
 
       child.wait();
@@ -394,6 +507,11 @@ namespace proc {
     _app_id = -1;
   }
 
+  state_guard_t proc_t::lock_state() const {
+    return state_guard_t {_state_mutex};
+  }
+
+#ifdef SUNSHINE_TESTS
   const std::vector<ctx_t> &proc_t::get_apps() const {
     return _apps;
   }
@@ -402,11 +520,31 @@ namespace proc {
     return _apps;
   }
 
+  boost::process::v1::environment proc_t::get_env() const {
+    const auto state = lock_state();
+    return *_env;
+  }
+
+  bool proc_t::wait_for_exit_for_testing(std::chrono::milliseconds timeout) {
+    const auto state = lock_state();
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (_process.running()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        return false;
+      }
+      std::this_thread::sleep_until(std::min(deadline, now + std::chrono::milliseconds {1}));
+    }
+    return true;
+  }
+#endif
+
   // Gets application image from application list.
   // Returns image from assets directory if found there.
   // Returns default image if image configuration is not set.
   // Returns http content-type header compatible image type.
   std::string proc_t::get_app_image(int app_id) {
+    const auto state = lock_state();
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
     });
@@ -416,21 +554,57 @@ namespace proc {
   }
 
   std::string proc_t::get_last_run_app_name() {
+    const auto state = lock_state();
     return _app.name;
   }
 
-  void proc_t::update_apps_and_env(proc_t &&other) {
+  std::pair<int, std::string> proc_t::active_identity() {
+    const auto state = lock_state();
+    const auto id = running();
+    return {id, id > 0 ? _app.uuid : std::string {}};
+  }
+
+  std::vector<ctx_t> proc_t::apps_snapshot() const {
+    const auto state = lock_state();
+    return _apps;
+  }
+
+  void proc_t::prepare_apps_and_env(proc_t &other) const {
+    const auto state = lock_state();
     if (_app_id > 0 || placebo) {
-      // Preserve session-specific environment variables for the running app
-      for (const auto &var : _env) {
-        std::string name = var.get_name();
-        if (name.find("SUNSHINE_APP_") == 0 || name.find("SUNSHINE_CLIENT_") == 0) {
-          other._env[name] = var.to_string();
+      for (const auto &var : *_env) {
+        const auto name = var.get_name();
+        if (name.starts_with("SUNSHINE_APP_") || name.starts_with("SUNSHINE_CLIENT_")) {
+          (*other._env)[name] = var.to_string();
         }
       }
     }
-    _env = std::move(other._env);
-    _apps = std::move(other._apps);
+  }
+
+  void proc_t::publish_apps_and_env(proc_t &other, const state_guard_t &guard) noexcept {
+    assert(guard.lifetime == _state_mutex && guard.lock.owns_lock());
+    // Pointer/vector swaps avoid Boost.Process environment moves or allocation after commit.
+    static_assert(noexcept(_env.swap(other._env)) && noexcept(_apps.swap(other._apps)));
+    _env.swap(other._env);
+    _apps.swap(other._apps);
+  }
+
+  void proc_t::publish_catalog_revision(std::string &path, std::string &revision, const state_guard_t &guard) noexcept {
+    assert(guard.lifetime == _state_mutex && guard.lock.owns_lock());
+    static_assert(noexcept(_catalog_path.swap(path)) && noexcept(_catalog_revision.swap(revision)));
+    _catalog_path.swap(path);
+    _catalog_revision.swap(revision);
+  }
+
+  bool proc_t::catalog_matches(const std::string &path, const std::string &revision) const {
+    const auto state = lock_state();
+    return _catalog_path == path && _catalog_revision == revision;
+  }
+
+  void proc_t::update_apps_and_env(proc_t &&other) {
+    const auto state = lock_state();
+    prepare_apps_and_env(other);
+    publish_apps_and_env(other, state);
   }
 
   proc_t::~proc_t() {
@@ -477,7 +651,7 @@ namespace proc {
    * @param val_raw Raw value that may contain $(NAME) substitutions.
    * @return Value with recognized environment-variable substitutions expanded.
    */
-  std::string parse_env_val(boost::process::v1::native_environment &env, const std::string_view &val_raw) {
+  std::string parse_env_val(boost::process::v1::environment &env, const std::string_view &val_raw) {
     auto pos = std::begin(val_raw);
     auto dollar = std::find(pos, std::end(val_raw), '$');
 
@@ -694,8 +868,8 @@ namespace proc {
     auto input_with_index = ss.str();
 
     // CRC32 then truncate to signed 32-bit range due to client limitations
-    auto id_no_index = std::to_string(abs((int32_t) calculate_crc32(input_no_index)));
-    auto id_with_index = std::to_string(abs((int32_t) calculate_crc32(input_with_index)));
+    auto id_no_index = std::to_string(catalog::legacy_crc_id(calculate_crc32(input_no_index)));
+    auto id_with_index = std::to_string(catalog::legacy_crc_id(calculate_crc32(input_with_index)));
 
     return std::make_tuple(id_no_index, id_with_index);
   }
@@ -703,19 +877,20 @@ namespace proc {
   /**
    * @brief Parse serialized text into the corresponding runtime representation.
    */
-  std::optional<proc::proc_t> parse(const std::string &file_name) {
+  static std::optional<proc::proc_t> parse_text(const std::string &bytes) {
     pt::ptree tree;
 
     try {
-      pt::read_json(file_name, tree);
+      std::istringstream input {bytes};
+      pt::read_json(input, tree);
 
       auto &apps_node = tree.get_child("apps"s);
       auto &env_vars = tree.get_child("env"s);
 
-      auto this_env = boost::this_process::environment();
+      boost::process::v1::environment this_env {boost::this_process::environment()};
 
       for (auto &[name, val] : env_vars) {
-        this_env[name] = parse_env_val(this_env, val.get_value<std::string>());
+        assign_environment(this_env, name, parse_env_val(this_env, val.get_value<std::string>()));
       }
 
       std::set<std::string, std::less<>> ids;
@@ -806,15 +981,15 @@ namespace proc {
         ctx.wait_all = wait_all.value_or(true);
         ctx.exit_timeout = std::chrono::seconds {exit_timeout.value_or(5)};
 
-        auto possible_ids = calculate_app_id(name, ctx.image_path, i++);
-        if (ids.count(std::get<0>(possible_ids)) == 0) {
-          // Avoid using index to generate id if possible
-          ctx.id = std::get<0>(possible_ids);
+        if (const auto id = app_node.get_optional<std::string>("id")) {
+          ctx.id = *id;
         } else {
-          // Fallback to include index on collision
-          ctx.id = std::get<1>(possible_ids);
+          auto possible_ids = calculate_app_id(name, ctx.image_path, i);
+          ctx.id = ids.contains(std::get<0>(possible_ids)) ? std::get<1>(possible_ids) : std::get<0>(possible_ids);
         }
+        ++i;
         ids.insert(ctx.id);
+        ctx.uuid = app_node.get<std::string>("uuid", "");
 
         ctx.name = std::move(name);
         ctx.prep_cmds = std::move(prep_cmds);
@@ -824,48 +999,218 @@ namespace proc {
       }
 
       return proc::proc_t {
-        this_env,
+        std::move(this_env),
         std::move(apps)
       };
-    } catch (std::exception &e) {
-      BOOST_LOG(error) << e.what();
+    } catch (const std::exception &) {
+      BOOST_LOG(error) << "Application runtime preparation failed";
     }
 
     return std::nullopt;
   }
 
-  /**
-   * @brief Refresh cached platform state from the operating system.
-   *
-   * This function compares the current last modified time of the file to the time it was last parsed.
-   * If the file has been modified since it was last parsed (or if it has never been parsed),
-   * it will be re-parsed to update the app list.
-   *
-   * An optional is used rather than a bare file_time_type because value-initialized
-   * file_time_type{} is not a reliable "never parsed" sentinel. On some toolchains
-   * (e.g. MSYS2 UCRT64 GCC 16.2), file_time_type::clock::now() compares
-   * less-or-equal to file_time_type{}, which would cause the initial parse to be skipped.
-   *
-   * When an app is currently running, only the cached app configuration list and environment
-   * are updated — active process state (_app_id, _process, _process_group, etc.) is preserved
-   * so that the in-flight streaming session can still be terminated properly.
-   */
-  void refresh(const std::string &file_name) {
-    static std::optional<std::filesystem::file_time_type> last_apps_file_update;  ///< Timestamp of the last successful apps.json parse, or nullopt if never parsed.
+  std::optional<proc::proc_t> parse(const std::string &file_name) {
+    std::ifstream input {file_name, std::ios::binary};
+    if (!input) {
+      return std::nullopt;
+    }
+    const std::string bytes {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
+    return input.bad() ? std::nullopt : parse_text(bytes);
+  }
 
-    std::error_code ec;
-    auto current_time = std::filesystem::last_write_time(file_name, ec);
-
-    // Only skip parsing when we have a known-good timestamp and the file hasn't changed
-    if (last_apps_file_update && !ec && current_time == *last_apps_file_update) {
-      return;
+  namespace {
+    /**
+     * @brief Collect legacy image/environment-derived candidates separately from pure normalization.
+     */
+    catalog::allocation allocation_inputs(const catalog::json &tree, const std::pair<int, std::string> &active) {
+      catalog::allocation inputs;
+      inputs.uuid = []() {
+        return uuid_util::uuid_t::generate().string();
+      };
+      inputs.candidate = [](const std::string &uuid) {
+        return calculate_crc32(uuid);
+      };
+      if (active.first > 0 && !active.second.empty()) {
+        inputs.active = active;
+      }
+      if (std::ranges::all_of(tree.at("apps"), [](const auto &app) {
+            return app.contains("id");
+          })) {
+        return inputs;
+      }
+      boost::process::v1::environment env {boost::this_process::environment()};
+      for (const auto &[name, value] : tree.at("env").items()) {
+        assign_environment(env, name, parse_env_val(env, value.get<std::string>()));
+      }
+      std::set<std::string> old_ids;
+      int index = 0;
+      for (const auto &app : tree.at("apps")) {
+        const auto name = parse_env_val(env, app.at("name").get<std::string>());
+        const auto image = parse_env_val(env, app.value("image-path", ""));
+        const auto [primary, indexed] = calculate_app_id(name, image, index++);
+        const auto chosen = old_ids.contains(primary) ? indexed : primary;
+        old_ids.insert(chosen);
+        inputs.legacy.push_back(std::stoi(chosen));
+      }
+      return inputs;
     }
 
-    auto proc_opt = proc::parse(file_name);
+    /**
+     * @brief Execute owner -> process state -> state-file preparation, replace, then nonthrowing publication.
+     */
+    catalog_response transact_catalog(const std::string &file, const std::optional<std::string> &expected, const std::function<void(catalog::json &)> &mutation) {
+      catalog_response response;
+      rtsp_stream::catalog_operation([&]() {
+        try {
+          // Owner -> process state -> state-file. Never acquire this guard before owner dispatch.
+          const auto state = proc.lock_state();
+          auto path = std::filesystem::absolute(file).lexically_normal().string();
+          std::string revision;
+          std::optional<proc_t> prepared;
+          bool ready = false;
+          const auto active = proc.active_identity();
+          const auto success = http::update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
+            try {
+              const auto current_revision = util::hex(crypto::hash(original)).to_string();
+              if (expected && *expected != current_revision) {
+                throw catalog::error {"Application catalog changed; reload before saving", 409};
+              }
+              auto tree = catalog::parse(original);
+              catalog::validate(tree);
+              const auto before = tree;
+              catalog::normalize(tree, allocation_inputs(tree, active));
+              if (mutation) {
+                mutation(tree);
+                catalog::normalize(tree, allocation_inputs(tree, active));
+              }
+              const auto changed = tree != before;
+              auto bytes = changed ? tree.dump(4) + "\n" : original;
+              revision = util::hex(crypto::hash(bytes)).to_string();
+              if (!proc.catalog_matches(path, revision)) {
+                prepared = parse_text(bytes);
+                if (!prepared) {
+                  throw catalog::error {"Application runtime settings could not be prepared"};
+                }
+                proc.prepare_apps_and_env(*prepared);
+              }
+              // Response and every fallible runtime/environment allocation precede replacement.
+              tree["revision"] = revision;
+              tree["status"] = true;
+              // Legacy scalar conversion is response-only; persisted typed/foreign values survive.
+              for (auto &app : tree["apps"]) {
+                for (const auto *key : {"elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all"}) {
+                  if (app.contains(key) && app[key].is_string()) {
+                    app[key] = app[key] == "true";
+                  }
+                }
+                if (app.contains("exit-timeout") && app["exit-timeout"].is_string()) {
+                  app["exit-timeout"] = std::stoi(app["exit-timeout"].get<std::string>());
+                }
+                if (app.contains("prep-cmd")) {
+                  for (auto &cmd : app["prep-cmd"]) {
+                    if (cmd.contains("elevated") && cmd["elevated"].is_string()) {
+                      cmd["elevated"] = cmd["elevated"] == "true";
+                    }
+                  }
+                }
+              }
+              response = {200, tree.dump()};
+              ready = true;
+              return changed ? std::optional {std::move(bytes)} : std::nullopt;
+            } catch (const catalog::error &error) {
+              response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
+              return std::nullopt;
+            }
+          });
+          if (!success || !ready) {
+            // The core consumes exceptions to preserve existing permission-writer behavior.
+            if (response.status == 200 || response.body.empty()) {
+              response = {500, R"({"status":false,"error":"Application catalog could not be saved; previous runtime retained"})"};
+            }
+            return;
+          }
+          if (prepared) {
+            proc.publish_apps_and_env(*prepared, state);
+          }
+          proc.publish_catalog_revision(path, revision, state);
+        } catch (const catalog::error &error) {
+          response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
+        } catch (const std::exception &) {
+          response = {500, R"({"status":false,"error":"Application catalog unavailable; previous runtime retained"})"};
+        }
+      });
+      return response;
+    }
+  }  // namespace
 
-    if (proc_opt) {
-      proc.update_apps_and_env(std::move(*proc_opt));
-      last_apps_file_update = current_time;
+  catalog_response read_catalog(const std::string &file) {
+    return transact_catalog(file, std::nullopt, {});
+  }
+
+  catalog_response save_catalog_app(const std::string &file, const std::string &revision, const std::string &edit) {
+    if (revision.empty()) {
+      return {428, R"({"status":false,"error":"Application catalog revision is required"})"};
+    }
+    return transact_catalog(file, revision, [&](auto &tree) {
+      auto input = catalog::parse(edit);
+      if (!input.is_object()) {
+        throw catalog::error {"application: expected an object"};
+      }
+      auto &apps = tree["apps"];
+      if (input.contains("uuid")) {
+        const auto uuid = input["uuid"].is_string() ? catalog::canonical_uuid(input["uuid"].template get<std::string>()) : std::nullopt;
+        if (!uuid) {
+          throw catalog::error {"apps.uuid: invalid UUID"};
+        }
+        input["uuid"] = *uuid;
+        const auto it = std::find_if(apps.begin(), apps.end(), [&](const auto &app) {
+          return app["uuid"] == *uuid;
+        });
+        if (it == apps.end()) {
+          throw catalog::error {"Application no longer exists", 404};
+        }
+        catalog::merge_edit(*it, input);
+      } else {
+        if (!input.contains("index") || input["index"] != -1 || input.contains("id")) {
+          throw catalog::error {"New applications require server-generated identity"};
+        }
+        auto app = input;
+        for (const auto *key : {"index", "revision", "launching", "status"}) {
+          app.erase(key);
+        }
+        apps.push_back(std::move(app));
+      }
+      catalog::validate(tree);
+      std::stable_sort(apps.begin(), apps.end(), [](const auto &left, const auto &right) {
+        return left.at("name").template get<std::string>() < right.at("name").template get<std::string>();
+      });
+    });
+  }
+
+  catalog_response delete_catalog_app(const std::string &file, const std::string &revision, const std::string &uuid) {
+    if (revision.empty()) {
+      return {428, R"({"status":false,"error":"Application catalog revision is required"})"};
+    }
+    return transact_catalog(file, revision, [&](auto &tree) {
+      const auto target = catalog::canonical_uuid(uuid);
+      if (!target) {
+        throw catalog::error {"apps.uuid: invalid UUID"};
+      }
+      auto &apps = tree["apps"];
+      const auto it = std::find_if(apps.begin(), apps.end(), [&](const auto &app) {
+        return app["uuid"] == *target;
+      });
+      if (it == apps.end()) {
+        throw catalog::error {"Application no longer exists", 404};
+      }
+      apps.erase(it);
+    });
+  }
+
+  void refresh(const std::string &file_name) {
+    const auto result = read_catalog(file_name);
+    if (result.status != 200) {
+      BOOST_LOG(error) << "Application catalog refresh failed; previous runtime retained";
     }
   }
 }  // namespace proc

@@ -369,9 +369,22 @@ jobs:
 
       - name: Run tests
         id: test
-        shell: msys2 {0}
+        # Keep child-process tests in a native Windows context after the MSYS2 build.
+        shell: pwsh
         working-directory: cmake-build-ci/tests
-        run: ./test_sunshine.exe --gtest_color=yes --gtest_output=xml:test_results.xml
+        env:
+          MSYS2_LOCATION: ${{ steps.setup-msys2.outputs.msys2-location }}
+          MATRIX_MSYSTEM: ${{ matrix.msystem }}
+        run: |
+          $runtimeBin = Join-Path $env:MSYS2_LOCATION "$env:MATRIX_MSYSTEM/bin"
+          if (-not (Test-Path -LiteralPath $runtimeBin -PathType Container)) {
+            throw 'Configured MSYS2 runtime directory is unavailable'
+          }
+          $env:PATH = "$runtimeBin;$env:PATH"
+          & ./test_sunshine.exe --gtest_color=yes --gtest_output=xml:test_results.xml
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Upload system tray screenshots
         if: >-

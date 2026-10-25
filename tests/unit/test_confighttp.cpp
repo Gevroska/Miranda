@@ -33,6 +33,7 @@
 #include <src/httpcommon.h>
 #include <src/network.h>
 #include <src/nvhttp.h>
+#include <src/process.h>
 #include <src/utility.h>
 
 #ifdef SUNSHINE_BUILD_PORTAL
@@ -40,6 +41,9 @@
 #endif
 
 namespace confighttp {
+  void getApps(const resp_https_t &response, const req_https_t &request);
+  void saveApp(const resp_https_t &response, const req_https_t &request);
+  void deleteApp(const resp_https_t &response, const req_https_t &request);
   /**
    * @brief Production device-administration route exercised by the existing HTTPS fixture.
    * @param response Response object.
@@ -198,6 +202,9 @@ protected:
     server->config.timeout_content = 300;
 
     server->resource["^/client-update-test$"]["POST"] = confighttp::updateClient;
+    server->resource["^/api/apps$"]["GET"] = confighttp::getApps;
+    server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
+    server->resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = confighttp::deleteApp;
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -2154,4 +2161,65 @@ TEST_F(DevicePermissionApiTest, FailedPersistenceReturnsFailureAndLeavesPrevious
   EXPECT_FALSE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
   EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
   config::nvhttp.file_state = valid_file;
+}
+
+/**
+ * @brief Real authenticated editor endpoints share content preconditions and UUID selectors.
+ */
+class AppCatalogApiTest: public ConfigHttpTest {
+protected:
+  std::string previous_file;
+  proc::proc_t previous_proc;
+
+  void SetUp() override {
+    ConfigHttpTest::SetUp();
+    previous_file = config::stream.file_apps;
+    previous_proc = std::move(proc::proc);
+    proc::proc = proc::proc_t {};
+    config::stream.file_apps = (test_web_dir / "apps.json").string();
+    std::ofstream {config::stream.file_apps} << R"({"env":{},"apps":[{"name":"A","foreign":{"enabled":false}}]})";
+  }
+
+  void TearDown() override {
+    proc::proc.terminate();
+    proc::proc = std::move(previous_proc);
+    config::stream.file_apps = previous_file;
+    ConfigHttpTest::TearDown();
+  }
+
+  SimpleWeb::CaseInsensitiveMultimap headers(bool csrf = true) {
+    SimpleWeb::CaseInsensitiveMultimap result {{"Authorization", create_auth_header("testuser", "testpass")}, {"Content-Type", "application/json"}};
+    if (csrf) {
+      const auto token = client->request("GET", "/csrf-token-test", "", result);
+      result.emplace("Origin", "https://example.invalid");
+      result.emplace("X-CSRF-Token", nlohmann::json::parse(token->content.string())["csrf_token"].get<std::string>());
+    }
+    return result;
+  }
+};
+
+TEST_F(AppCatalogApiTest, RevisionAndUuidPreconditionsRejectStaleTabsAndKeepUnknownFields) {
+  const auto fetched = client->request("GET", "/api/apps", "", headers(false));
+  ASSERT_EQ(fetched->status_code, "200 OK");
+  const auto catalog = nlohmann::json::parse(fetched->content.string());
+  auto app = catalog["apps"][0];
+  app["name"] = "Renamed";
+  auto request_headers = headers();
+  EXPECT_TRUE(client->request("POST", "/api/apps", app.dump(), request_headers)->status_code.starts_with("428"));
+  request_headers.emplace("If-Match", catalog["revision"].get<std::string>());
+  const auto saved = client->request("POST", "/api/apps", app.dump(), request_headers);
+  ASSERT_EQ(saved->status_code, "200 OK");
+  const auto result = nlohmann::json::parse(saved->content.string());
+  EXPECT_EQ(result["apps"][0]["id"], app["id"]);
+  EXPECT_EQ(result["apps"][0]["foreign"]["enabled"], false);
+  EXPECT_TRUE(client->request("POST", "/api/apps", app.dump(), request_headers)->status_code.starts_with("409"));
+  const auto path = "/api/apps/" + app["uuid"].get<std::string>();
+  EXPECT_TRUE(client->request("DELETE", path, "", request_headers)->status_code.starts_with("409"));
+}
+
+TEST_F(AppCatalogApiTest, AuthenticationAndCsrfStillDenyMutations) {
+  EXPECT_TRUE(client->request("POST", "/api/apps", R"({"name":"new","index":-1})", {{"Content-Type", "application/json"}})->status_code.starts_with("401"));
+  auto request_headers = headers(false);
+  request_headers.emplace("Origin", "https://example.invalid");
+  EXPECT_TRUE(client->request("POST", "/api/apps", R"({"name":"new","index":-1})", request_headers)->status_code.starts_with("400"));
 }

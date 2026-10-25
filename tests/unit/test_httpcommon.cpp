@@ -7,15 +7,20 @@
 
 // standard includes
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
 // lib includes
+#include <boost/property_tree/json_parser.hpp>
 #include <curl/curl.h>
 #ifdef _WIN32
   #include <aclapi.h>
@@ -239,6 +244,43 @@ protected:
     }
     return false;
   }
+
+  /**
+   * @brief Verify successive real saves preserve the current policy before bytes and after replacement.
+   * @param saves Number of additional successful transactions to exercise.
+   */
+  void expect_repeated_saves_preserve_security(unsigned saves) {
+    for (unsigned iteration = 0; iteration < saves; ++iteration) {
+      const auto original = security_snapshot(file);
+      ASSERT_TRUE(same_security(original, original));
+      const auto original_file_count = std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator());
+      bool saw_restored = false, saw_prebytes = false;
+      http::test_support::set_state_security_hook([&](auto stage, const auto &temporary) {
+        if (stage == http::test_support::state_security_stage_e::verify) {
+          EXPECT_EQ(std::filesystem::file_size(temporary), 0U);
+          EXPECT_TRUE(same_security(original, security_snapshot(temporary)));
+          saw_restored = true;
+        }
+      });
+      http::test_support::set_state_update_hook([&]() {
+        for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+          if (entry.path().filename().string().starts_with("state.json.tmp-")) {
+            EXPECT_EQ(std::filesystem::file_size(entry.path()), 0U);
+            EXPECT_TRUE(same_security(original, security_snapshot(entry.path())));
+            saw_prebytes = true;
+          }
+        }
+      });
+      EXPECT_TRUE(http::update_state_file(file.string(), [&](auto &tree) {
+        tree.put("repeated_save", iteration);
+      }));
+      http::test_support::set_state_security_hook({});
+      http::test_support::set_state_update_hook({});
+      EXPECT_TRUE(saw_restored && saw_prebytes);
+      EXPECT_TRUE(same_security(original, security_snapshot(file), true));
+      EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator()), original_file_count);
+    }
+  }
 #endif
 
   /**
@@ -300,6 +342,9 @@ TEST_F(StateFileTransactionTest, RestrictsEmptyTemporaryBeforeWritingAndPreserve
   EXPECT_EQ(replacement_metadata.st_gid, original_metadata.st_gid);
 #endif
   EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator()), 1);
+#ifdef _WIN32
+  expect_repeated_saves_preserve_security(2);
+#endif
 }
 
 #ifdef _WIN32
@@ -408,6 +453,10 @@ TEST_F(StateFileTransactionTest, PreservesInheritedAuthorityAndLaterParentRevoca
   EXPECT_TRUE(inherited_read(replaced));
   EXPECT_TRUE(same_security(baseline, security_snapshot(sibling)));
   EXPECT_TRUE(state_bytes().contains("replacement"));
+  expect_repeated_saves_preserve_security(2);
+  EXPECT_TRUE(unprotected(security_snapshot(file)));
+  EXPECT_TRUE(inherited_read(security_snapshot(file)));
+  EXPECT_TRUE(same_security(baseline, security_snapshot(sibling)));
 
   auto reduced_parent = security_from_sddl(L"D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
   ASSERT_FALSE(reduced_parent.empty());
@@ -427,6 +476,10 @@ TEST_F(StateFileTransactionTest, PreservesInheritedAuthorityAndLaterParentRevoca
     tree.put("fixture", "saved after parent revocation");
   }));
   EXPECT_TRUE(same_security(revoked, security_snapshot(file), true));
+  expect_repeated_saves_preserve_security(2);
+  EXPECT_TRUE(same_security(untouched_revoked, security_snapshot(file)));
+  EXPECT_TRUE(unprotected(security_snapshot(file)));
+  EXPECT_FALSE(inherited_read(security_snapshot(file)));
 }
 
 TEST_F(StateFileTransactionTest, PreservesUnprotectedExplicitAuthorityWhileTemporaryIsEmpty) {
@@ -468,6 +521,8 @@ TEST_F(StateFileTransactionTest, PreservesUnprotectedExplicitAuthorityWhileTempo
   EXPECT_TRUE(inspected);
   EXPECT_TRUE(same_security(original, security_snapshot(file), true));
   EXPECT_TRUE(unprotected(security_snapshot(file)));
+  expect_repeated_saves_preserve_security(2);
+  EXPECT_TRUE(unprotected(security_snapshot(file)));
 }
 
 TEST_F(StateFileTransactionTest, FailedEmptyTemporarySecuritySetOrVerificationPreservesOriginalAndRecovers) {
@@ -499,9 +554,21 @@ TEST_F(StateFileTransactionTest, FailedEmptyTemporarySecuritySetOrVerificationPr
     EXPECT_TRUE(state_bytes() == original_bytes);
     EXPECT_TRUE(same_security(original, security_snapshot(file)));
     EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator()), 1);
+    bool saw_recovered_policy = false;
+    http::test_support::set_state_security_hook([&](auto stage, const auto &temporary) {
+      if (stage == http::test_support::state_security_stage_e::verify) {
+        EXPECT_EQ(std::filesystem::file_size(temporary), 0U);
+        EXPECT_TRUE(same_security(original, security_snapshot(temporary)));
+        saw_recovered_policy = true;
+      }
+    });
     EXPECT_TRUE(http::update_state_file(file.string(), [](auto &tree) {
       tree.put("fixture", "recovered");
     }));
+    http::test_support::set_state_security_hook({});
+    EXPECT_TRUE(saw_recovered_policy);
+    EXPECT_TRUE(same_security(original, security_snapshot(file), true));
+    expect_repeated_saves_preserve_security(1);
   }
 }
 
@@ -657,3 +724,127 @@ TEST_F(StateFileTransactionTest, RefusesNamedAccessOrInheritedDefaultAclWithoutP
   EXPECT_FALSE(bytes.contains("unpublished"));
 }
 #endif
+
+TEST_F(StateFileTransactionTest, ByteReadOnlyAndThrowingPreparationDoNotCreateTemporaries) {
+  const auto original = state_bytes();
+  bool called = false;
+  EXPECT_TRUE(http::update_state_file_bytes(file.string(), [&](const std::string &bytes) -> std::optional<std::string> {
+    called = true;
+    EXPECT_EQ(bytes, original);
+    return std::nullopt;
+  }));
+  EXPECT_TRUE(called);
+  EXPECT_EQ(state_bytes(), original);
+  EXPECT_EQ(std::distance(std::filesystem::directory_iterator {directory}, std::filesystem::directory_iterator {}), 1);
+  EXPECT_FALSE(http::update_state_file_bytes(file.string(), [](const auto &) -> std::optional<std::string> {
+    throw std::runtime_error {"fixture preparation failure"};
+  }));
+  EXPECT_EQ(state_bytes(), original);
+  EXPECT_EQ(std::distance(std::filesystem::directory_iterator {directory}, std::filesystem::directory_iterator {}), 1);
+}
+
+TEST_F(StateFileTransactionTest, MissingExistingEmptyAndExplicitEmptyReplacementRemainDistinct) {
+  const auto missing = directory / "missing.json";
+  EXPECT_TRUE(http::update_state_file_bytes(missing.string(), [](const auto &bytes) -> std::optional<std::string> {
+    EXPECT_TRUE(bytes.empty());
+    return std::nullopt;
+  }));
+  EXPECT_FALSE(std::filesystem::exists(missing));
+  EXPECT_TRUE(http::update_state_file_bytes(file.string(), [](const auto &) -> std::optional<std::string> {
+    return std::string {};
+  }));
+  EXPECT_TRUE(std::filesystem::exists(file));
+  EXPECT_EQ(std::filesystem::file_size(file), 0);
+  EXPECT_TRUE(http::update_state_file_bytes(file.string(), [](const auto &bytes) -> std::optional<std::string> {
+    EXPECT_TRUE(bytes.empty());
+    return std::nullopt;
+  }));
+  EXPECT_FALSE(http::update_state_file(file.string(), [](auto &tree) {
+    tree.put("fixture", "must not replace invalid empty JSON");
+  }));
+  EXPECT_EQ(std::filesystem::file_size(file), 0);
+}
+
+#ifndef _WIN32
+TEST_F(StateFileTransactionTest, DirectoryReadErrorNeverInvokesBytePreparation) {
+  const auto source = directory / "directory_source";
+  std::filesystem::create_directory(source);
+  const auto marker = source / "untouched.txt";
+  std::ofstream {marker} << "original";
+  bool called = false;
+  EXPECT_FALSE(http::update_state_file_bytes(source.string(), [&](const auto &) -> std::optional<std::string> {
+    called = true;
+    return std::nullopt;
+  }));
+  EXPECT_FALSE(called);
+  EXPECT_TRUE(std::filesystem::is_directory(source));
+  EXPECT_EQ(std::filesystem::file_size(marker), 8);
+  EXPECT_EQ(std::distance(std::filesystem::directory_iterator {directory}, std::filesystem::directory_iterator {}), 2);
+}
+#endif
+
+TEST_F(StateFileTransactionTest, ObservedExternalEditIsNotOverwrittenAfterPreparation) {
+  http::test_support::set_state_update_hook([&]() {
+    std::ofstream {file} << R"({"fixture":"external"})";
+  });
+  EXPECT_FALSE(http::update_state_file_bytes(file.string(), [](const auto &) -> std::optional<std::string> {
+    return R"({"fixture":"prepared"})";
+  }));
+  EXPECT_EQ(state_bytes(), R"({"fixture":"external"})");
+}
+
+TEST_F(StateFileTransactionTest, ByteAndPropertyTreeAdaptersShareTheWholeTransactionLock) {
+  std::promise<void> first_preparing;
+  std::promise<void> release_first;
+  auto released = release_first.get_future().share();
+  std::promise<void> second_attempting;
+  std::promise<void> second_preparing;
+  auto second_entered = second_preparing.get_future();
+  bool first_success = false, second_success = false;
+  std::jthread bytes_worker {[&]() {
+    first_success = http::update_state_file_bytes(file.string(), [&](const std::string &bytes) -> std::optional<std::string> {
+      first_preparing.set_value();
+      released.wait();
+      boost::property_tree::ptree tree;
+      std::istringstream input {bytes};
+      boost::property_tree::read_json(input, tree);
+      tree.put("byte-update", "retained");
+      std::ostringstream output;
+      boost::property_tree::write_json(output, tree);
+      return output.str();
+    });
+  }};
+  std::jthread tree_worker;
+  // This guard releases the paused callback before either worker's destructor can join.
+  bool signalled = false;
+  auto cleanup = util::fail_guard([&]() {
+    if (!signalled) {
+      release_first.set_value();
+    }
+  });
+  const auto first_ready = first_preparing.get_future().wait_for(std::chrono::seconds {2});
+  EXPECT_EQ(first_ready, std::future_status::ready);
+  tree_worker = std::jthread {[&]() {
+    second_attempting.set_value();
+    second_success = http::update_state_file(file.string(), [&](auto &tree) {
+      second_preparing.set_value();
+      tree.put("tree-update", "retained");
+    });
+  }};
+  const auto attempted = second_attempting.get_future().wait_for(std::chrono::seconds {2});
+  EXPECT_EQ(attempted, std::future_status::ready);
+  EXPECT_EQ(second_entered.wait_for(std::chrono::milliseconds {100}), std::future_status::timeout);
+  release_first.set_value();
+  signalled = true;
+  bytes_worker.join();
+  tree_worker.join();
+  EXPECT_TRUE(first_success);
+  EXPECT_TRUE(second_success);
+  EXPECT_EQ(second_entered.wait_for(std::chrono::seconds {0}), std::future_status::ready);
+  boost::property_tree::ptree result;
+  std::istringstream input {state_bytes()};
+  boost::property_tree::read_json(input, result);
+  EXPECT_EQ(result.get<std::string>("byte-update"), "retained");
+  EXPECT_EQ(result.get<std::string>("tree-update"), "retained");
+  EXPECT_EQ(result.get<std::string>("fixture"), "original");
+}

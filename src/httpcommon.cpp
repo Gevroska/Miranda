@@ -6,7 +6,9 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -100,6 +102,42 @@ namespace http {
   namespace {
     std::unordered_set<std::string> recovery_required;  ///< Failed restorations block further writes until operator recovery.
     std::mutex state_file_mutex;  ///< Serializes credentials and pairing updates, including shared-file defaults.
+
+    /**
+     * @brief Read complete binary bytes and explicitly check native read and close errors before preparation.
+     */
+    bool read_state_bytes(const fs::path &path, std::string &bytes) {
+#ifdef _WIN32
+      auto *input = _wfopen(path.c_str(), L"rb");
+#else
+      auto *input = std::fopen(path.c_str(), "rb");
+#endif
+      if (!input) {
+        return false;
+      }
+      auto close = util::fail_guard([&]() {
+        if (input) {
+          std::fclose(input);
+        }
+      });
+      std::array<char, 16384> buffer;
+      while (true) {
+        const auto count = std::fread(buffer.data(), 1, buffer.size(), input);
+        if (std::ferror(input)) {
+          return false;
+        }
+        bytes.append(buffer.data(), count);
+        if (std::feof(input)) {
+          break;
+        }
+        if (!count) {
+          return false;
+        }
+      }
+      const auto result = std::fclose(input);
+      input = nullptr;
+      return result == 0;
+    }
 #ifdef SUNSHINE_TESTS
     std::function<std::optional<std::uint32_t>(const fs::path &, const fs::path &, const fs::path &)> state_replace_hook;  ///< Deterministic native partial-failure injection.
     std::function<void(test_support::state_security_stage_e, const fs::path &)> state_security_hook;  ///< Inspect only the empty temporary at its native security gates.
@@ -258,6 +296,20 @@ namespace http {
 #endif
 
   bool update_state_file(const std::string &file, const std::function<void(pt::ptree &)> &update) {
+    return update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
+      pt::ptree tree;
+      if (!original.empty() || fs::exists(file)) {
+        std::istringstream input {original};
+        pt::read_json(input, tree);
+      }
+      update(tree);
+      std::ostringstream serialized;
+      pt::write_json(serialized, tree);
+      return serialized.str();
+    });
+  }
+
+  bool update_state_file_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare) {
     std::lock_guard lock {state_file_mutex};
     const fs::path destination {file};
     std::error_code identity_error;
@@ -281,7 +333,7 @@ namespace http {
       }
     });
     try {
-      pt::ptree tree;
+      std::string original;
       const bool existed = fs::exists(destination);
       if (existed) {
 #ifdef _WIN32
@@ -296,12 +348,15 @@ namespace http {
           return false;
         }
 #endif
-        pt::read_json(destination.string(), tree);
+        if (!read_state_bytes(destination, original)) {
+          return false;
+        }
       }
-      update(tree);
-      std::ostringstream serialized;
-      pt::write_json(serialized, tree);
-      const auto bytes = serialized.str();
+      const auto replacement = prepare(original);
+      if (!replacement) {
+        return true;
+      }
+      const auto &bytes = *replacement;
 #ifdef _WIN32
       std::vector<std::uint8_t> existing_security;
       std::vector<std::uint8_t> creation_security;
@@ -350,7 +405,12 @@ namespace http {
           return false;
         }
         const auto protection = (control & SE_DACL_PROTECTED) ? PROTECTED_DACL_SECURITY_INFORMATION : UNPROTECTED_DACL_SECURITY_INFORMATION;
-        if (!SetFileSecurityW(temporary.c_str(), DACL_SECURITY_INFORMATION | protection, existing_security.data())) {
+        auto restoration_security = existing_security;
+        // Request the captured inheritance model as setter input; keep the readback snapshot immutable.
+        if (!SetSecurityDescriptorControl(restoration_security.data(), SE_DACL_AUTO_INHERIT_REQ, (control & SE_DACL_AUTO_INHERITED) ? SE_DACL_AUTO_INHERIT_REQ : 0)) {
+          return false;
+        }
+        if (!SetFileSecurityW(temporary.c_str(), DACL_SECURITY_INFORMATION | protection, restoration_security.data())) {
           BOOST_LOG(error) << "State update refused because the empty temporary's security policy could not be restored"sv;
           return false;
         }
@@ -396,6 +456,11 @@ namespace http {
         state_update_hook();
       }
 #endif
+      // Detect external edits observed before writing. Arbitrary external writers must still cooperate.
+      std::string latest;
+      if (fs::exists(destination) != existed || (existed && (!read_state_bytes(destination, latest) || latest != original))) {
+        return false;
+      }
       std::size_t written = 0;
       while (written < bytes.size()) {
 #ifdef _WIN32

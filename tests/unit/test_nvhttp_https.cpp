@@ -20,9 +20,11 @@
 #include <vector>
 
 // local includes
+#include <src/app_catalog.h>
 #include <src/config.h>
 #include <src/crypto.h>
 #include <src/nvhttp.h>
+#include <src/process.h>
 #include <src/rtsp.h>
 
 namespace {
@@ -270,9 +272,19 @@ namespace {
         client->socket.lowest_layer().close(close_error);
       }
       if (server) {
-        server->stop();
+        // The fixture owns this event loop; SimpleWeb::stop only stops an internal loop.
+        const auto server_io = server->io_service;
+        if (server_io) {
+          server_io->stop();
+        }
         if (server_thread.joinable()) {
           server_thread.join();
+        }
+        handler_scope->stop();
+        server->stop();
+        if (server_io) {
+          server_io->restart();
+          server_io->poll();
         }
         server.reset();
       }
@@ -701,6 +713,208 @@ namespace {
     EXPECT_TRUE(stop(credentials_a).contains("<cancel>1</cancel>"));
     EXPECT_FALSE(rtsp_stream::test_support::token_authorized(first));
     EXPECT_FALSE(rtsp_stream::test_support::token_authorized(second));
+  }
+
+  /**
+   * @brief Exercise real selector admission without media workers using a captured empty-command app.
+   */
+  class HttpsApplicationIdentityTest: public HttpsClientIdentityTest {
+  protected:
+    proc::proc_t previous_proc;
+    std::string previous_file;
+    proc::catalog::json initial;
+    std::pair<int, std::string> selected;
+    int source_preparations = 0;
+    int source_rollbacks = 0;
+    int encoder_probes = 0;
+    std::atomic_bool existing_viewer {false};
+
+    void SetUp() override {
+      HttpsClientIdentityTest::SetUp();
+      previous_proc = std::move(proc::proc);
+      proc::proc = proc::proc_t {};
+      previous_file = config::stream.file_apps;
+      config::stream.file_apps = (std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "https_application_catalog.json").string();
+      std::ofstream {config::stream.file_apps} << R"({"env":{},"apps":[{"name":"Active"},{"name":"Other"}]})";
+      const auto loaded = proc::read_catalog(config::stream.file_apps);
+      ASSERT_EQ(loaded.status, 200) << loaded.body;
+      initial = proc::catalog::parse(loaded.body);
+      const auto &app = initial["apps"][0];
+      selected = {std::stoi(app["id"].get<std::string>()), app["uuid"].get<std::string>()};
+      auto session = std::make_shared<rtsp_stream::launch_session_t>();
+      session->surround_info = 2;
+      ASSERT_EQ(proc::proc.execute(selected.first, session), 0);
+      nvhttp::test_support::set_source_preparation_hooks(
+        [&](const auto &) {
+          ++source_preparations;
+        },
+        [&]() {
+          ++encoder_probes;
+          return 0;
+        },
+        [&]() {
+          ++source_rollbacks;
+        },
+        [&]() {
+          return existing_viewer ? 1 : 0;
+        }
+      );
+      start_server(true, true);
+    }
+
+    void TearDown() override {
+      rtsp_stream::stop_application({});
+      nvhttp::test_support::set_source_preparation_hooks();
+      proc::proc.terminate();
+      proc::proc = std::move(previous_proc);
+      std::filesystem::remove(config::stream.file_apps);
+      config::stream.file_apps = previous_file;
+      HttpsClientIdentityTest::TearDown();
+    }
+
+    std::string exchange(const std::string &path) {
+      auto client = connect_client(&credentials_a);
+      send(*client, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+      return read_response(*client);
+    }
+
+    std::string stream_path(const std::string &route, const std::string &selectors) const {
+      return route + "?rikey=00112233445566778899aabbccddeeff&rikeyid=1&corever=1&localAudioPlayMode=0" + selectors;
+    }
+  };
+
+  TEST_F(HttpsApplicationIdentityTest, ListAndRestrictedCurrentIdentityUseTheSameDurablePair) {
+    const auto hidden = exchange("/serverinfo");
+    EXPECT_TRUE(hidden.contains("<currentgame>0</currentgame>"));
+    EXPECT_FALSE(hidden.contains(selected.second));
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view));
+    const auto visible = exchange("/serverinfo");
+    EXPECT_TRUE(visible.contains("<currentgameuuid>" + selected.second + "</currentgameuuid>"));
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::list));
+    const auto listed = exchange("/applist");
+    EXPECT_TRUE(listed.contains("<UUID>" + selected.second + "</UUID>"));
+    EXPECT_TRUE(listed.contains("<ID>" + std::to_string(selected.first) + "</ID>"));
+    EXPECT_TRUE(listed.contains("<IDX>0</IDX>"));
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, ViewOnlySameAppSelectorsPrepareFreshSourceWithoutExecutingEditedCommands) {
+    auto edit = initial["apps"][0];
+    edit["cmd"] = "nonexistent_identity_regression_executable";
+    ASSERT_EQ(proc::save_catalog_app(config::stream.file_apps, initial["revision"], edit.dump()).status, 200);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view));
+    for (const auto &selectors : {
+           "&appid=" + std::to_string(selected.first),
+           "&appid=" + std::to_string(selected.first) + "&appuuid=",
+           "&appuuid=" + selected.second,
+           "&appid=-1&appuuid=" + selected.second
+         }) {
+      const auto response = exchange(stream_path("/launch", selectors));
+      EXPECT_TRUE(response.contains("status_code=\"200\"")) << selectors;
+      const auto token = rtsp_stream::test_support::pending_launch();
+      ASSERT_TRUE(token);
+      EXPECT_EQ(token->appid, selected.first);
+      EXPECT_EQ(token->app_uuid, selected.second);
+      EXPECT_EQ(token->client_uuid, uuid_a);
+      EXPECT_EQ(token->client_cert, credentials_a.x509);
+      EXPECT_FALSE(token->joining);  // No media source exists; the source hook must still run.
+      EXPECT_GT(source_preparations, 0);
+      EXPECT_EQ(encoder_probes, source_preparations);
+      EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
+      EXPECT_EQ(proc::proc.active_identity(), selected);
+      EXPECT_EQ(proc::proc.get_last_run_app_name(), "Active");
+      rtsp_stream::stop_application({});
+    }
+    const auto prepared_before_denial = source_preparations;
+    const auto other = initial["apps"][1]["uuid"].get<std::string>();
+    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + other)).contains("status_code=\"403\""));
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    EXPECT_EQ(source_preparations, prepared_before_denial);
+    EXPECT_EQ(encoder_probes, prepared_before_denial);
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, FakeExistingViewerJoinPreservesSourceAndApplication) {
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view));
+    existing_viewer = true;
+    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + selected.second)).contains("status_code=\"200\""));
+    const auto token = rtsp_stream::test_support::pending_launch();
+    ASSERT_TRUE(token);
+    EXPECT_TRUE(token->joining);
+    EXPECT_EQ(token->appid, selected.first);
+    EXPECT_EQ(token->app_uuid, selected.second);
+    EXPECT_EQ(source_preparations, 0);
+    EXPECT_EQ(encoder_probes, 0);
+    EXPECT_EQ(proc::proc.active_identity(), selected);
+    rtsp_stream::stop_application({});
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    const auto other = initial["apps"][1]["uuid"].get<std::string>();
+    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + other)).contains("status_code=\"503\""));
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    EXPECT_EQ(source_preparations, 0);
+    EXPECT_EQ(encoder_probes, 0);
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, RejectedSelectorMatrixLeavesNoUsableAdmission) {
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    const auto prepared_before_denial = source_preparations;
+    for (const auto &route : {"/launch", "/resume"}) {
+      for (const auto &selectors : {
+             "&appid=-1",
+             "&appid=-1&appuuid=",
+             "&appid=-2",
+             "&appid=2147483648",
+             "&appid=7&appid=8",
+             "&appuuid=invalid",
+             "&appuuid=&appuuid=",
+             "&appid=-1&appuuid=33333333-3333-3333-3333-333333333333"
+           }) {
+        const auto response = exchange(stream_path(route, selectors));
+        EXPECT_FALSE(response.contains("status_code=\"200\"")) << selectors;
+        EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+        EXPECT_EQ(proc::proc.active_identity(), selected);
+      }
+      const auto other = initial["apps"][1]["uuid"].get<std::string>();
+      EXPECT_TRUE(exchange(stream_path(route, "&appid=" + std::to_string(selected.first) + "&appuuid=" + other)).contains("status_code=\"400\""));
+      EXPECT_TRUE(exchange(stream_path(route, "&appid=0&appuuid=" + selected.second)).contains("status_code=\"400\""));
+      EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    }
+    EXPECT_EQ(source_preparations, prepared_before_denial);
+    EXPECT_EQ(encoder_probes, prepared_before_denial);
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, DeletedActiveUuidResumesUntilStoppedAndRevocationInvalidatesIt) {
+    ASSERT_EQ(proc::delete_catalog_app(config::stream.file_apps, initial["revision"], selected.second).status, 200);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view));
+    for (const auto &selectors : {std::string {}, "&appid=-1&appuuid=" + selected.second}) {
+      EXPECT_TRUE(exchange(stream_path("/resume", selectors)).contains("status_code=\"200\""));
+      const auto token = rtsp_stream::test_support::pending_launch();
+      ASSERT_TRUE(token);
+      EXPECT_EQ(token->app_uuid, selected.second);
+      rtsp_stream::stop_application({});
+    }
+    EXPECT_TRUE(exchange(stream_path("/resume", "&appid=-1&appuuid=" + selected.second)).contains("status_code=\"200\""));
+    const auto token = rtsp_stream::test_support::pending_launch();
+    ASSERT_TRUE(token);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, 0U));
+    EXPECT_FALSE(rtsp_stream::test_support::token_authorized(token));
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    proc::proc.terminate();
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + selected.second)).contains("status_code=\"404\""));
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, RepairedClientCannotUseUuidSentinelOnAnOriginalTlsConnection) {
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    auto original = connect_client(&credentials_a);
+    ASSERT_TRUE(nvhttp::unpair_client(uuid_a));
+    const auto repaired = nvhttp::test_support::add_client("repaired selector fixture", credentials_a.x509, true);
+    ASSERT_TRUE(nvhttp::update_client(repaired, std::nullopt, permissions::launch));
+    const auto path = stream_path("/launch", "&appid=-1&appuuid=" + selected.second + "&uniqueid=" + repaired);
+    send(*original, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    EXPECT_TRUE(read_response(*original).contains("status_code=\"401\""));
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    EXPECT_EQ(source_preparations, 0);
+    EXPECT_EQ(proc::proc.active_identity(), selected);
   }
 
 }  // namespace

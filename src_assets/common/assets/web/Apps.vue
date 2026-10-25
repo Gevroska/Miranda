@@ -43,8 +43,9 @@
     </div>
 
     <!-- Apps Grid -->
+    <div v-if="catalogError" class="alert alert-danger">{{ catalogError }}</div>
     <div class="row g-3" v-if="displayedApps.length > 0">
-      <div class="col-12 col-sm-6 col-md-4 col-lg-3" v-for="{ app, index } in displayedApps" :key="index">
+      <div class="col-12 col-sm-6 col-md-4 col-lg-3" v-for="{ app, index } in displayedApps" :key="app.uuid">
         <div class="card app-card h-100">
           <div class="app-poster-container">
             <img
@@ -477,6 +478,7 @@
               :aria-label="$t('_common.close')"></button>
           </div>
           <div class="modal-body">
+            <div v-if="deleteError" class="alert alert-danger">{{ deleteError }}</div>
             <i18n-t keypath="apps.delete_confirm" tag="span">
               <template #name><strong>{{ deleteTarget.name }}</strong></template>
             </i18n-t>
@@ -705,6 +707,9 @@
         searchQuery: "",
         sortMode: "default",
         deleteTarget: null,
+        catalogRevision: "",
+        catalogError: "",
+        deleteError: "",
         version: null,
         githubVersion: null,
       };
@@ -834,7 +839,8 @@
         this.openEditModal();
       },
       showDeleteModal(id) {
-        this.deleteTarget = { index: id, name: this.apps[id].name };
+        this.deleteTarget = { uuid: this.apps[id].uuid, name: this.apps[id].name };
+        this.deleteError = "";
         this.$nextTick(() => {
           Modal.getOrCreateInstance(this.$refs.deleteModal).show();
         });
@@ -843,22 +849,36 @@
         const modal = Modal.getInstance(this.$refs.deleteModal);
         if (modal) modal.hide();
       },
-      loadApps() {
-        return fetch("./api/apps")
-          .then((r) => r.json())
-          .then((r) => {
-            this.apps = r.apps;
-          });
+      async loadApps() {
+        this.catalogError = "";
+        try {
+          const response = await fetch("./api/apps");
+          const result = await response.json();
+          if (!response.ok || result.status === false) throw new Error(result.error || this.$t("apps.catalog_error"));
+          this.apps = result.apps;
+          this.catalogRevision = result.revision;
+        } catch (error) {
+          this.catalogError = error.message || this.$t("apps.catalog_error");
+        }
       },
-      confirmDelete() {
-        apiFetch("./api/apps/" + this.deleteTarget.index, {
-          method: "DELETE",
-          headers: {
-            "Content-Type": "application/json"
-          },
-        }).then((r) => {
-          if (r.status === 200) document.location.reload();
-        });
+      async confirmDelete() {
+        this.deleteError = "";
+        try {
+          const response = await apiFetch("./api/apps/" + this.deleteTarget.uuid, {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+              "If-Match": this.catalogRevision,
+            },
+          });
+          if (response.status !== 200) {
+            const result = await response.json();
+            throw new Error(result.error || this.$t("apps.catalog_error"));
+          }
+          document.location.reload();
+        } catch (error) {
+          this.deleteError = error.message || this.$t("apps.catalog_error");
+        }
       },
       addPrepCmd() {
         let template = {
@@ -1022,7 +1042,7 @@
           this.editForm.detached[index] = path;
         });
       },
-      save() {
+      async save() {
         this.editFormError = "";
         this.editForm["image-path"] = this.editForm["image-path"].toString().replaceAll('"', '');
 
@@ -1034,15 +1054,23 @@
           return;
         }
 
-        apiFetch("./api/apps", {
-          method: "POST",
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(this.editForm),
-        }).then((r) => {
-          if (r.status === 200) document.location.reload();
-        });
+        try {
+          const response = await apiFetch("./api/apps", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "If-Match": this.catalogRevision,
+            },
+            body: JSON.stringify(this.editForm),
+          });
+          if (response.status !== 200) {
+            const result = await response.json();
+            throw new Error(result.error || this.$t("apps.catalog_error"));
+          }
+          document.location.reload();
+        } catch (error) {
+          this.editFormError = error.message || this.$t("apps.catalog_error");
+        }
       },
       handleImageError(event) {
         // Hide the broken image and show placeholder instead

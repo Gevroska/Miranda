@@ -9,6 +9,7 @@
 // standard includes
 #include <array>
 #include <string>
+#include <thread>
 #include <utility>
 
 // lib includes
@@ -114,4 +115,22 @@ TEST(RtspResponseTest, CommonDispatcherPreservesResponsesWithoutServerContext) {
       EXPECT_TRUE(response.ends_with("\r\n\r\n"));
     }
   }
+}
+
+TEST(RtspCatalogTest, NestedCatalogWorkUsesOwnerAndStartupFallbackWithoutRedirectingProcessWorkers) {
+  const auto caller = std::this_thread::get_id();
+  std::thread::id dispatched;
+  {
+    auto owner = rtsp_stream::test_support::start_owner();
+    rtsp_stream::catalog_operation([&]() {
+      dispatched = std::this_thread::get_id();
+      rtsp_stream::catalog_operation([&]() {
+        EXPECT_EQ(std::this_thread::get_id(), dispatched);
+      });
+    });
+    EXPECT_NE(dispatched, caller);
+  }
+  rtsp_stream::catalog_operation([&]() {
+    EXPECT_EQ(std::this_thread::get_id(), caller);
+  });
 }

@@ -55,6 +55,7 @@
     "covers_found": "Covers Found",
     "cover_search_hint": "Search names should match IGDB naming conventions.",
     "delete": "Delete",
+    "catalog_error": "The application catalog could not be saved. Your changes remain in this form; reload the catalog before retrying a conflict.",
     "delete_confirm": "Are you sure you want to delete {name}?",
     "delete_title": "Delete Application",
     "detached_cmds": "Detached Commands",

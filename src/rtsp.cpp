@@ -960,6 +960,10 @@ namespace rtsp_stream {
     });
   }
 
+  void catalog_operation(std::function<void()> operation) {
+    server.sync(std::move(operation));
+  }
+
   void reconcile_client(std::string_view uuid, std::string_view cert, bool destroy) {
     server.sync([&]() {
       server.reconcile(uuid, cert, destroy);
@@ -1049,6 +1053,12 @@ namespace rtsp_stream {
     bool claim_launch(const std::shared_ptr<launch_session_t> &launch) {
       return server.sync([&]() {
         return server.claim(*launch);
+      });
+    }
+
+    std::shared_ptr<launch_session_t> pending_launch() {
+      return server.sync([&]() {
+        return server.launch_event.view(0s);
       });
     }
   }  // namespace test_support

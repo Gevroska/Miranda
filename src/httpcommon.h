@@ -22,6 +22,17 @@
 namespace http {
 
   /**
+   * @brief Serialize a secured byte read/prepare/replace transaction.
+   * @param file Destination whose native authority must be preserved.
+   * @param prepare Prepare complete replacement bytes while holding the state-file lock; nullopt performs a read-only transaction.
+   * @return Whether preparation and any requested replacement succeeded.
+   * @note Catalog callers use owner -> state-file order. Permission mutations retain mutation -> authorization -> state-file order,
+   * releasing authorization/state locks before owner reconciliation. Preparation must never acquire authorization,
+   * await the owner, or recursively enter a state-file transaction.
+   */
+  bool update_state_file_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare);
+
+  /**
    * @brief Serialize a shared JSON read/modify/atomic-replace transaction.
    * @param file State or credentials file; separate configured paths are supported.
    * @param update Mutation preserving all unrelated JSON fields.

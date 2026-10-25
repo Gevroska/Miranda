@@ -24,6 +24,7 @@
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
+#include "app_catalog.h"
 #include "config.h"
 #include "display_device.h"
 #include "file_handler.h"
@@ -119,8 +120,14 @@ namespace SimpleWeb {
 }  // namespace SimpleWeb
 
 namespace nvhttp {
-
-  static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
+#ifdef SUNSHINE_TESTS
+  namespace {
+    std::function<void(const rtsp_stream::launch_session_t &)> source_configure_hook;  ///< Fake-only display setup; never establishes retained-source lifetime.
+    std::function<int()> source_probe_hook;  ///< Fake-only encoder qualification result.
+    std::function<void()> source_rollback_hook;  ///< Matching fake cleanup without touching hardware.
+    std::function<int()> source_sessions_hook;  ///< Fake-only existing-viewer count for HTTP component fixtures.
+  }  // namespace
+#endif
 
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
@@ -632,7 +639,7 @@ namespace nvhttp {
       x++;
     }
     launch_session->unique_id = (get_arg(args, "uniqueid", "unknown"));
-    launch_session->appid = (int) util::from_view(get_arg(args, "appid", "unknown"));
+    launch_session->appid = 0;  // Resolved only inside authorized serialized preparation.
     launch_session->enable_sops = util::from_view(get_arg(args, "sops", "0"));
     launch_session->surround_info = (int) util::from_view(get_arg(args, "surroundAudioInfo", "196610"));
     launch_session->surround_params = (get_arg(args, "surroundParams", ""));
@@ -1428,9 +1435,16 @@ namespace nvhttp {
       }
     }
     tree.put("root.Permission", grant);
-    const auto current_appid = permissions::allows(grant, permissions::view) ? proc::proc.running() : 0;
+    std::pair<int, std::string> current_application {0, ""};
+    if (permissions::allows(grant, permissions::view)) {
+      rtsp_stream::catalog_operation([&]() {
+        current_application = proc::proc.active_identity();
+      });
+    }
+    const auto current_appid = current_application.first;
     tree.put("root.PairStatus", pair_status);
     tree.put("root.currentgame", current_appid);
+    tree.put("root.currentgameuuid", current_application.second);
     tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
 
     std::ostringstream data;
@@ -1479,12 +1493,15 @@ namespace nvhttp {
 
     apps.put("<xmlattr>.status_code", 200);
 
-    for (auto &proc : proc::proc.get_apps()) {
+    std::size_t index = 0;
+    for (const auto &proc : proc::proc.apps_snapshot()) {
       pt::ptree app;
 
       app.put("IsHdrSupported"s, video::active_hevc_mode >= 3 ? 1 : 0);
       app.put("AppTitle"s, proc.name);
       app.put("ID", proc.id);
+      app.put("UUID", proc.uuid);
+      app.put("IDX", index++);
 
       apps.push_back(std::make_pair("App", app));
     }
@@ -1511,19 +1528,10 @@ namespace nvhttp {
     });
     auto args = request->parse_query_string();
     int target = 0;
-    if (!args.contains("rikey") || !args.contains("rikeyid") || (!resuming && (!args.contains("appid") || !args.contains("localAudioPlayMode")))) {
+    if (!args.contains("rikey") || !args.contains("rikeyid") || (!resuming && ((!args.contains("appid") && !args.contains("appuuid")) || !args.contains("localAudioPlayMode")))) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "Missing a required stream parameter");
       return;
-    }
-    if (!resuming) {
-      const auto value = get_arg(args, "appid");
-      const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), target);
-      if (value.empty() || error != std::errc {} || end != value.data() + value.size() || target < 0 || !get_arg(args, "appuuid", "").empty()) {
-        tree.put("root.<xmlattr>.status_code", 400);
-        tree.put("root.<xmlattr>.status_message", "Invalid application identifier; UUID targets are not implemented");
-        return;
-      }
     }
     std::shared_ptr<rtsp_stream::launch_session_t> session;
     try {
@@ -1540,30 +1548,33 @@ namespace nvhttp {
       if (!client || !permissions::allows(client->permissions, permissions::view)) {
         return 403;
       }
-      const auto current = proc::proc.running();
-      const bool active = rtsp_stream::session_count() > 0;
-      if (resuming) {
-        if (current <= 0) {
-          return 503;
-        }
-        target = current;
+      if (args.count("appid") > 1 || args.count("appuuid") > 1) {
+        return 400;
       }
-      const bool same_application = target == current && (current > 0 || active);
-      if (!same_application && !permissions::allows(client->permissions, permissions::launch)) {
+      proc::refresh(config::stream.file_apps);
+      const auto current_identity = proc::proc.active_identity();
+      const auto current = current_identity.first;
+      const bool active =
+#ifdef SUNSHINE_TESTS
+        source_sessions_hook ? source_sessions_hook() > 0 :
+#endif
+                               rtsp_stream::session_count() > 0;
+      std::vector<std::pair<int, std::string>> applications;
+      for (const auto &app : proc::proc.apps_snapshot()) applications.emplace_back(std::stoi(app.id), app.uuid);
+      std::pair<int, std::string> selected;
+      try {
+        selected = proc::catalog::resolve(args.contains("appid") ? std::optional {get_arg(args, "appid")} : std::nullopt, args.contains("appuuid") ? std::optional {get_arg(args, "appuuid")} : std::nullopt, applications, current_identity, resuming);
+      } catch (const proc::catalog::error &error) {
+        return error.status;
+      }
+      target = selected.first;
+      const bool same_application = selected == current_identity && (current > 0 || active);
+      if (!same_application && !permissions::allows(client->permissions, permissions::launch))
         return 403;
-      }
-      if (active && !same_application) {
+      if (active && !same_application)
         return 503;
-      }
-      if (target > 0 && !same_application) {
-        const auto &apps = proc::proc.get_apps();
-        if (std::ranges::none_of(apps, [&](const auto &app) {
-              return app.id == std::to_string(target);
-            })) {
-          return 404;
-        }
-      }
       session->appid = target;
+      session->app_uuid = std::move(selected.second);
       session->joining = active;
       if (!active && args.contains("localAudioPlayMode")) {
         host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
@@ -1578,10 +1589,21 @@ namespace nvhttp {
       }
       if (!active) {
         configured = true;
-        display_device::configure_display(config::video, *session);
-        if (video::probe_encoders()) {
-          return 503;
+#ifdef SUNSHINE_TESTS
+        if (source_configure_hook) {
+          source_configure_hook(*session);
+        } else
+#endif
+        {
+          display_device::configure_display(config::video, *session);
         }
+        const auto probe_result =
+#ifdef SUNSHINE_TESTS
+          source_probe_hook ? source_probe_hook() :
+#endif
+                              video::probe_encoders();
+        if (probe_result)
+          return 503;
       }
       if (target > 0 && !same_application) {
         const auto error = proc::proc.execute(target, session);
@@ -1597,7 +1619,14 @@ namespace nvhttp {
                                                         proc::proc.terminate();
                                                       }
                                                       if (configured) {
-                                                        display_device::revert_configuration();
+#ifdef SUNSHINE_TESTS
+                                                        if (source_rollback_hook) {
+                                                          source_rollback_hook();
+                                                        } else
+#endif
+                                                        {
+                                                          display_device::revert_configuration();
+                                                        }
                                                       }
                                                     });
     tree.put("root.<xmlattr>.status_code", status);
@@ -1886,6 +1915,15 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    void set_source_preparation_hooks(std::function<void(const rtsp_stream::launch_session_t &)> configure, std::function<int()> probe, std::function<void()> rollback, std::function<int()> sessions) {
+      rtsp_stream::catalog_operation([&]() {
+        source_configure_hook = std::move(configure);
+        source_probe_hook = std::move(probe);
+        source_rollback_hook = std::move(rollback);
+        source_sessions_hook = std::move(sessions);
+      });
+    }
+
     void set_gamestream_routes(SimpleWeb::Server<SunshineHTTPS> &server, bool &host_audio) {
       configure_gamestream_routes(server, host_audio);
     }

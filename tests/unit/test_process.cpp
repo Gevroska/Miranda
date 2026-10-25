@@ -6,14 +6,22 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <thread>
 
 // lib imports
+#include <boost/algorithm/string.hpp>
 #include <boost/process/v1.hpp>
 
 // local includes
+#include <src/app_catalog.h>
+#include <src/display_device.h>
+#include <src/httpcommon.h>
+#include <src/logging.h>
 #include <src/process.h>
 #include <src/utility.h>
 
@@ -36,22 +44,18 @@ namespace proc {
    * @param val_raw Text containing variable references.
    * @return Text with environment references expanded.
    */
-  std::string parse_env_val(boost::process::v1::native_environment &env, const std::string_view &val_raw);
+  std::string parse_env_val(boost::process::v1::environment &env, const std::string_view &val_raw);
+
+  /**
+   * @brief Assign configured values with the same platform semantics as both preparation paths.
+   */
+  void assign_environment(boost::process::v1::environment &env, const std::string &name, const std::string &value);
 }  // namespace proc
 
 #ifdef _WIN32
 TEST(ProcessTest, ExpandsEnvironmentNamesWithoutChangingTheirCase) {
-  auto env = boost::this_process::environment();
+  boost::process::v1::environment env {boost::this_process::environment()};
   const std::string key = "SUNSHINE_RANGE_SEARCH_REGRESSION";
-  const auto original = env.find(key);
-  const std::optional<std::string> saved = original == env.end() ? std::nullopt : std::optional {original->to_string()};
-  const auto restore = util::fail_guard([&env, &key, &saved]() {
-    if (saved.has_value()) {
-      env[key] = *saved;
-    } else {
-      env[key].clear();
-    }
-  });
   env[key] = "case-preserved";
 
   EXPECT_EQ(proc::parse_env_val(env, "before-$(sunshine_range_search_regression)-after"), "before-case-preserved-after");
@@ -669,4 +673,775 @@ TEST_F(ProcessRefreshTest, FileTimeType_DefaultValueComparison) {
   // The actual correctness is verified by Refresh_ParsesFileOnFirstCall above —
   // if that test passes, the optional fix works regardless of platform behavior.
   SUCCEED();
+}
+
+namespace {
+  const std::string APP_UUID_A = "11111111-1111-1111-1111-111111111111";
+  const std::string APP_UUID_B = "22222222-2222-2222-2222-222222222222";
+  const std::string APP_UUID_C = "33333333-3333-3333-3333-333333333333";
+
+  /**
+   * @brief Deterministic pure allocation inputs avoid image I/O and random collision searches.
+   */
+  proc::catalog::allocation catalog_inputs(std::vector<int> legacy = {}) {
+    auto next = std::make_shared<unsigned>(0);
+    return {
+      [next]() {
+        return std::vector {APP_UUID_A, APP_UUID_B, APP_UUID_C}.at((*next)++);
+      },
+      [](const std::string &) {
+        return 0U;
+      },
+      std::move(legacy),
+      INT32_MAX,
+      std::nullopt
+    };
+  }
+}  // namespace
+
+TEST(AppCatalogTest, TypedUnknownValuesSurviveNormalizationAndRestart) {
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[{"name":"A","foreign":{"array":[null,true,5,2.5,{},[]]}}],"version":17,"foreign":false})");
+  const auto foreign = tree["apps"][0]["foreign"];
+  proc::catalog::normalize(tree, catalog_inputs({42}));
+  const auto once = tree;
+  proc::catalog::normalize(tree, catalog_inputs({99}));
+  EXPECT_EQ(tree, once);
+  EXPECT_EQ(tree["apps"][0]["foreign"], foreign);
+  EXPECT_EQ(tree["apps"][0]["id"], "42");
+  EXPECT_EQ(tree["version"], 17);
+  EXPECT_EQ(tree["foreign"], false);
+}
+
+TEST(AppCatalogTest, EveryUnambiguousLegacyTargetIsReservedBeforeFallback) {
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[{"name":"new"},{"name":"legacy"}]})");
+  proc::catalog::normalize(tree, catalog_inputs({0, 1}));
+  EXPECT_EQ(tree["apps"][0]["id"], "2");
+  EXPECT_EQ(tree["apps"][1]["id"], "1");
+}
+
+TEST(AppCatalogTest, CollisionProbingExhaustionAndRetiredTargetsAreDeterministic) {
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[{"name":"A"},{"name":"B"}]})");
+  auto inputs = catalog_inputs();
+  inputs.maximum = 2;
+  proc::catalog::normalize(tree, inputs);
+  EXPECT_EQ(tree["apps"][0]["id"], "1");
+  EXPECT_EQ(tree["apps"][1]["id"], "2");
+  tree["apps"].erase(0);
+  tree["apps"].push_back({{"name", "C"}, {"uuid", APP_UUID_C}});
+  EXPECT_THROW(proc::catalog::normalize(tree, inputs), proc::catalog::error);
+  EXPECT_EQ(tree["miranda-app-identity"]["allocated-ids"].size(), 2);
+}
+
+TEST(AppCatalogTest, LedgerMustBeBijectiveIncludingCapturedActiveIdentity) {
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[],"miranda-app-identity":{"version":1,"allocated-ids":{"1":"11111111-1111-1111-1111-111111111111","2":"11111111-1111-1111-1111-111111111111"}}})");
+  EXPECT_THROW(proc::catalog::normalize(tree, catalog_inputs()), proc::catalog::error);
+  tree["miranda-app-identity"]["allocated-ids"].erase("2");
+  auto inputs = catalog_inputs();
+  inputs.active = std::pair {2, APP_UUID_A};
+  EXPECT_THROW(proc::catalog::normalize(tree, inputs), proc::catalog::error);
+}
+
+TEST(AppCatalogTest, ExplicitReservationsCannotBeStolenByGeneratedIdentities) {
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[{"name":"new"},{"name":"explicit","uuid":"11111111-1111-1111-1111-111111111111","id":1}]})");
+  proc::catalog::normalize(tree, catalog_inputs());
+  EXPECT_EQ(tree["apps"][0]["uuid"], APP_UUID_B);
+  EXPECT_EQ(tree["apps"][0]["id"], "2");
+  EXPECT_EQ(tree["apps"][1]["id"], "1");
+}
+
+TEST(AppCatalogTest, RejectsDuplicateKeysOverflowAndUnsupportedSchemaWithoutLoss) {
+  for (const std::string bytes : {
+         R"({"env":{},"apps":[],"env":{}})",
+         R"({"env":{},"apps":[{"name":"A","foreign":{"x":0,"x":1}}]})",
+         R"({"env":{},"apps":[],"unknown":18446744073709551616})",
+         R"({"env":{},"apps":[],"unknown":-9223372036854775809})"
+       }) {
+    EXPECT_THROW(proc::catalog::parse(bytes), proc::catalog::error);
+  }
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[],"miranda-app-identity":{"version":2,"allocated-ids":{}}})");
+  const auto before = tree;
+  EXPECT_THROW(proc::catalog::normalize(tree, catalog_inputs()), proc::catalog::error);
+  EXPECT_EQ(tree, before);
+}
+
+TEST(AppCatalogTest, RejectsWrongTypesDuplicateAndReservedIdentities) {
+  for (const std::string identity : {"0", "-1", "2147483648", "true", "1.0", "null", R"("01")", R"("+1")"}) {
+    EXPECT_THROW(proc::catalog::positive_id(proc::catalog::parse(identity)), proc::catalog::error) << identity;
+  }
+  for (const auto *uuid : {"00000000-0000-0000-0000-000000000000", "8CB5C136-DA67-4F99-B4A1-F9CD35005CF4", "malformed"}) {
+    EXPECT_FALSE(proc::catalog::canonical_uuid(uuid));
+  }
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[{"name":"A","id":7,"uuid":"11111111-1111-1111-1111-111111111111"},{"name":"B","id":7,"uuid":"22222222-2222-2222-2222-222222222222"}]})");
+  EXPECT_THROW(proc::catalog::normalize(tree, catalog_inputs()), proc::catalog::error);
+  tree["apps"][1]["id"] = "8";
+  tree["apps"][1]["uuid"] = APP_UUID_A;
+  EXPECT_THROW(proc::catalog::normalize(tree, catalog_inputs()), proc::catalog::error);
+}
+
+TEST(AppCatalogTest, LegacyCrcBoundaryHasDefinedPositiveResults) {
+  EXPECT_EQ(proc::catalog::legacy_crc_id(0), 0);
+  EXPECT_EQ(proc::catalog::legacy_crc_id(0x80000000U), 0);
+  EXPECT_EQ(proc::catalog::legacy_crc_id(0xffffffffU), 1);
+  EXPECT_EQ(proc::catalog::legacy_crc_id(0x80000001U), INT32_MAX);
+}
+
+TEST(AppCatalogTest, EditorRetainsNestedMetadataAndRefusesAmbiguousLoss) {
+  auto retained = proc::catalog::parse(R"({"name":"A","prep-cmd":[{"do":"one","undo":"undo","foreign":{"flags":[false,null]}}],"foreign":{}})");
+  auto edit = proc::catalog::parse(R"({"name":"renamed","prep-cmd":[{"do":"one","undo":"undo","elevated":true}]})");
+  proc::catalog::merge_edit(retained, edit);
+  EXPECT_EQ(retained["prep-cmd"][0]["foreign"]["flags"], proc::catalog::json::array({false, nullptr}));
+  EXPECT_TRUE(retained["foreign"].is_object());
+  auto reordered = proc::catalog::parse(R"({"prep-cmd":[{"do":"added","undo":""},{"do":"one","undo":"undo"}]})");
+  proc::catalog::merge_edit(retained, reordered);
+  EXPECT_EQ(retained["prep-cmd"][1]["foreign"]["flags"], proc::catalog::json::array({false, nullptr}));
+  // Return to one retained foreign command before exercising an ambiguous replacement.
+  retained["prep-cmd"].erase(0);
+  edit["prep-cmd"][0]["do"] = "changed";
+  EXPECT_THROW(proc::catalog::merge_edit(retained, edit), proc::catalog::error);
+  edit["prep-cmd"] = proc::catalog::json::array();
+  proc::catalog::merge_edit(retained, edit);
+  EXPECT_TRUE(retained["prep-cmd"].empty());
+}
+
+/**
+ * @brief Exercise complete serialized disk/runtime transactions using synthetic empty-command apps.
+ */
+class AppCatalogTransactionTest: public ProcessRefreshTest {
+protected:
+  proc::proc_t saved;
+  fs::path file;
+
+  void SetUp() override {
+    ProcessRefreshTest::SetUp();
+    saved = std::move(proc::proc);
+    proc::proc = proc::proc_t {};
+    file = test_dir / "identity_catalog.json";
+    writeAppsJson(file, {"Desktop", "Other"});
+  }
+
+  void TearDown() override {
+    http::test_support::set_state_security_hook({});
+    http::test_support::set_state_replace_hook({});
+    http::test_support::set_state_attributes_hook({});
+    http::test_support::set_state_update_hook({});
+    proc::test_support::set_undo_environment_hook({});
+    rtsp_stream::test_support::set_owner_hook({});
+    proc::proc.terminate();
+    proc::proc = std::move(saved);
+    ProcessRefreshTest::TearDown();
+  }
+
+  std::string bytes() const {
+    std::ifstream in {file, std::ios::binary};
+    return {std::istreambuf_iterator<char> {in}, std::istreambuf_iterator<char> {}};
+  }
+
+  proc::catalog::json read() const {
+    const auto result = proc::read_catalog(file.string());
+    EXPECT_EQ(result.status, 200) << result.body;
+    return proc::catalog::parse(result.body);
+  }
+};
+
+TEST_F(AppCatalogTransactionTest, RenameArtworkAndReorderRetainBothIdentitiesThroughRestart) {
+  const auto initial = read();
+  auto edit = initial["apps"][0];
+  const auto uuid = edit["uuid"];
+  const auto id = edit["id"];
+  edit["name"] = "Zulu renamed";
+  edit["image-path"] = "synthetic.png";
+  const auto result = proc::save_catalog_app(file.string(), initial["revision"], edit.dump());
+  ASSERT_EQ(result.status, 200) << result.body;
+  proc::proc = proc::proc_t {};
+  const auto restarted = read();
+  EXPECT_EQ(restarted["apps"][1]["uuid"], uuid);
+  EXPECT_EQ(restarted["apps"][1]["id"], id);
+}
+
+TEST_F(AppCatalogTransactionTest, StaleSaveAndDeleteAreRejectedAgainstExactBytes) {
+  const auto first_tab = read();
+  const auto second_tab = first_tab;
+  auto edit = first_tab["apps"][0];
+  edit["name"] = "Changed";
+  ASSERT_EQ(proc::save_catalog_app(file.string(), first_tab["revision"], edit.dump()).status, 200);
+  const auto committed = bytes();
+  EXPECT_EQ(proc::save_catalog_app(file.string(), second_tab["revision"], edit.dump()).status, 409);
+  EXPECT_EQ(proc::delete_catalog_app(file.string(), second_tab["revision"], second_tab["apps"][0]["uuid"]).status, 409);
+  EXPECT_EQ(proc::save_catalog_app(file.string(), "", edit.dump()).status, 428);
+  EXPECT_EQ(proc::delete_catalog_app(file.string(), "", second_tab["apps"][0]["uuid"]).status, 428);
+  EXPECT_EQ(bytes(), committed);
+}
+
+TEST_F(AppCatalogTransactionTest, SameMtimeAndDifferentPathsDoNotSuppressChangedContent) {
+  const auto initial = read();
+  const auto time = fs::last_write_time(file);
+  auto changed = proc::catalog::parse(bytes());
+  changed["apps"][0]["name"] = "Same timestamp";
+  std::ofstream {file} << changed.dump();
+  fs::last_write_time(file, time);
+  proc::refresh(file.string());
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "Same timestamp");
+  const auto other = test_dir / "other_catalog.json";
+  writeAppsJson(other, {"Different path"});
+  fs::last_write_time(other, time);
+  proc::refresh(other.string());
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "Different path");
+}
+
+TEST_F(AppCatalogTransactionTest, InvalidExternalInputRetainsLastGoodBytesAndRuntime) {
+  read();
+  const auto original_apps = proc::proc.apps_snapshot();
+  const std::string invalid = R"({"env":{},"apps":[{"name":"bad","id":0}]})";
+  std::ofstream {file} << invalid;
+  EXPECT_EQ(proc::read_catalog(file.string()).status, 400);
+  EXPECT_EQ(bytes(), invalid);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].uuid, original_apps[0].uuid);
+}
+
+TEST_F(AppCatalogTransactionTest, ActiveEditDeletionAndEnvironmentPublicationPreserveCapturedContext) {
+  const auto initial = read();
+  const auto target = initial["apps"][0];
+  const auto id = std::stoi(target["id"].get<std::string>());
+  auto session = std::make_shared<rtsp_stream::launch_session_t>();
+  session->surround_info = 2;
+  ASSERT_EQ(proc::proc.execute(id, session), 0);
+  const auto captured = proc::proc.active_identity();
+  auto edit = target;
+  edit["name"] = "After launch";
+  const auto saved_result = proc::save_catalog_app(file.string(), initial["revision"], edit.dump());
+  ASSERT_EQ(saved_result.status, 200) << saved_result.body;
+  EXPECT_EQ(proc::proc.active_identity(), captured);
+  EXPECT_EQ(proc::proc.get_env().at("SUNSHINE_APP_NAME").to_string(), "Desktop");
+  const auto current = proc::catalog::parse(saved_result.body);
+  ASSERT_EQ(proc::delete_catalog_app(file.string(), current["revision"], target["uuid"]).status, 200);
+  EXPECT_EQ(proc::proc.active_identity(), captured);
+  const std::vector<std::pair<int, std::string>> no_live_apps;
+  EXPECT_EQ(proc::catalog::resolve("-1", captured.second, no_live_apps, captured, true), captured);
+  proc::proc.terminate();
+  EXPECT_THROW(proc::catalog::resolve("-1", captured.second, no_live_apps, proc::proc.active_identity(), false), proc::catalog::error);
+}
+
+#ifdef _WIN32
+TEST_F(AppCatalogTransactionTest, NativeSecurityAndReplacementFailuresRetainBytesAndRuntime) {
+  const auto initial = read();
+  const auto original = bytes();
+  const auto identity = proc::proc.apps_snapshot()[0].uuid;
+  auto edit = initial["apps"][0];
+  edit["name"] = "Must not publish";
+  for (const auto stage : {http::test_support::state_security_stage_e::restore, http::test_support::state_security_stage_e::verify}) {
+    http::test_support::set_state_security_hook([&](auto current, const auto &temporary) {
+      EXPECT_EQ(fs::file_size(temporary), 0);
+      if (current == stage) {
+        throw std::runtime_error {"fixture security failure"};
+      }
+    });
+    EXPECT_EQ(proc::save_catalog_app(file.string(), initial["revision"], edit.dump()).status, 500);
+    EXPECT_EQ(bytes(), original);
+    EXPECT_EQ(proc::proc.apps_snapshot()[0].uuid, identity);
+    http::test_support::set_state_security_hook({});
+  }
+  http::test_support::set_state_replace_hook([](const auto &, const auto &, const auto &) {
+    return std::optional<std::uint32_t> {5};
+  });
+  EXPECT_EQ(proc::save_catalog_app(file.string(), initial["revision"], edit.dump()).status, 500);
+  EXPECT_EQ(bytes(), original);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "Desktop");
+}
+
+TEST_F(AppCatalogTransactionTest, UnwritableLegacyInputNeverAdvertisesTransientIdentity) {
+  const auto original = bytes();
+  http::test_support::set_state_attributes_hook([](const auto &) {
+    return std::optional<std::uint32_t> {0x4000};
+  });
+  EXPECT_EQ(proc::read_catalog(file.string()).status, 500);
+  EXPECT_EQ(bytes(), original);
+  EXPECT_TRUE(proc::proc.apps_snapshot().empty());
+}
+#endif
+
+TEST(AppSelectorTest, NumericUuidSentinelAndResumeMatrix) {
+  const std::vector<std::pair<int, std::string>> apps {{7, APP_UUID_A}, {8, APP_UUID_B}};
+  const std::pair<int, std::string> active {7, APP_UUID_A};
+  EXPECT_EQ(proc::catalog::resolve("7", std::nullopt, apps, active, false), active);
+  EXPECT_EQ(proc::catalog::resolve("7", "", apps, active, false), active);
+  EXPECT_EQ(proc::catalog::resolve(std::nullopt, APP_UUID_A, apps, active, false), active);
+  EXPECT_EQ(proc::catalog::resolve("-1", APP_UUID_A, apps, active, false), active);
+  EXPECT_EQ(proc::catalog::resolve("-1", APP_UUID_A, apps, active, true), active);
+  EXPECT_EQ(proc::catalog::resolve(std::nullopt, std::nullopt, apps, active, true), active);
+  EXPECT_EQ(proc::catalog::resolve("7", APP_UUID_A, apps, active, true), active);
+  for (const auto &id : {"0", "8", "99", "-2", "2147483648", "-01", "", "7x"}) {
+    EXPECT_THROW(proc::catalog::resolve(id, APP_UUID_A, apps, active, true), proc::catalog::error) << id;
+  }
+  for (const auto &uuid : {"", "invalid", "33333333-3333-3333-3333-333333333333"}) {
+    EXPECT_THROW(proc::catalog::resolve("-1", uuid, apps, active, false), proc::catalog::error) << uuid;
+  }
+  EXPECT_THROW(proc::catalog::resolve("-1", APP_UUID_B, apps, active, true), proc::catalog::error);
+  EXPECT_THROW(proc::catalog::resolve("7", APP_UUID_B, apps, active, false), proc::catalog::error);
+  EXPECT_THROW(proc::catalog::resolve(std::nullopt, std::nullopt, apps, active, false), proc::catalog::error);
+}
+
+TEST_F(AppCatalogTransactionTest, ConcurrentTabsCannotBothCommitTheSameRevision) {
+  const auto initial = read();
+  auto first = initial["apps"][0];
+  auto second = first;
+  first["name"] = "First writer";
+  second["name"] = "Second writer";
+  std::promise<void> start;
+  auto ready = start.get_future().share();
+  proc::catalog_response left, right;
+  std::jthread first_tab {[&]() {
+    ready.wait();
+    left = proc::save_catalog_app(file.string(), initial["revision"], first.dump());
+  }};
+  std::jthread second_tab {[&]() {
+    ready.wait();
+    right = proc::save_catalog_app(file.string(), initial["revision"], second.dump());
+  }};
+  start.set_value();
+  first_tab.join();
+  second_tab.join();
+  EXPECT_TRUE((left.status == 200 && right.status == 409) || (left.status == 409 && right.status == 200));
+  const auto committed = read();
+  const auto it = std::find_if(committed["apps"].begin(), committed["apps"].end(), [&](const auto &app) {
+    return app["uuid"] == initial["apps"][0]["uuid"];
+  });
+  ASSERT_NE(it, committed["apps"].end());
+  EXPECT_EQ((*it)["id"], initial["apps"][0]["id"]);
+  EXPECT_TRUE((*it)["name"] == "First writer" || (*it)["name"] == "Second writer");
+}
+
+namespace {
+  /**
+   * @brief Seed a fixture environment override and restore its value/spelling even after an assertion failure.
+   */
+  class native_variable_scope {
+    std::string name;
+    std::optional<std::string> previous;
+
+  public:
+    native_variable_scope(std::string name, const std::optional<std::string> &value):
+        name(std::move(name)) {
+      logging::log_flush();
+      auto parent = boost::this_process::environment();
+#ifdef _WIN32
+      const auto found = std::find_if(parent.begin(), parent.end(), [&](const auto &entry) {
+        return boost::iequals(entry.get_name(), this->name);
+      });
+#else
+      const auto found = parent.find(this->name);
+#endif
+      if (found != parent.end()) {
+        this->name = found->get_name();
+        previous = found->to_string();
+      }
+      if (value) {
+        parent[this->name] = *value;
+      } else {
+        parent[this->name].clear();
+      }
+    }
+
+    ~native_variable_scope() {
+      logging::log_flush();
+      auto parent = boost::this_process::environment();
+      if (previous) {
+        parent[name] = *previous;
+      } else {
+        parent[name].clear();
+      }
+    }
+
+    static std::optional<std::string> read(const std::string &name) {
+      const auto parent = boost::this_process::environment();
+#ifdef _WIN32
+      const auto found = std::find_if(parent.begin(), parent.end(), [&](const auto &entry) {
+        return boost::iequals(entry.get_name(), name);
+      });
+#else
+      const auto found = parent.find(name);
+#endif
+      return found == parent.end() ? std::nullopt : std::optional {found->to_string()};
+    }
+  };
+}  // namespace
+
+TEST_F(AppCatalogTransactionTest, OwnedPreparationNeverMutatesParentEnvironmentOnRejectedOrSuccessfulInput) {
+  native_variable_scope marker {"P1C_REVIEW_MARKER", "parent"};
+  native_variable_scope path {"P1C_REVIEW_PATH", "base"};
+  read();
+  const auto runtime_before = proc::proc.get_env();
+  const auto apps_before = proc::proc.apps_snapshot();
+  const std::string malformed = R"({"env":{"P1C_REVIEW_MARKER":"candidate","P1C_REVIEW_PATH":"$(P1C_REVIEW_PATH):once"},"apps":[{"name":"A","uuid":"invalid"}]})";
+  std::ofstream {file} << malformed;
+  EXPECT_EQ(proc::read_catalog(file.string()).status, 400);
+  EXPECT_EQ(bytes(), malformed);
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_MARKER"), "parent");
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_PATH"), "base");
+  EXPECT_EQ(proc::proc.get_env().at("P1C_REVIEW_MARKER").to_string(), runtime_before.at("P1C_REVIEW_MARKER").to_string());
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].uuid, apps_before[0].uuid);
+
+  const std::string valid = R"({"env":{"P1C_REVIEW_MARKER":"candidate","P1C_REVIEW_PATH":"$(P1C_REVIEW_PATH):once"},"apps":[{"name":"A"}]})";
+  std::ofstream {file} << valid;
+  http::test_support::set_state_update_hook([&]() {
+    // Observe the prebytes interval as well as postchecks: owned evaluation never exposes a transient native assignment.
+    EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_MARKER"), "parent");
+    EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_PATH"), "base");
+  });
+#ifdef _WIN32
+  http::test_support::set_state_replace_hook([](const auto &, const auto &, const auto &) {
+    return std::optional<std::uint32_t> {5};
+  });
+  EXPECT_EQ(proc::read_catalog(file.string()).status, 500);
+  EXPECT_EQ(bytes(), valid);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].uuid, apps_before[0].uuid);
+  EXPECT_EQ(proc::proc.get_env().at("P1C_REVIEW_MARKER").to_string(), "parent");
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_MARKER"), "parent");
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_PATH"), "base");
+  http::test_support::set_state_replace_hook({});
+#endif
+  const auto committed = read();
+  EXPECT_EQ(proc::proc.get_env().at("P1C_REVIEW_MARKER").to_string(), "candidate");
+  EXPECT_EQ(proc::proc.get_env().at("P1C_REVIEW_PATH").to_string(), "base:once");
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_MARKER"), "parent");
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_PATH"), "base");
+  const auto committed_bytes = bytes();
+  const auto unchanged = read();
+  EXPECT_EQ(unchanged["revision"], committed["revision"]);
+  EXPECT_EQ(bytes(), committed_bytes);
+  auto edit = committed["apps"][0];
+  edit["output"] = "";
+  EXPECT_EQ(proc::save_catalog_app(file.string(), committed["revision"], edit.dump()).status, 200);
+  EXPECT_EQ(proc::proc.get_env().at("P1C_REVIEW_PATH").to_string(), "base:once");
+  EXPECT_EQ(native_variable_scope::read("P1C_REVIEW_PATH"), "base");
+}
+
+TEST_F(AppCatalogTransactionTest, OrderedDependentEnvironmentSurvivesNormalizationSaveAndCleanRestart) {
+  native_variable_scope root {"ZZ_P1C_ROOT", std::nullopt};
+  native_variable_scope alias {"AA_P1C_ALIAS", std::nullopt};
+  const std::string legacy = R"json({"env":{"ZZ_P1C_ROOT":"desired","AA_P1C_ALIAS":"$(ZZ_P1C_ROOT)"
+}
+
+, "apps": [{"name": "$(AA_P1C_ALIAS)", "cmd": "$(AA_P1C_ALIAS)", "foreign": {"array": [null, false, {}, []]}}]
+})json";
+  std::ofstream {file} << legacy;
+  const auto before = proc::parse(file.string());
+  ASSERT_TRUE(before);
+  const auto expected_id = before->apps_snapshot()[0].id;
+  ASSERT_EQ(before->apps_snapshot()[0].name, "desired");
+  ASSERT_EQ(before->apps_snapshot()[0].cmd, "desired");
+  const auto normalized = read();
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].id, expected_id);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "desired");
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].cmd, "desired");
+  EXPECT_EQ(proc::proc.get_env().at("AA_P1C_ALIAS").to_string(), "desired");
+  EXPECT_LT(bytes().find("ZZ_P1C_ROOT"), bytes().find("AA_P1C_ALIAS"));
+  EXPECT_FALSE(native_variable_scope::read("ZZ_P1C_ROOT"));
+  EXPECT_FALSE(native_variable_scope::read("AA_P1C_ALIAS"));
+  auto edit = normalized["apps"][0];
+  edit["wait-all"] = false;
+  ASSERT_EQ(proc::save_catalog_app(file.string(), normalized["revision"], edit.dump()).status, 200);
+  proc::proc = proc::proc_t {};
+  const auto restarted = read();
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].id, expected_id);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "desired");
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].cmd, "desired");
+  EXPECT_EQ(proc::proc.get_env().at("AA_P1C_ALIAS").to_string(), "desired");
+  EXPECT_EQ(restarted["apps"][0]["foreign"], normalized["apps"][0]["foreign"]);
+  EXPECT_LT(bytes().find("ZZ_P1C_ROOT"), bytes().find("AA_P1C_ALIAS"));
+  EXPECT_FALSE(native_variable_scope::read("ZZ_P1C_ROOT"));
+  EXPECT_FALSE(native_variable_scope::read("AA_P1C_ALIAS"));
+}
+
+TEST_F(AppCatalogTransactionTest, RealExitedChildCleanupSerializesWithOwnerPublicationAndRunsUndoOnce) {
+  // No settings manager is installed: real process cleanup must not configure host displays.
+  display_device::test_reset_display_device();
+  native_variable_scope parent_marker {"P1C_UNDO_ENVIRONMENT", "parent"};
+  auto tree = proc::catalog::parse(R"({"env":{"P1C_UNDO_ENVIRONMENT":"captured"},"apps":[{"name":"Owned child","auto-detach":false,"wait-all":false,"exit-timeout":0,"prep-cmd":[{"do":"","undo":""}]}]})");
+  const auto output = test_dir / "owned_child_undo.txt";
+#ifdef _WIN32
+  tree["apps"][0]["cmd"] = "cmd.exe /D /C exit 0";
+  tree["apps"][0]["prep-cmd"][0]["undo"] = "cmd.exe /D /C echo %P1C_UNDO_ENVIRONMENT%";
+#else
+  std::ofstream {test_dir / "p1c-exit.sh"} << "exit 0\n";
+  std::ofstream {test_dir / "p1c-undo.sh"} << "printf '%s\\n' \"$P1C_UNDO_ENVIRONMENT\"\n";
+  tree["apps"][0]["cmd"] = "/bin/sh p1c-exit.sh";
+  tree["apps"][0]["prep-cmd"][0]["undo"] = "/bin/sh p1c-undo.sh";
+  tree["apps"][0]["working-dir"] = test_dir.string();
+#endif
+  tree["apps"][0]["output"] = output.string();
+  std::ofstream {file} << tree.dump();
+  const auto initial = read();
+  const auto id = std::stoi(initial["apps"][0]["id"].get<std::string>());
+  auto session = std::make_shared<rtsp_stream::launch_session_t>();
+  session->surround_info = 2;
+  ASSERT_EQ(proc::proc.execute(id, session), 0);
+  ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+  auto owner = rtsp_stream::test_support::start_owner();
+  std::promise<void> consuming;
+  std::promise<void> release;
+  const auto released = release.get_future().share();
+  std::promise<void> posted;
+  std::atomic_bool observed_post {false};
+  std::atomic_int undos {0};
+  proc::test_support::set_undo_environment_hook([&](const auto &environment) {
+    EXPECT_EQ(environment.at("P1C_UNDO_ENVIRONMENT").to_string(), "captured");
+    EXPECT_EQ(environment.at("SUNSHINE_APP_ID").to_string(), std::to_string(id));
+    if (++undos == 1) {
+      consuming.set_value();
+    }
+    released.wait();
+    EXPECT_EQ(environment.at("P1C_UNDO_ENVIRONMENT").to_string(), "captured");
+  });
+  rtsp_stream::test_support::set_owner_hook([&](std::string_view event) {
+    if (event == "operation_posted" && !observed_post.exchange(true)) {
+      posted.set_value();
+    }
+  });
+  int running = -1;
+  proc::catalog_response saved_result;
+  std::promise<void> saved;
+  auto published = saved.get_future();
+  std::jthread cleanup {[&]() {
+    running = proc::proc.running();
+  }};
+  std::jthread writer;
+  bool signalled = false;
+  auto unblock = util::fail_guard([&]() {
+    if (!signalled) {
+      release.set_value();
+    }
+  });
+  EXPECT_EQ(consuming.get_future().wait_for(std::chrono::seconds {2}), std::future_status::ready);
+  auto edit = initial["apps"][0];
+  edit["name"] = "Committed after cleanup";
+  writer = std::jthread {[&]() {
+    saved_result = proc::save_catalog_app(file.string(), initial["revision"], edit.dump());
+    saved.set_value();
+  }};
+  EXPECT_EQ(posted.get_future().wait_for(std::chrono::seconds {2}), std::future_status::ready);
+  EXPECT_EQ(published.wait_for(std::chrono::milliseconds {100}), std::future_status::timeout);
+  release.set_value();
+  signalled = true;
+  cleanup.join();
+  writer.join();
+  proc::test_support::set_undo_environment_hook({});
+  rtsp_stream::test_support::set_owner_hook({});
+  EXPECT_EQ(running, 0);
+  EXPECT_EQ(undos, 1);
+  EXPECT_EQ(saved_result.status, 200) << saved_result.body;
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "Committed after cleanup");
+  EXPECT_EQ(proc::proc.running(), 0);
+  std::ifstream undo_output {output};
+  std::string first, extra;
+  std::getline(undo_output, first);
+  std::getline(undo_output, extra);
+  if (!first.empty() && first.back() == '\r') {
+    first.pop_back();
+  }
+  EXPECT_EQ(first, "captured");
+  EXPECT_TRUE(extra.empty());
+  EXPECT_EQ(native_variable_scope::read("P1C_UNDO_ENVIRONMENT"), "parent");
+  auto stopped = std::async(std::launch::async, [&]() {
+    owner.reset();
+  });
+  EXPECT_EQ(stopped.wait_for(std::chrono::seconds {2}), std::future_status::ready);
+  stopped.get();
+}
+
+TEST(ProcessStateTest, GuardRetainsMutexStorageAcrossQuiescentProcessMoves) {
+  std::optional<proc::state_guard_t> retained;
+  {
+    proc::proc_t original;
+    retained.emplace(original.lock_state());
+    proc::proc_t moved {std::move(original)};
+    const auto nested = moved.lock_state();
+    EXPECT_EQ(retained->lifetime, nested.lifetime);
+    EXPECT_TRUE(retained->lock.owns_lock());
+  }
+  EXPECT_TRUE(retained->lock.owns_lock());
+  retained.reset();
+}
+
+TEST(ProcessEnvironmentTest, OwnedReplacementPreservesWindowsSpellingAndPosixDistinctNames) {
+  const auto parent = native_variable_scope::read("PATH");
+  boost::process::v1::environment owned;
+  owned["Path"] = "base";
+  proc::assign_environment(owned, "PATH", proc::parse_env_val(owned, "$(Path);extra"));
+  proc::assign_environment(owned, "path", "last");
+  std::size_t case_matches = 0;
+  for (const auto &entry : owned) {
+    if (boost::iequals(entry.get_name(), "PATH")) {
+      ++case_matches;
+    }
+  }
+#ifdef _WIN32
+  EXPECT_EQ(case_matches, 1);
+  EXPECT_EQ(owned.at("Path").to_string(), "last");
+  EXPECT_EQ(proc::parse_env_val(owned, "$(PATH)"), "last");
+#else
+  EXPECT_EQ(case_matches, 3);
+  EXPECT_EQ(owned.at("Path").to_string(), "base");
+  EXPECT_EQ(owned.at("PATH").to_string(), "base;extra");
+  EXPECT_EQ(owned.at("path").to_string(), "last");
+#endif
+  EXPECT_EQ(native_variable_scope::read("PATH"), parent);
+}
+
+TEST_F(AppCatalogTransactionTest, CaseVariantOverridesAndDependentLegacyIdentityUseOneWindowsEntry) {
+  native_variable_scope parent_path {"PATH", "parent"};
+#ifndef _WIN32
+  native_variable_scope other_path {"path", std::nullopt};
+  native_variable_scope mixed_path {"Path", std::nullopt};
+#endif
+  const std::string legacy = R"json({"env":{"PATH":"first","path":"last","P1C_PATH_ALIAS":"$(PATH)"
+}
+
+, "apps": [{"name": "$(P1C_PATH_ALIAS)", "cmd": "$(P1C_PATH_ALIAS)"}]
+})json";
+  std::ofstream {file} << legacy;
+#ifdef _WIN32
+  const std::string expected = "last";
+  const std::size_t expected_entries = 1;
+#else
+  const std::string expected = "first";
+  const std::size_t expected_entries = 2;
+#endif
+  const auto original_id = std::get<0>(proc::calculate_app_id(expected, "", 0));
+  const auto normalized = read();
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].name, expected);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].cmd, expected);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].id, original_id);
+  auto owned = proc::proc.get_env();
+  std::size_t entries = 0;
+  for (const auto &entry : owned) {
+    if (boost::iequals(entry.get_name(), "PATH")) {
+      ++entries;
+    }
+  }
+  EXPECT_EQ(entries, expected_entries);
+  EXPECT_EQ(proc::parse_env_val(owned, "$(PATH)"), expected);
+  EXPECT_EQ(native_variable_scope::read("PATH"), "parent");
+  proc::proc = proc::proc_t {};
+  const auto restarted = read();
+  EXPECT_EQ(restarted["apps"][0]["uuid"], normalized["apps"][0]["uuid"]);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].id, original_id);
+  EXPECT_EQ(proc::proc.apps_snapshot()[0].cmd, expected);
+  EXPECT_EQ(native_variable_scope::read("PATH"), "parent");
+}
+
+TEST_F(AppCatalogTransactionTest, ConfiguredPathSelectsTheExecutableWithInferredAndExplicitWorkingDirectories) {
+  display_device::test_reset_display_device();
+  const auto configured = fs::absolute(test_dir / "configured bin");
+  const auto native = fs::absolute(test_dir / "native-bin");
+  const auto unrelated = fs::absolute(test_dir / "unrelated working");
+  const auto empty = fs::absolute(test_dir / "empty-bin");
+  for (const auto &directory : {configured, native, unrelated, empty}) {
+    fs::create_directories(directory);
+  }
+#ifdef _WIN32
+  const std::string name = "p1c_lookup_helper.exe";
+  const auto configured_binary = boost::process::v1::search_path("cmd.exe");
+  const auto native_binary = boost::process::v1::search_path("where.exe");
+  ASSERT_FALSE(configured_binary.empty());
+  ASSERT_FALSE(native_binary.empty());
+  fs::copy_file(configured_binary.string(), configured / name);
+  fs::copy_file(native_binary.string(), native / name);
+  const auto command = name + " /D /C echo configured";
+  const std::string expected = "configured";
+#else
+  const std::string name = "p1c_lookup_helper";
+  std::ofstream {configured / name} << "#!/bin/sh\nprintf 'configured:%s:%s\\n' \"$1\" \"$2\"\n";
+  std::ofstream {native / name} << "#!/bin/sh\nprintf 'native\\n'\n";
+  fs::permissions(configured / name, fs::perms::owner_exec, fs::perm_options::add);
+  fs::permissions(native / name, fs::perms::owner_exec, fs::perm_options::add);
+  const auto command = "\"" + name + "\" \"two words\" suffix";
+  const std::string expected = "configured:two words:suffix";
+#endif
+  native_variable_scope native_path {"PATH", native.string()};
+  const auto output = fs::absolute(test_dir / "configured_execution.txt");
+  auto catalog = proc::catalog::parse(R"({"env":{},"apps":[{"name":"PATH fixture","auto-detach":false,"wait-all":false,"exit-timeout":0}]})");
+  catalog["env"]["PATH"] = configured.string();
+  catalog["apps"][0]["cmd"] = command;
+  catalog["apps"][0]["output"] = output.string();
+  {
+    native_variable_scope configured_only {"PATH", empty.string()};
+    std::ofstream {file} << catalog.dump();
+    const auto loaded = read();
+    auto owned = proc::proc.get_env();
+    EXPECT_EQ(proc::find_working_directory(command, owned), boost::filesystem::path(configured.string()));
+    EXPECT_EQ(native_variable_scope::read("PATH"), empty.string());
+    std::ofstream {output};
+    auto session = std::make_shared<rtsp_stream::launch_session_t>();
+    session->surround_info = 2;
+    ASSERT_EQ(proc::proc.execute(std::stoi(loaded["apps"][0]["id"].get<std::string>()), session), 0);
+    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+    EXPECT_EQ(proc::proc.running(), 0);
+    std::ifstream result {output};
+    std::string line;
+    std::getline(result, line);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    EXPECT_EQ(line, expected);
+    EXPECT_EQ(native_variable_scope::read("PATH"), empty.string());
+    catalog = proc::catalog::parse(bytes());
+  }
+  for (const bool explicit_directory : {false, true}) {
+    catalog["apps"][0]["working-dir"] = explicit_directory ? unrelated.string() : "";
+    std::ofstream {file} << catalog.dump();
+    const auto loaded = read();
+    auto owned = proc::proc.get_env();
+    EXPECT_EQ(proc::find_working_directory(command, owned), boost::filesystem::path(configured.string()));
+    EXPECT_EQ(native_variable_scope::read("PATH"), native.string());
+    std::ofstream {output};
+    auto session = std::make_shared<rtsp_stream::launch_session_t>();
+    session->surround_info = 2;
+    ASSERT_EQ(proc::proc.execute(std::stoi(loaded["apps"][0]["id"].get<std::string>()), session), 0);
+    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+    EXPECT_EQ(proc::proc.running(), 0);
+    std::ifstream result {output};
+    std::string line;
+    std::getline(result, line);
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    EXPECT_EQ(line, expected);
+    EXPECT_EQ(native_variable_scope::read("PATH"), native.string());
+    catalog = proc::catalog::parse(bytes());
+  }
+#ifndef _WIN32
+  // Preserve existing absolute/relative executable syntax and the original quoted argument suffix.
+  for (const auto &syntax : {"\"" + (configured / name).string() + "\" \"two words\" suffix", "./" + name + " \"two words\" suffix"}) {
+    catalog["apps"][0]["cmd"] = syntax;
+    catalog["apps"][0]["working-dir"] = configured.string();
+    std::ofstream {file} << catalog.dump();
+    const auto loaded = read();
+    std::ofstream {output};
+    auto session = std::make_shared<rtsp_stream::launch_session_t>();
+    session->surround_info = 2;
+    ASSERT_EQ(proc::proc.execute(std::stoi(loaded["apps"][0]["id"].get<std::string>()), session), 0);
+    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+    EXPECT_EQ(proc::proc.running(), 0);
+    std::ifstream result {output};
+    std::string line;
+    std::getline(result, line);
+    EXPECT_EQ(line, expected);
+    EXPECT_EQ(native_variable_scope::read("PATH"), native.string());
+    catalog = proc::catalog::parse(bytes());
+  }
+#endif
+  catalog["apps"][0]["cmd"] = command;
+  catalog["env"]["PATH"] = empty.string();
+  catalog["apps"][0]["working-dir"] = unrelated.string();
+  std::ofstream {file} << catalog.dump();
+  const auto missing = read();
+  auto owned = proc::proc.get_env();
+  EXPECT_TRUE(proc::find_working_directory(command, owned).empty());
+  std::ofstream {output};
+  auto session = std::make_shared<rtsp_stream::launch_session_t>();
+  session->surround_info = 2;
+  EXPECT_NE(proc::proc.execute(std::stoi(missing["apps"][0]["id"].get<std::string>()), session), 0);
+  EXPECT_EQ(proc::proc.running(), 0);
+  EXPECT_EQ(fs::file_size(output), 0);
+  EXPECT_EQ(native_variable_scope::read("PATH"), native.string());
 }
