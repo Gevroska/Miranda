@@ -6,6 +6,7 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -152,6 +153,79 @@ protected:
    */
   bool same_security(std::vector<std::uint8_t> expected, std::vector<std::uint8_t> current, bool replacement = false) {
     return http::test_support::state_file_security_matches(std::move(expected), std::move(current), replacement);
+  }
+
+  /**
+   * @brief Describe fixture authority differences without disclosing SIDs or descriptor bytes.
+   * @param expected Reference fixture snapshot.
+   * @param current Snapshot under inspection.
+   * @return Bounded component comparisons suitable for a failed assertion.
+   */
+  std::string security_difference(std::vector<std::uint8_t> expected, std::vector<std::uint8_t> current) {
+    testing::Message details;
+    const auto valid = [](auto &snapshot) {
+      return snapshot.size() >= sizeof(SECURITY_DESCRIPTOR_RELATIVE) && IsValidSecurityDescriptor(snapshot.data()) && GetSecurityDescriptorLength(snapshot.data()) <= snapshot.size();
+    };
+    if (!valid(expected) || !valid(current)) {
+      details << "valid expected/current=" << valid(expected) << '/' << valid(current);
+      return details.GetString();
+    }
+    SECURITY_DESCRIPTOR_CONTROL expected_control {}, current_control {};
+    DWORD expected_revision = 0, current_revision = 0;
+    GetSecurityDescriptorControl(expected.data(), &expected_control, &expected_revision);
+    GetSecurityDescriptorControl(current.data(), &current_control, &current_revision);
+    details << "control expected/current=" << expected_control << '/' << current_control
+            << "; revision=" << expected_revision << '/' << current_revision;
+    const auto describe_sid = [&](const char *label, auto getter) {
+      PSID expected_sid = nullptr, current_sid = nullptr;
+      BOOL expected_defaulted = FALSE, current_defaulted = FALSE;
+      const bool expected_read = getter(expected.data(), &expected_sid, &expected_defaulted);
+      const bool current_read = getter(current.data(), &current_sid, &current_defaulted);
+      const bool equal = !expected_sid || !current_sid ? expected_sid == current_sid :
+                                                         IsValidSid(expected_sid) && IsValidSid(current_sid) && EqualSid(expected_sid, current_sid);
+      details << "; " << label << " read=" << expected_read << '/' << current_read
+              << " defaulted=" << expected_defaulted << '/' << current_defaulted << " SID_equal=" << equal;
+    };
+    describe_sid("owner", GetSecurityDescriptorOwner);
+    describe_sid("group", GetSecurityDescriptorGroup);
+    PACL expected_acl = nullptr, current_acl = nullptr;
+    BOOL expected_present = FALSE, current_present = FALSE, expected_defaulted = FALSE, current_defaulted = FALSE;
+    const bool expected_read = GetSecurityDescriptorDacl(expected.data(), &expected_present, &expected_acl, &expected_defaulted);
+    const bool current_read = GetSecurityDescriptorDacl(current.data(), &current_present, &current_acl, &current_defaulted);
+    details << "; DACL read=" << expected_read << '/' << current_read
+            << " present=" << expected_present << '/' << current_present
+            << " defaulted=" << expected_defaulted << '/' << current_defaulted
+            << " nonnull=" << (expected_acl != nullptr) << '/' << (current_acl != nullptr);
+    if (!expected_acl || !current_acl || !IsValidAcl(expected_acl) || !IsValidAcl(current_acl)) {
+      return details.GetString();
+    }
+    details << " revision=" << static_cast<unsigned>(expected_acl->AclRevision) << '/' << static_cast<unsigned>(current_acl->AclRevision)
+            << " ACE_count=" << expected_acl->AceCount << '/' << current_acl->AceCount;
+    const auto count = std::min<DWORD>({expected_acl->AceCount, current_acl->AceCount, 16});
+    for (DWORD index = 0; index < count; ++index) {
+      void *expected_ace = nullptr, *current_ace = nullptr;
+      if (!GetAce(expected_acl, index, &expected_ace) || !GetAce(current_acl, index, &current_ace)) {
+        details << "; ACE[" << index << "] unreadable";
+        continue;
+      }
+      const auto *left = static_cast<ACE_HEADER *>(expected_ace), *right = static_cast<ACE_HEADER *>(current_ace);
+      details << "; ACE[" << index << "] type=" << static_cast<unsigned>(left->AceType) << '/' << static_cast<unsigned>(right->AceType)
+              << " flags=" << static_cast<unsigned>(left->AceFlags) << '/' << static_cast<unsigned>(right->AceFlags)
+              << " size=" << left->AceSize << '/' << right->AceSize;
+      constexpr auto prefix_size = sizeof(ACE_HEADER) + sizeof(ACCESS_MASK);
+      if (left->AceSize >= prefix_size && right->AceSize >= prefix_size) {
+        ACCESS_MASK left_mask = 0, right_mask = 0;
+        const auto *left_bytes = static_cast<const std::uint8_t *>(expected_ace), *right_bytes = static_cast<const std::uint8_t *>(current_ace);
+        std::memcpy(&left_mask, left_bytes + sizeof(ACE_HEADER), sizeof(left_mask));
+        std::memcpy(&right_mask, right_bytes + sizeof(ACE_HEADER), sizeof(right_mask));
+        details << " mask=" << left_mask << '/' << right_mask
+                << " remaining_bytes_equal=" << (left->AceSize == right->AceSize && !std::memcmp(left_bytes + prefix_size, right_bytes + prefix_size, left->AceSize - prefix_size));
+      }
+    }
+    if (expected_acl->AceCount > count || current_acl->AceCount > count) {
+      details << "; additional ACEs omitted";
+    }
+    return details.GetString();
   }
 
   /**
@@ -436,14 +510,24 @@ TEST_F(StateFileTransactionTest, PreservesInheritedAuthorityAndLaterParentRevoca
       }
     }
   });
+  std::vector<std::uint8_t> destination_before_replace, temporary_before_replace;
+  http::test_support::set_state_replace_hook([&](const auto &destination, const auto &temporary, const auto &) -> std::optional<std::uint32_t> {
+    destination_before_replace = security_snapshot(destination);
+    temporary_before_replace = security_snapshot(temporary);
+    return std::nullopt;
+  });
   EXPECT_TRUE(http::update_state_file(file.string(), [](auto &tree) {
     tree.put("fixture", "replacement");
   }));
   http::test_support::set_state_security_hook({});
   http::test_support::set_state_update_hook({});
+  http::test_support::set_state_replace_hook({});
   EXPECT_TRUE(saw_creation && saw_restored && saw_prebytes);
   const auto replaced = security_snapshot(file);
-  EXPECT_TRUE(same_security(original, replaced, true));
+  EXPECT_TRUE(same_security(original, replaced, true))
+    << security_difference(original, replaced)
+    << "\nBefore replacement destination: " << security_difference(original, destination_before_replace)
+    << "\nBefore replacement temporary: " << security_difference(original, temporary_before_replace);
   EXPECT_TRUE(unprotected(replaced));
   EXPECT_TRUE(inherited_read(replaced));
   EXPECT_TRUE(same_security(baseline, security_snapshot(sibling)));
@@ -463,7 +547,7 @@ TEST_F(StateFileTransactionTest, PreservesInheritedAuthorityAndLaterParentRevoca
   ASSERT_EQ(SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, acl, nullptr), ERROR_SUCCESS);
   const auto revoked = security_snapshot(file);
   const auto untouched_revoked = security_snapshot(sibling);
-  EXPECT_TRUE(same_security(revoked, untouched_revoked));
+  EXPECT_TRUE(same_security(revoked, untouched_revoked)) << security_difference(revoked, untouched_revoked);
   EXPECT_TRUE(unprotected(revoked) && unprotected(untouched_revoked));
   EXPECT_FALSE(inherited_read(revoked));
   EXPECT_FALSE(inherited_read(untouched_revoked));
@@ -472,7 +556,7 @@ TEST_F(StateFileTransactionTest, PreservesInheritedAuthorityAndLaterParentRevoca
   }));
   EXPECT_TRUE(same_security(revoked, security_snapshot(file), true));
   expect_repeated_saves_preserve_security(2);
-  EXPECT_TRUE(same_security(untouched_revoked, security_snapshot(file)));
+  EXPECT_TRUE(same_security(untouched_revoked, security_snapshot(file))) << security_difference(untouched_revoked, security_snapshot(file));
   EXPECT_TRUE(unprotected(security_snapshot(file)));
   EXPECT_FALSE(inherited_read(security_snapshot(file)));
 }

@@ -6,6 +6,12 @@
 #include "../certificate_test_utils.h"
 #include "../tests_common.h"
 
+// standard includes
+#include <algorithm>
+#include <array>
+#include <string_view>
+#include <vector>
+
 // lib includes
 #include <openssl/x509.h>
 
@@ -37,9 +43,14 @@ TEST(CryptoTest, GeneratedCredentialsExposeSubjectAndVerifySignatures) {
   const auto common_name_data = X509_NAME_ENTRY_get_data(common_name_entry);
   ASSERT_NE(common_name_data, nullptr);
 
+#if OPENSSL_VERSION_NUMBER >= 0x40100000L
+  const auto common_name_length = ASN1_STRING_get_length(common_name_data);
+#else
+  const auto common_name_length = static_cast<std::size_t>(ASN1_STRING_length(common_name_data));
+#endif
   const std::string_view parsed_common_name {
     reinterpret_cast<const char *>(ASN1_STRING_get0_data(common_name_data)),
-    static_cast<std::size_t>(ASN1_STRING_length(common_name_data))
+    common_name_length
   };
   ASSERT_EQ(parsed_common_name, common_name);
 
@@ -48,6 +59,32 @@ TEST(CryptoTest, GeneratedCredentialsExposeSubjectAndVerifySignatures) {
   const auto signature = crypto::sign256(pkey, payload);
   ASSERT_FALSE(signature.empty());
   ASSERT_TRUE(crypto::verify256(cert, payload, {reinterpret_cast<const char *>(signature.data()), signature.size()}));
+}
+
+TEST(CryptoTest, CertificateSignaturePreservesEmbeddedAndTrailingNulBytes) {
+  const auto credentials = crypto::gen_creds("Sunshine Binary Signature Fixture", 2048);
+  auto certificate = crypto::x509(credentials.x509);
+  ASSERT_NE(certificate.get(), nullptr);
+
+  constexpr std::array<unsigned char, 256> expected {0x80, 0x00, 0xFF, 0x42};
+  const auto encoded_length = i2d_X509(certificate.get(), nullptr);
+  ASSERT_GT(encoded_length, static_cast<int>(expected.size()));
+  std::vector<unsigned char> encoded(static_cast<std::size_t>(encoded_length));
+  auto *output = encoded.data();
+  ASSERT_EQ(i2d_X509(certificate.get(), &output), encoded_length);
+  ASSERT_EQ(output, encoded.data() + encoded.size());
+
+  // Replace only the final 2048-bit RSA signature bytes, retaining the DER length fields.
+  std::copy(expected.begin(), expected.end(), encoded.data() + encoded.size() - expected.size());
+  const auto *input = encoded.data();
+  crypto::x509_t binary_certificate {d2i_X509(nullptr, &input, encoded_length)};
+  ASSERT_NE(binary_certificate.get(), nullptr);
+  ASSERT_EQ(input, encoded.data() + encoded.size());
+
+  const auto signature = crypto::signature(binary_certificate);
+  const std::string_view expected_bytes {reinterpret_cast<const char *>(expected.data()), expected.size()};
+  EXPECT_EQ(signature.size(), expected.size());
+  EXPECT_EQ(signature, expected_bytes);
 }
 
 TEST(CryptoTest, CertificateChainRequiresExactPairedIdentity) {
