@@ -207,4 +207,32 @@ INSTANTIATE_TEST_SUITE_P(
     BatteryParam {0x13, LI_BATTERY_STATE_UNKNOWN, 100, 0x1A, 255}
   )
 );
+
+TEST(WindowsRumbleTest, QueuedFeedbackCannotCrossRebindRemovalOrCallbackIdentityReuse) {
+  auto old_queue = std::make_shared<safe::mail_raw_t>()->queue<platf::gamepad_feedback_msg_t>("feedback");
+  auto current_queue = std::make_shared<safe::mail_raw_t>()->queue<platf::gamepad_feedback_msg_t>("feedback");
+  const auto id = platf::vigem::bind_feedback_for_testing(0, old_queue, 2);
+  auto old_work = platf::vigem::capture_feedback_for_testing(id, 10, 20);
+  EXPECT_EQ(platf::vigem::bind_feedback_for_testing(id, current_queue, 4), id);
+  old_work();
+  EXPECT_FALSE(old_queue->pop(std::chrono::milliseconds {0}));
+  EXPECT_FALSE(current_queue->pop(std::chrono::milliseconds {0}));
+  auto current_work = platf::vigem::capture_feedback_for_testing(id, 10, 20);
+  current_work();
+  const auto rumble = current_queue->pop(std::chrono::milliseconds {0});
+  ASSERT_TRUE(rumble);
+  EXPECT_EQ(rumble->id, 4);
+  EXPECT_EQ(rumble->data.rumble.lowfreq, 2560);
+  const auto rgb = current_queue->pop(std::chrono::milliseconds {0});
+  ASSERT_TRUE(rgb);
+  EXPECT_EQ(rgb->id, 4);
+  auto removed_work = platf::vigem::capture_feedback_for_testing(id, 30, 40);
+  platf::vigem::unbind_feedback_for_testing(id);
+  const auto replacement = platf::vigem::bind_feedback_for_testing(0, current_queue, 5);
+  EXPECT_NE(replacement, id);
+  removed_work();
+  EXPECT_FALSE(current_queue->pop(std::chrono::milliseconds {0}));
+  platf::vigem::unbind_feedback_for_testing(replacement);
+}
+
 #endif

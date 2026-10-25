@@ -165,6 +165,8 @@ namespace nvhttp {
     std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
+    permissions::mask_t permissions = 0;  ///< Explicit implemented rights; pairing alone grants nothing.
+    std::uint64_t revision = 0;  ///< Monotonic in-process authorization revision.
   };
 
   /**
@@ -186,6 +188,9 @@ namespace nvhttp {
     static std::mutex mutex;
     return mutex;
   }
+
+  std::mutex client_mutation_mutex;  ///< Serializes persistence, publication and completed revocation barriers.
+  std::uint64_t authorization_revision = 0;  ///< Next revision, guarded by client_auth_mutex().
 
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
@@ -242,41 +247,22 @@ namespace nvhttp {
   /**
    * @brief Persist the current state to its backing store.
    */
-  void save_state() {
-    pt::ptree root;
-
-    if (fs::exists(config::nvhttp.file_state)) {
-      try {
-        pt::read_json(config::nvhttp.file_state, root);
-      } catch (std::exception &e) {
-        BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-        return;
+  bool save_state(const client_t &client = client_root) {
+    return http::update_state_file(config::nvhttp.file_state, [&](auto &root) {
+      root.put("root.uniqueid", http::unique_id);
+      root.get_child("root").erase("devices");
+      pt::ptree devices;
+      for (const auto &device : client.named_devices) {
+        pt::ptree node;
+        node.put("name", device.name);
+        node.put("cert", device.cert);
+        node.put("uuid", device.uuid);
+        node.put("enabled", device.enabled);
+        node.put("permissions", device.permissions);
+        devices.push_back(std::make_pair(""s, node));
       }
-    }
-
-    root.erase("root"s);
-
-    root.put("root.uniqueid", http::unique_id);
-    client_t &client = client_root;
-    pt::ptree node;
-
-    pt::ptree named_cert_nodes;
-    for (auto &named_cert : client.named_devices) {
-      pt::ptree named_cert_node;
-      named_cert_node.put("name"s, named_cert.name);
-      named_cert_node.put("cert"s, named_cert.cert);
-      named_cert_node.put("uuid"s, named_cert.uuid);
-      named_cert_node.put("enabled"s, named_cert.enabled);
-      named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
-    }
-    root.add_child("root.named_devices"s, named_cert_nodes);
-
-    try {
-      pt::write_json(config::nvhttp.file_state, root);
-    } catch (std::exception &e) {
-      BOOST_LOG(error) << "Couldn't write "sv << config::nvhttp.file_state << ": "sv << e.what();
-      return;
-    }
+      root.put_child("root.named_devices", devices);
+    });
   }
 
   /**
@@ -367,10 +353,22 @@ namespace nvhttp {
         if (client.uuid.empty() || (!original_uuid.empty() && client.uuid != original_uuid)) {
           return std::nullopt;
         }
-        return verified_client_t {client.uuid, crypto::pem(stored_certificate), client.name};
+        return verified_client_t {client.uuid, crypto::pem(stored_certificate), client.name, client.permissions, client.revision};
       }
     }
     return std::nullopt;
+  }
+
+  std::optional<verified_client_t> current_client(const std::string_view uuid, const std::string_view cert) {
+    if (uuid.empty() || cert.empty()) {
+      return std::nullopt;
+    }
+    auto certificate = crypto::x509(cert);
+    if (!certificate) {
+      return std::nullopt;
+    }
+    std::lock_guard lock {client_auth_mutex()};
+    return resolve_client_identity(certificate.get(), uuid);
   }
 
   /**
@@ -422,6 +420,29 @@ namespace nvhttp {
       }
       handler(std::move(response), std::move(request), *identity);
     };
+  }
+
+  /**
+   * @brief Require a current effective action right at the RTSP serialization point.
+   * @param required Effective right required by this route.
+   * @param handler Protected handler executed only while authorized.
+   * @return Authenticated route with host-side action enforcement.
+   */
+  template<class Handler>
+  auto permitted(permissions::mask_t required, Handler handler) {
+    return authenticated([required, handler = std::move(handler)](auto response, auto request, const auto &identity) {
+      if (!rtsp_stream::authorize_operation(identity.uuid, identity.cert, required, [&]() {
+            handler(response, request, identity);
+          })) {
+        pt::ptree tree;
+        tree.put("root.<xmlattr>.status_code", 403);
+        tree.put("root.<xmlattr>.status_message", "Permission denied");
+        std::ostringstream data;
+        pt::write_xml(data, tree);
+        response->write(data.str());
+        response->close_connection_after_response = true;
+      }
+    });
   }
 
   /**
@@ -505,6 +526,11 @@ namespace nvhttp {
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
         named_cert.enabled = el.get<bool>("enabled", true);
+        const auto grant = permissions::parse(el.get<std::string>("permissions", "0"));
+        named_cert.permissions = grant.value_or(0);
+        if (!grant) {
+          BOOST_LOG(warning) << "Invalid paired-client permission mask requires an explicit administrator grant"sv;
+        }
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -517,6 +543,9 @@ namespace nvhttp {
     }
 
     std::lock_guard lock {client_auth_mutex()};
+    for (auto &device : client.named_devices) {
+      device.revision = ++authorization_revision;
+    }
     client_root = std::move(client);
     rebuild_client_cert_chain();
   }
@@ -542,16 +571,29 @@ namespace nvhttp {
     named_cert.uuid = uuid_util::uuid_t::generate().string();
     const auto uuid = named_cert.uuid;
 
-    std::lock_guard lock {client_auth_mutex()};
-    std::erase_if(client_root.named_devices, [&certificate](const named_cert_t &existing_client) {
-      auto existing_certificate = crypto::x509(existing_client.cert);
-      return existing_certificate && X509_cmp(existing_certificate.get(), certificate.get()) == 0;
-    });
-    client_root.named_devices.emplace_back(std::move(named_cert));
-    rebuild_client_cert_chain();
-
-    if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
-      save_state();
+    std::lock_guard mutation {client_mutation_mutex};
+    std::vector<named_cert_t> replaced;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      auto candidate = client_root;
+      std::erase_if(candidate.named_devices, [&](const named_cert_t &existing) {
+        auto stored = crypto::x509(existing.cert);
+        if (stored && X509_cmp(stored.get(), certificate.get()) == 0) {
+          replaced.push_back(existing);
+          return true;
+        }
+        return false;
+      });
+      named_cert.revision = ++authorization_revision;
+      candidate.named_devices.emplace_back(std::move(named_cert));
+      if (!config::sunshine.flags[config::flag::FRESH_STATE] && !save_state(candidate)) {
+        return {};
+      }
+      client_root = std::move(candidate);
+      rebuild_client_cert_chain();
+    }
+    for (const auto &old : replaced) {
+      rtsp_stream::reconcile_client(old.uuid, old.cert, true);
     }
     return uuid;
   }
@@ -611,6 +653,7 @@ namespace nvhttp {
     launch_session->client_uuid = identity.uuid;
     launch_session->client_cert = identity.cert;
     launch_session->client_name = identity.name;
+    launch_session->authorization_revision = identity.revision;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     std::array<unsigned char, 8> raw_payload;
@@ -1378,7 +1421,14 @@ namespace nvhttp {
       tree.put("root.ExternalIP", config::nvhttp.external_ip);
     }
 
-    auto current_appid = proc::proc.running();
+    permissions::mask_t grant = 0;
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (const auto identity = request_client_identity(request)) {
+        grant = identity->permissions;
+      }
+    }
+    tree.put("root.Permission", grant);
+    const auto current_appid = permissions::allows(grant, permissions::view) ? proc::proc.running() : 0;
     tree.put("root.PairStatus", pair_status);
     tree.put("root.currentgame", current_appid);
     tree.put("root.state", current_appid > 0 ? "SUNSHINE_SERVER_BUSY" : "SUNSHINE_SERVER_FREE");
@@ -1398,6 +1448,7 @@ namespace nvhttp {
       named_cert_node["name"] = named_cert.name;
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
+      named_cert_node["permissions"] = named_cert.permissions;
       named_cert_nodes.push_back(named_cert_node);
     }
 
@@ -1440,221 +1491,144 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Launch the requested application for a GameStream session.
-   *
-   * @param host_audio Host audio.
-   * @param response HTTP response object to populate.
-   * @param request HTTP request data from the client.
-   * @param identity Verified paired identity bound to the request.
+   * @brief Prepare an authorized launch or join before exposing an RTSP admission.
+   * @param resuming Whether the request resumes the currently selected application.
+   * @param host_audio Host audio preference retained across resume requests.
+   * @param response Protocol response.
+   * @param request Original authenticated HTTPS request.
+   * @param identity Request-bound original paired identity.
    */
-  void launch(bool &host_audio, resp_https_t response, req_https_t request, const verified_client_t &identity) {
+  void prepare_stream(bool resuming, bool &host_audio, resp_https_t response, req_https_t request, const verified_client_t &identity) {
     print_req<SunshineHTTPS>(request);
-
     pt::ptree tree;
-    bool revert_display_configuration {false};
-    auto g = util::fail_guard([&]() {
+    const auto result_field = resuming ? "root.resume" : "root.gamesession";
+    tree.put(result_field, 0);
+    auto respond = util::fail_guard([&]() {
       std::ostringstream data;
-
-      if (tree.empty()) {
-        BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
-      }
-
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
-
-      if (revert_display_configuration) {
-        display_device::revert_configuration();
-      }
     });
-
     auto args = request->parse_query_string();
-    if (
-      args.find("rikey"s) == std::end(args) ||
-      args.find("rikeyid"s) == std::end(args) ||
-      args.find("localAudioPlayMode"s) == std::end(args) ||
-      args.find("appid"s) == std::end(args)
-    ) {
-      tree.put("root.resume", 0);
+    int target = 0;
+    if (!args.contains("rikey") || !args.contains("rikeyid") || (!resuming && (!args.contains("appid") || !args.contains("localAudioPlayMode")))) {
       tree.put("root.<xmlattr>.status_code", 400);
-      tree.put("root.<xmlattr>.status_message", "Missing a required launch parameter");
-
+      tree.put("root.<xmlattr>.status_message", "Missing a required stream parameter");
       return;
     }
-
-    auto appid = util::from_view(get_arg(args, "appid"));
-
-    auto current_appid = proc::proc.running();
-    if (current_appid > 0) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 400);
-      tree.put("root.<xmlattr>.status_message", "An app is already running on this host");
-
-      return;
-    }
-
-    host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args, identity);
-
-    if (rtsp_stream::session_count() == 0) {
-      // The display should be restored in case something fails as there are no other sessions.
-      revert_display_configuration = true;
-
-      // We want to prepare display only if there are no active sessions at
-      // the moment. This should be done before probing encoders as it could
-      // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
-
-      // Probe encoders again before streaming to ensure our chosen
-      // encoder matches the active GPU (which could have changed
-      // due to hotplugging, driver crash, primary monitor change,
-      // or any number of other factors).
-      if (video::probe_encoders()) {
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
-        tree.put("root.gamesession", 0);
-
+    if (!resuming) {
+      const auto value = get_arg(args, "appid");
+      const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), target);
+      if (value.empty() || error != std::errc {} || end != value.data() + value.size() || target < 0 || !get_arg(args, "appuuid", "").empty()) {
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "Invalid application identifier; UUID targets are not implemented");
         return;
       }
     }
-
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
+    std::shared_ptr<rtsp_stream::launch_session_t> session;
+    try {
+      session = make_launch_session(host_audio, args, identity);
+    } catch (const std::exception &) {
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid stream parameters");
       return;
     }
-
-    if (appid > 0) {
-      auto err = proc::proc.execute((int) appid, launch_session);
-      if (err) {
-        tree.put("root.<xmlattr>.status_code", err);
-        tree.put("root.<xmlattr>.status_message", "Failed to start the specified application");
-        tree.put("root.gamesession", 0);
-
-        return;
+    bool configured = false;
+    bool started_application = false;
+    const auto status = rtsp_stream::prepare_launch(session, [&]() {
+      const auto client = current_client(identity.uuid, identity.cert);
+      if (!client || !permissions::allows(client->permissions, permissions::view)) {
+        return 403;
       }
+      const auto current = proc::proc.running();
+      const bool active = rtsp_stream::session_count() > 0;
+      if (resuming) {
+        if (current <= 0) {
+          return 503;
+        }
+        target = current;
+      }
+      const bool same_application = target == current && (current > 0 || active);
+      if (!same_application && !permissions::allows(client->permissions, permissions::launch)) {
+        return 403;
+      }
+      if (active && !same_application) {
+        return 503;
+      }
+      if (target > 0 && !same_application) {
+        const auto &apps = proc::proc.get_apps();
+        if (std::ranges::none_of(apps, [&](const auto &app) {
+              return app.id == std::to_string(target);
+            })) {
+          return 404;
+        }
+      }
+      session->appid = target;
+      session->joining = active;
+      if (!active && args.contains("localAudioPlayMode")) {
+        host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+      }
+      session->host_audio = host_audio;
+      const auto encryption = net::encryption_mode_for_address(request->remote_endpoint().address());
+      if (!session->rtsp_cipher && encryption == config::ENCRYPTION_MODE_MANDATORY) {
+        return 403;
+      }
+      if (current > 0 && !same_application) {
+        proc::proc.terminate();
+      }
+      if (!active) {
+        configured = true;
+        display_device::configure_display(config::video, *session);
+        if (video::probe_encoders()) {
+          return 503;
+        }
+      }
+      if (target > 0 && !same_application) {
+        const auto error = proc::proc.execute(target, session);
+        if (error) {
+          return error;
+        }
+        started_application = true;
+      }
+      return 200;
+    },
+                                                    [&]() {
+                                                      if (started_application) {
+                                                        proc::proc.terminate();
+                                                      }
+                                                      if (configured) {
+                                                        display_device::revert_configuration();
+                                                      }
+                                                    });
+    tree.put("root.<xmlattr>.status_code", status);
+    if (status != 200) {
+      tree.put("root.<xmlattr>.status_message", status == 403 ? "Permission denied or required encryption unavailable" : "Stream preparation failed or another session is pending");
+      return;
     }
-
-    tree.put("root.<xmlattr>.status_code", 200);
-    tree.put(
-      "root.sessionUrl0",
-      std::format(
-        "{}{}:{}",
-        launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
-        static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
-      )
-    );
-    tree.put("root.gamesession", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
-
-    // Stream was started successfully, we will revert the config when the app or session terminates
-    revert_display_configuration = false;
+    tree.put("root.sessionUrl0", std::format("{}{}:{}", session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
+    tree.put(result_field, 1);
   }
 
   /**
-   * @brief Resume an existing GameStream session.
-   *
-   * @param host_audio Host audio.
-   * @param response HTTP response object to populate.
-   * @param request HTTP request data from the client.
-   * @param identity Verified paired identity bound to the request.
+   * @brief Start an application or join the already selected target without replacing it.
+   * @param host_audio Host audio preference.
+   * @param response Protocol response.
+   * @param request Authenticated request.
+   * @param identity Original paired identity.
+   */
+  void launch(bool &host_audio, resp_https_t response, req_https_t request, const verified_client_t &identity) {
+    prepare_stream(false, host_audio, std::move(response), std::move(request), identity);
+  }
+
+  /**
+   * @brief Join the current application with effective viewing authority.
+   * @param host_audio Host audio preference.
+   * @param response Protocol response.
+   * @param request Authenticated request.
+   * @param identity Original paired identity.
    */
   void resume(bool &host_audio, resp_https_t response, req_https_t request, const verified_client_t &identity) {
-    print_req<SunshineHTTPS>(request);
-
-    pt::ptree tree;
-    auto g = util::fail_guard([&]() {
-      std::ostringstream data;
-
-      if (tree.empty()) {
-        BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
-      }
-
-      pt::write_xml(data, tree);
-      response->write(data.str());
-      response->close_connection_after_response = true;
-    });
-
-    auto current_appid = proc::proc.running();
-    if (current_appid == 0) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "No running app to resume");
-
-      return;
-    }
-
-    auto args = request->parse_query_string();
-    if (
-      args.find("rikey"s) == std::end(args) ||
-      args.find("rikeyid"s) == std::end(args)
-    ) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 400);
-      tree.put("root.<xmlattr>.status_message", "Missing a required resume parameter");
-
-      return;
-    }
-
-    // Newer Moonlight clients send localAudioPlayMode on /resume too,
-    // so we should use it if it's present in the args and there are
-    // no active sessions we could be interfering with.
-    const bool no_active_sessions {rtsp_stream::session_count() == 0};
-    if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
-      host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    }
-    const auto launch_session = make_launch_session(host_audio, args, identity);
-
-    if (no_active_sessions) {
-      // We want to prepare display only if there are no active sessions at
-      // the moment. This should be done before probing encoders as it could
-      // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
-
-      // Probe encoders again before streaming to ensure our chosen
-      // encoder matches the active GPU (which could have changed
-      // due to hotplugging, driver crash, primary monitor change,
-      // or any number of other factors).
-      if (video::probe_encoders()) {
-        tree.put("root.resume", 0);
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
-
-        return;
-      }
-    }
-
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
-      return;
-    }
-
-    tree.put("root.<xmlattr>.status_code", 200);
-    tree.put(
-      "root.sessionUrl0",
-      std::format(
-        "{}{}:{}",
-        launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
-        static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
-      )
-    );
-    tree.put("root.resume", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
+    prepare_stream(true, host_audio, std::move(response), std::move(request), identity);
   }
 
   /**
@@ -1675,17 +1649,17 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    tree.put("root.cancel", 0);
+    tree.put("root.<xmlattr>.status_code", 500);
+
+    rtsp_stream::stop_application([]() {
+      if (proc::proc.running() > 0) {
+        proc::proc.terminate();
+      }
+      display_device::revert_configuration();
+    });
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
-
-    rtsp_stream::terminate_sessions();
-
-    if (proc::proc.running() > 0) {
-      proc::proc.terminate();
-    }
-
-    // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
-    display_device::revert_configuration();
   }
 
   /**
@@ -1710,6 +1684,38 @@ namespace nvhttp {
   void setup(const std::string &pkey, const std::string &cert) {
     conf_intern.pkey = pkey;
     conf_intern.servercert = cert;
+  }
+
+  /**
+   * @brief Install protected routes once for the production listener and native loopback regressions.
+   * @param https_server Configured HTTPS listener.
+   * @param host_audio Retained launch/resume host audio preference.
+   */
+  void configure_gamestream_routes(https_server_t &https_server, bool &host_audio) {
+    https_server.default_resource["GET"] = authenticated([](auto response, auto request, const auto &) {
+      not_found<SunshineHTTPS>(response, request);
+    });
+    https_server.resource["^/serverinfo$"]["GET"] = permitted(0, [](auto response, auto request, const auto &) {
+      serverinfo<SunshineHTTPS>(response, request);
+    });
+    https_server.resource["^/pair$"]["GET"] = authenticated([](auto response, auto request, const auto &) {
+      pair<SunshineHTTPS>(response, request);
+    });
+    https_server.resource["^/applist$"]["GET"] = permitted(permissions::list, [](auto response, auto request, const auto &) {
+      applist(response, request);
+    });
+    https_server.resource["^/appasset$"]["GET"] = permitted(permissions::list, [](auto response, auto request, const auto &) {
+      appasset(response, request);
+    });
+    https_server.resource["^/launch$"]["GET"] = authenticated([&host_audio](auto response, auto request, const auto &identity) {
+      launch(host_audio, response, request, identity);
+    });
+    https_server.resource["^/resume$"]["GET"] = authenticated([&host_audio](auto response, auto request, const auto &identity) {
+      resume(host_audio, response, request, identity);
+    });
+    https_server.resource["^/cancel$"]["GET"] = permitted(permissions::launch, [](auto response, auto request, const auto &) {
+      cancel(response, request);
+    });
   }
 
   void start() {
@@ -1741,30 +1747,7 @@ namespace nvhttp {
     https_server.verify = verify_connection;
     https_server.on_verify_failed = unauthorized;
 
-    https_server.default_resource["GET"] = authenticated([](auto response, auto request, const auto &) {
-      not_found<SunshineHTTPS>(response, request);
-    });
-    https_server.resource["^/serverinfo$"]["GET"] = authenticated([](auto response, auto request, const auto &) {
-      serverinfo<SunshineHTTPS>(response, request);
-    });
-    https_server.resource["^/pair$"]["GET"] = authenticated([](auto response, auto request, const auto &) {
-      pair<SunshineHTTPS>(response, request);
-    });
-    https_server.resource["^/applist$"]["GET"] = authenticated([](auto response, auto request, const auto &) {
-      applist(response, request);
-    });
-    https_server.resource["^/appasset$"]["GET"] = authenticated([](auto response, auto request, const auto &) {
-      appasset(response, request);
-    });
-    https_server.resource["^/launch$"]["GET"] = authenticated([&host_audio](auto response, auto request, const auto &identity) {
-      launch(host_audio, response, request, identity);
-    });
-    https_server.resource["^/resume$"]["GET"] = authenticated([&host_audio](auto response, auto request, const auto &identity) {
-      resume(host_audio, response, request, identity);
-    });
-    https_server.resource["^/cancel$"]["GET"] = authenticated([](auto response, auto request, const auto &) {
-      cancel(response, request);
-    });
+    configure_gamestream_routes(https_server, host_audio);
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -1809,41 +1792,83 @@ namespace nvhttp {
     tcp.join();
   }
 
-  void erase_all_clients() {
-    std::lock_guard lock {client_auth_mutex()};
-    client_root = {};
-    cert_chain.clear();
-    save_state();
+  bool erase_all_clients() {
+    std::lock_guard mutation {client_mutation_mutex};
+    std::vector<named_cert_t> removed;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      if (!save_state(client_t {})) {
+        return false;
+      }
+      removed = std::move(client_root.named_devices);
+      client_root = {};
+      cert_chain.clear();
+    }
+    for (const auto &device : removed) {
+      rtsp_stream::reconcile_client(device.uuid, device.cert, true);
+    }
+    return true;
   }
 
   bool unpair_client(const std::string_view uuid) {
-    std::lock_guard lock {client_auth_mutex()};
-    bool removed = false;
-    for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
-      if ((*it).uuid == uuid) {
-        it = client_root.named_devices.erase(it);
-        removed = true;
-      } else {
-        ++it;
+    std::lock_guard mutation {client_mutation_mutex};
+    std::string cert;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      auto candidate = client_root;
+      const auto it = std::ranges::find(candidate.named_devices, uuid, &named_cert_t::uuid);
+      if (it == candidate.named_devices.end()) {
+        return false;
       }
+      cert = it->cert;
+      std::erase_if(candidate.named_devices, [&](const auto &device) {
+        return device.uuid == uuid;
+      });
+      if (!save_state(candidate)) {
+        return false;
+      }
+      client_root = std::move(candidate);
+      rebuild_client_cert_chain();
     }
+    rtsp_stream::reconcile_client(uuid, cert, true);
+    return true;
+  }
 
-    rebuild_client_cert_chain();
-    save_state();
-    return removed;
+  bool update_client(const std::string_view uuid, const std::optional<bool> enabled, const std::optional<permissions::mask_t> grant) {
+    if ((grant && !permissions::valid(*grant)) || (!grant && !enabled)) {
+      return false;
+    }
+    std::lock_guard mutation {client_mutation_mutex};
+    std::string cert;
+    bool destroy = false;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      auto candidate = client_root;
+      const auto it = std::ranges::find(candidate.named_devices, uuid, &named_cert_t::uuid);
+      if (it == candidate.named_devices.end()) {
+        return false;
+      }
+      if (enabled) {
+        it->enabled = *enabled;
+      }
+      if (grant) {
+        it->permissions = *grant;
+      }
+      it->revision = ++authorization_revision;
+      cert = it->cert;
+      destroy = !it->enabled;
+      if (!save_state(candidate)) {
+        return false;
+      }
+      client_root = std::move(candidate);
+      rebuild_client_cert_chain();
+    }
+    rtsp_stream::reconcile_client(uuid, cert, destroy);
+    return true;
   }
 
   bool set_client_enabled(const std::string_view uuid, bool enabled) {
-    std::lock_guard lock {client_auth_mutex()};
-    for (auto &named_cert : client_root.named_devices) {
-      if (named_cert.uuid == uuid) {
-        named_cert.enabled = enabled;
-        rebuild_client_cert_chain();
-        save_state();
-        return true;
-      }
-    }
-    return false;
+    return update_client(uuid, enabled, std::nullopt);
   }
 
   /**
@@ -1861,6 +1886,10 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    void set_gamestream_routes(SimpleWeb::Server<SunshineHTTPS> &server, bool &host_audio) {
+      configure_gamestream_routes(server, host_audio);
+    }
+
     std::unique_ptr<SimpleWeb::Server<SunshineHTTPS>> make_https_server(
       const std::string &certificate_file,
       const std::string &private_key_file,

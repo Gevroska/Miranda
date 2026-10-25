@@ -10,11 +10,13 @@ extern "C" {
 
 // standard includes
 #include <algorithm>
+#include <bit>
 #include <bitset>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -22,7 +24,9 @@ extern "C" {
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 
 // lib includes
 #include <boost/endian/buffers.hpp>
@@ -34,6 +38,9 @@ extern "C" {
 #include "logging.h"
 #include "platform/common.h"
 #include "platform/virtualhid_input.h"
+#ifdef _WIN32
+  #include "platform/windows/input.h"
+#endif
 #include "thread_pool.h"
 #include "utility.h"
 
@@ -123,26 +130,6 @@ namespace input {
   }
 
   /**
-   * @brief Extract the virtual-key code from a packed key-press identifier.
-   *
-   * @param kpid Key-press identifier containing the virtual-key code and flags.
-   * @return Virtual-key code stored in the high byte.
-   */
-  uint16_t vk_from_kpid(key_press_id_t kpid) {
-    return kpid >> 8;
-  }
-
-  /**
-   * @brief Extract the modifier flags from a packed key-press identifier.
-   *
-   * @param kpid Key-press identifier containing the virtual-key code and flags.
-   * @return Modifier flags stored in the low byte.
-   */
-  uint8_t flags_from_kpid(key_press_id_t kpid) {
-    return kpid & 0xFF;
-  }
-
-  /**
    * @brief Convert a little-endian netfloat to a native endianness float.
    * @param f Little-endian network float bytes.
    * @return Floating-point value decoded for the host CPU.
@@ -170,10 +157,28 @@ namespace input {
   struct key_press_state_t {
     bool pressed = false;  ///< Whether the key is held.
     bool extended = false;  ///< Whether its press identified an extended key.
+    std::uint16_t host_code = 0;  ///< Actual mapped key emitted for its first owner.
+    std::uint8_t flags = 0;  ///< Original emitted flags.
+    std::size_t owners = 0;  ///< Connections or temporary modifiers holding this host key.
   };
 
   static std::unordered_map<key_press_id_t, key_press_state_t> key_press {};
-  static std::array<std::uint8_t, 5> mouse_press {};
+  static std::array<std::size_t, 6> mouse_press {};
+  static std::weak_ptr<input_t> repeat_owner;  ///< Connection owning the latest held repeat key.
+  static key_press_id_t repeat_client_key {};  ///< Original client key of the repeat owner.
+  static std::uint64_t press_sequence = 0;  ///< Worker-owned ordering of held key presses.
+  static thread_local bool on_input_worker = false;  ///< Prevent lifecycle barriers waiting on their own worker.
+
+  /**
+   * @brief Mark entry to input-owned work, including delayed tasks.
+   */
+  struct input_worker_scope_t {
+    bool previous = std::exchange(on_input_worker, true);  ///< Previous nested worker marker.
+
+    ~input_worker_scope_t() {
+      on_input_worker = previous;
+    }
+  };
 
   static platf::input_t platf_input;
 #ifdef SUNSHINE_TESTS
@@ -207,6 +212,49 @@ namespace input {
     return sink;
   }
 #endif
+#ifdef SUNSHINE_TESTS
+  std::function<void(std::function<void()>)> delayed_task_sink;  ///< Captures the actual delayed operation for deterministic tests.
+  std::function<void(int, bool)> mouse_button_sink;  ///< Aggregate platform transition recorder.
+  std::function<void(std::string_view)> feedback_dispatch_hook;  ///< Deterministic control-consumer boundaries.
+#endif
+
+  /**
+   * @brief Schedule actual delayed input work, retaining its original authorization captures.
+   * @param function Callback to execute.
+   * @param delay Production delay.
+   * @param args Callback arguments.
+   * @return Scheduler cancellation identifier.
+   */
+  template<class Function, class Duration, class... Args>
+  auto schedule_input_delay(Function function, Duration delay, Args... args) {
+    auto work = [function = std::move(function), arguments = std::make_tuple(std::move(args)...)]() mutable {
+      input_worker_scope_t scope;
+      std::apply(function, arguments);
+    };
+#ifdef SUNSHINE_TESTS
+    if (delayed_task_sink) {
+      delayed_task_sink(std::move(work));
+      return reinterpret_cast<task_pool_util::TaskPool::task_id_t>(2);
+    }
+#endif
+    return task_pool.pushDelayed(std::move(work), delay).task_id;
+  }
+
+  /**
+   * @brief Emit one aggregate mouse transition to the platform or a test recorder.
+   * @param button Protocol button number.
+   * @param release Whether this is the final owner's release.
+   */
+  void emit_mouse_button(int button, bool release) {
+#ifdef SUNSHINE_TESTS
+    if (mouse_button_sink) {
+      mouse_button_sink(button, release);
+      return;
+    }
+#endif
+    platf::button_mouse(platf_input, button, release);
+  }
+
   static std::bitset<platf::MAX_GAMEPADS> gamepadMask {};
 
   /**
@@ -230,6 +278,16 @@ namespace input {
      * @brief Initialize an unassigned gamepad slot with no pending button timeout.
      */
     gamepad_t() = default;
+    gamepad_t(const gamepad_t &) = delete;
+    gamepad_t &operator=(const gamepad_t &) = delete;
+
+    gamepad_t(gamepad_t &&other) noexcept:
+        gamepad_state(other.gamepad_state),
+        back_timeout_id(std::exchange(other.back_timeout_id, nullptr)),
+        id(std::exchange(other.id, -1)),
+        back_button_state(other.back_button_state) {}
+
+    gamepad_t &operator=(gamepad_t &&) = delete;
 
     ~gamepad_t() {
       if (id >= 0) {
@@ -255,6 +313,31 @@ namespace input {
     // Sunshine forces the button to be in a specific state until the gamepad state matches that of
     // Moonlight once more.
     button_state_e back_button_state {button_state_e::NONE};  ///< Back button state.
+  };
+
+  /**
+   * @brief Exclusively attached or idle virtual controller devices; never a connection's queue or keys.
+   */
+  struct controller_set_t {
+    std::vector<gamepad_t> gamepads {MAX_GAMEPADS};  ///< Owned controller slots, moved as a set.
+  };
+
+  /**
+   * @brief One connection's actual contribution to a held host key.
+   */
+  struct held_key_t {
+    key_press_id_t host_id;  ///< Identity after mapping, flags and extended-key selection.
+    std::byte synthetic_modifiers;  ///< Temporary modifiers used for a repeated key.
+    std::uint64_t order;  ///< Latest-key repeat ordering.
+  };
+
+  /**
+   * @brief Validated packet stamped with the admission epoch of its input category.
+   */
+  struct queued_packet_t {
+    std::vector<std::uint8_t> bytes;  ///< Complete validated protocol packet.
+    permissions::mask_t category;  ///< Required named input category, or zero for an ignored unknown packet.
+    std::uint64_t epoch;  ///< Category generation when accepted at ingress.
   };
 
   /**
@@ -310,13 +393,20 @@ namespace input {
     modifier_state_t control_keys;  ///< Client Control keys contributing to the aggregate Control flag.
     modifier_state_t alt_keys;  ///< Client Alt keys contributing to the aggregate Alt flag.
 
-    std::vector<gamepad_t> gamepads {MAX_GAMEPADS};  ///< Virtual gamepad slots tracked for the stream.
+    std::shared_ptr<controller_set_t> controllers = std::make_shared<controller_set_t>();  ///< Exclusively attached virtual controllers.
+    std::string session_id;  ///< Original paired identity used only for idle controller retention.
+    bool retain_controllers = true;  ///< Disable/unpair/global Stop prevent later retention.
+    std::unordered_map<key_press_id_t, held_key_t> held_keys;  ///< Client keys and their actual host contributions.
+    std::bitset<6> held_mouse;  ///< This connection's contributions to all five mouse buttons.
+    permissions::mask_t allowed = 0;  ///< Current input gates, guarded by input_queue_lock.
+    std::array<std::uint64_t, 5> epochs {};  ///< Per-category generations, guarded by input_queue_lock.
+    bool closed = false;  ///< Disconnect closes this connection forever; guarded by input_queue_lock.
     std::unique_ptr<platf::client_input_t> client_context {platf::allocate_client_input_context(platf_input)};  ///< Client context.
 
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
 
-    std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
+    std::list<queued_packet_t> input_queue;  ///< Validated input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
     bool input_task_scheduled {};  ///< Whether one worker task owns packet dispatch for this stream; guarded by input_queue_lock.
 
@@ -347,7 +437,7 @@ namespace input {
 
   using retained_input_map_t = std::unordered_map<
     std::string,
-    std::shared_ptr<input_t>,
+    std::vector<std::shared_ptr<controller_set_t>>,
     transparent_string_hash_t,
     std::equal_to<>>;  ///< Retained inputs keyed by paired-client identity.
 
@@ -356,7 +446,8 @@ namespace input {
    */
   struct retained_input_state_t {
     std::mutex mutex;  ///< Synchronizes retained session access across transport threads.
-    retained_input_map_t inputs;  ///< Paused input sessions keyed by paired-client identity.
+    retained_input_map_t inputs;  ///< Idle controller sets keyed by paired-client identity.
+    std::vector<std::weak_ptr<input_t>> live;  ///< Connections with separate queues, keys and input contexts.
   };
 
   /**
@@ -376,21 +467,79 @@ namespace input {
    * @param function Lifecycle operation to execute.
    */
   template<typename Function>
-  void dispatch_input_task(Function &&function) {
-    if (task_pool.running()) {
-      task_pool.push(std::forward<Function>(function));
+  void dispatch_input_task(Function function) {
+    if (on_input_worker || !task_pool.running()) {
+      input_worker_scope_t scope;
+      function();
     } else {
-      std::forward<Function>(function)();
+      task_pool.push([function = std::move(function)]() mutable {
+        input_worker_scope_t scope;
+        function();
+      });
     }
   }
 
   /**
-   * @brief Destroy the virtual gamepads owned by retained input sessions.
-   *
-   * @param input Retained input session whose gamepads should be destroyed.
+   * @brief Await lifecycle cleanup on the existing single input worker.
+   * @param function Cleanup operation.
    */
-  void destroy_gamepads(const std::shared_ptr<input_t> &input) {
-    for (auto &gamepad : input->gamepads) {
+  template<typename Function>
+  void sync_input_task(Function function) {
+    if (on_input_worker || !task_pool.running()) {
+      input_worker_scope_t scope;
+      function();
+    } else {
+      task_pool.push([function = std::move(function)]() mutable {
+                 input_worker_scope_t scope;
+                 function();
+               })
+        .get();
+    }
+  }
+
+  /**
+   * @brief Convert a named category to its independent generation slot.
+   * @param category One implemented input bit.
+   * @return Generation index.
+   */
+  std::size_t category_index(permissions::mask_t category) {
+    return static_cast<std::size_t>(std::countr_zero(category) - 8);
+  }
+
+  /**
+   * @brief Read a category epoch only while its gate is open.
+   * @param input Connection state.
+   * @param category Named input category.
+   * @return Epoch, or no value when closed or denied.
+   */
+  std::optional<std::uint64_t> category_epoch(const std::shared_ptr<input_t> &input, permissions::mask_t category) {
+    if (!input) {
+      return std::nullopt;
+    }
+    std::lock_guard lock {input->input_queue_lock};
+    if (input->closed || !(input->allowed & category)) {
+      return std::nullopt;
+    }
+    return input->epochs[category_index(category)];
+  }
+
+  /**
+   * @brief Reject delayed work whose category was revoked, even if subsequently regranted.
+   * @param input Original connection.
+   * @param category Input category.
+   * @param epoch Original generation.
+   * @return Whether the exact generation remains authorized.
+   */
+  bool current_epoch(const std::shared_ptr<input_t> &input, permissions::mask_t category, std::uint64_t epoch) {
+    return category_epoch(input, category) == epoch;
+  }
+
+  /**
+   * @brief Release every device in an exclusively owned controller set.
+   * @param controllers Controller device set.
+   */
+  void destroy_gamepads(const std::shared_ptr<controller_set_t> &controllers) {
+    for (auto &gamepad : controllers->gamepads) {
       if (gamepad.back_timeout_id) {
         task_pool.cancel(gamepad.back_timeout_id);
         gamepad.back_timeout_id = nullptr;
@@ -405,36 +554,54 @@ namespace input {
   }
 
   /**
-   * @brief Destroy the virtual gamepads owned by retained input sessions.
-   *
-   * @param inputs Retained input sessions whose gamepads should be destroyed.
+   * @brief Destroy idle controller sets after removing them from retained storage.
+   * @param inputs Idle sets grouped by original paired identity.
    */
   void destroy_gamepads(const retained_input_map_t &inputs) {
-    for (const auto &[session_id, input] : inputs) {
-      static_cast<void>(session_id);
-      destroy_gamepads(input);
+    for (const auto &[identity, sets] : inputs) {
+      for (const auto &controllers : sets) {
+        destroy_gamepads(controllers);
+      }
     }
   }
 
   /**
-   * @brief Rebind retained input state to a resumed stream mailbox.
-   *
-   * @param input Retained input state.
-   * @param mail Mailbox for the resumed stream connection.
+   * @brief Attach an idle controller set only to a fresh connection with no devices.
+   * @param input New connection input state.
    */
-  void rebind_input(const std::shared_ptr<input_t> &input, const safe::mail_t &mail) {
-    input->touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
-    input->feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
-
-    for (int client_index = 0; client_index < input->gamepads.size(); ++client_index) {
-      auto &gamepad = input->gamepads[client_index];
-      if (gamepad.id < 0) {
-        continue;
+  void claim_idle_controllers(const std::shared_ptr<input_t> &input) {
+    if (std::ranges::any_of(input->controllers->gamepads, [](const auto &pad) {
+          return pad.id >= 0;
+        })) {
+      return;
+    }
+    auto &state = retained_input_state();
+    std::lock_guard lock {state.mutex};
+    const auto it = state.inputs.find(input->session_id);
+    if (it != state.inputs.end() && !it->second.empty()) {
+      input->controllers = std::move(it->second.back());
+      it->second.pop_back();
+      if (it->second.empty()) {
+        state.inputs.erase(it);
       }
+    }
+  }
 
-      if (platf::rebind_gamepad(platf_input, {gamepad.id, static_cast<std::uint8_t>(client_index)}, input->feedback_queue) != 0) {
-        free_id(gamepadMask, gamepad.id);
-        gamepad.id = -1;
+  /**
+   * @brief Move feedback away from a revoked/paused connection or bind its current mailbox.
+   * @param input Current exclusive controller owner.
+   * @param attached Whether this connection has controller authority.
+   */
+  void rebind_controllers(const std::shared_ptr<input_t> &input, bool attached) {
+    const auto feedback = attached ? input->feedback_queue : std::make_shared<safe::mail_raw_t>()->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
+    if (!attached) {
+      while (input->feedback_queue->pop(0ms)) {}
+    }
+    for (int index = 0; index < input->controllers->gamepads.size(); ++index) {
+      auto &pad = input->controllers->gamepads[index];
+      if (pad.id >= 0 && platf::rebind_gamepad(platf_input, {pad.id, static_cast<std::uint8_t>(index)}, feedback) != 0) {
+        free_id(gamepadMask, pad.id);
+        pad.id = -1;
       }
     }
   }
@@ -445,13 +612,13 @@ namespace input {
    * @return 0 if no shortcut applied, > 0 if shortcut applied.
    */
   inline int apply_shortcut(short keyCode) {
-    constexpr auto VK_F1 = 0x70;
-    constexpr auto VK_F13 = 0x7C;
+    constexpr auto shortcut_f1 = 0x70;
+    constexpr auto shortcut_f13 = 0x7C;
 
     BOOST_LOG(debug) << "Apply Shortcut: 0x"sv << util::hex((std::uint8_t) keyCode).to_string_view();
 
-    if (keyCode >= VK_F1 && keyCode <= VK_F13) {
-      mail::man->event<int>(mail::switch_display)->raise(keyCode - VK_F1);
+    if (keyCode >= shortcut_f1 && keyCode <= shortcut_f13) {
+      mail::man->event<int>(mail::switch_display)->raise(keyCode - shortcut_f1);
       return 1;
     }
 
@@ -769,7 +936,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_REL_MOUSE_MOVE_PACKET packet) {
-    if (!config::input.mouse) {
+    if (!config::input.mouse || !category_epoch(input, permissions::mouse)) {
       return;
     }
 
@@ -879,7 +1046,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_ABS_MOUSE_MOVE_PACKET packet) {
-    if (!config::input.mouse) {
+    if (!config::input.mouse || !category_epoch(input, permissions::mouse)) {
       return;
     }
 
@@ -912,69 +1079,59 @@ namespace input {
   }
 
   /**
-   * @brief Called to pass a mouse button message to the platform backend.
-   *
-   * @param input The input context pointer.
-   * @param packet The mouse button packet.
+   * @brief Emit a mouse transition only for the first/last owning connection.
+   * @param input Connection contribution owner.
+   * @param button Protocol mouse button, including X2.
+   * @param release Whether to relinquish this connection's contribution.
+   */
+  void owned_mouse_button(const std::shared_ptr<input_t> &input, int button, bool release) {
+    if (button <= 0 || button >= mouse_press.size() || input->held_mouse[button] == !release) {
+      return;
+    }
+    input->held_mouse[button] = !release;
+    if (release) {
+      if (mouse_press[button] && --mouse_press[button] == 0) {
+        emit_mouse_button(button, true);
+      }
+    } else if (mouse_press[button]++ == 0) {
+      emit_mouse_button(button, false);
+    }
+  }
+
+  /**
+   * @brief Apply a mouse button packet without lifting another connection's held button.
+   * @param input Connection state.
+   * @param packet Validated mouse packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_MOUSE_BUTTON_PACKET packet) {
-    if (!config::input.mouse) {
+    const auto epoch = category_epoch(input, permissions::mouse);
+    if (!config::input.mouse || !epoch) {
       return;
     }
-
-    auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
-    auto button = util::endian::big(packet->button);
-    if (button > 0 && button < mouse_press.size()) {
-      if (mouse_press[button] != release) {
-        // button state is already what we want
-        return;
-      }
-
-      mouse_press[button] = !release;
+    const bool release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
+    const auto button = util::endian::big(packet->button);
+    if (button <= 0 || button >= mouse_press.size()) {
+      return;
     }
-    /**
-     * When Moonlight sends mouse input through absolute coordinates,
-     * it's possible that BUTTON_RIGHT is pressed down immediately after releasing BUTTON_LEFT.
-     * As a result, Sunshine will left-click on hyperlinks in the browser before right-clicking
-     *
-     * This can be solved by delaying BUTTON_LEFT, however, any delay on input is undesirable during gaming
-     * As a compromise, Sunshine will only put delays on BUTTON_LEFT when
-     * absolute mouse coordinates have been sent.
-     *
-     * Try to make sure BUTTON_RIGHT gets called before BUTTON_LEFT is released.
-     *
-     * input->mouse_left_button_timeout can only be nullptr
-     * when the last mouse coordinates were absolute
-     */
-    if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
-      auto f = [input, release]() {
-        if (auto left_released = mouse_press[BUTTON_LEFT]; left_released) {
-          // Already released left button
+    // Delay only this owner's absolute-pointer left release for the right-click workaround.
+    if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout && input->held_mouse[button]) {
+      input->mouse_left_button_timeout = schedule_input_delay([input, epoch = *epoch]() {
+        input_worker_scope_t scope;
+        if (!current_epoch(input, permissions::mouse, epoch)) {
           return;
         }
-        platf::button_mouse(platf_input, BUTTON_LEFT, release);
-
-        mouse_press[BUTTON_LEFT] = false;
+        owned_mouse_button(input, BUTTON_LEFT, true);
         input->mouse_left_button_timeout = nullptr;
-      };
-
-      input->mouse_left_button_timeout = task_pool.pushDelayed(std::move(f), 10ms).task_id;
-
+      },
+                                                              10ms);
       return;
     }
-    if (
-      button == BUTTON_RIGHT && !release &&
-      input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY
-    ) {
-      platf::button_mouse(platf_input, BUTTON_RIGHT, false);
-      platf::button_mouse(platf_input, BUTTON_RIGHT, true);
-
-      mouse_press[BUTTON_RIGHT] = false;
-
+    if (button == BUTTON_RIGHT && !release && input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY) {
+      owned_mouse_button(input, BUTTON_RIGHT, false);
+      owned_mouse_button(input, BUTTON_RIGHT, true);
       return;
     }
-
-    platf::button_mouse(platf_input, button, release);
+    owned_mouse_button(input, button, release);
   }
 
   /**
@@ -1126,62 +1283,155 @@ namespace input {
   }
 
   /**
-   * @brief Send key and modifiers.
-   *
-   * @param key_code Moonlight keyboard packet key code.
-   * @param release Whether the key or button event is a release.
-   * @param flags Bit flags that modify the requested operation.
-   * @param synthetic_modifiers Byte mask of modifiers to press around the key event.
-   * @param extended Whether the client identified an extended key.
+   * @brief Normalize contribution identity to the pinned platform keyboard's effective flags and extension.
+   * @param code Mapped host virtual-key code.
+   * @param flags Emitted protocol flags.
+   * @param extended Extended-key identity selected on press.
+   * @return Aggregate host key identity.
    */
-  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, std::byte synthetic_modifiers, bool extended) {
-    if (!release) {
-      // Press any synthetic modifiers required for this key
-      if ((synthetic_modifiers & std::byte {MODIFIER_SHIFT}) != std::byte {0}) {
-        emit_keyboard_update(VKEY_SHIFT, false, flags);
+  key_press_id_t host_key_id(std::uint16_t code, std::uint8_t flags, bool extended) {
+    if (code == VKEY_SHIFT) {
+      code = VKEY_LSHIFT;
+    }
+    if (code == VKEY_CONTROL) {
+      code = VKEY_LCONTROL;
+    }
+    if (code == VKEY_MENU) {
+      code = VKEY_LMENU;
+    }
+#ifdef _WIN32
+    return platf::keyboard_key_identity(platf_input, code, flags, extended);
+#else
+    // The Linux/macOS key maps use the virtual-key code and ignore these packet fields.
+    flags = 0;
+    extended = false;
+#endif
+    return make_kpid(code, flags) | (extended ? 0x01000000U : 0);
+  }
+
+  /**
+   * @brief Relinquish one actual emitted host-key contribution.
+   * @param id Previously recorded host identity, unaffected by later remapping.
+   */
+  void release_host_key(key_press_id_t id) {
+    const auto it = key_press.find(id);
+    if (it != key_press.end() && it->second.owners && --it->second.owners == 0) {
+      const auto state = it->second;
+      key_press.erase(it);
+      emit_keyboard_update(state.host_code, true, state.flags, state.extended);
+    }
+  }
+
+  /**
+   * @brief Temporarily contribute requested synthetic modifiers around one actual key event.
+   * @param flags Protocol flags applied to synthetic events.
+   * @param modifiers Requested synthetic modifier mask.
+   * @param emit Actual key event to emit.
+   */
+  template<class Function>
+  void with_synthetic_modifiers(std::uint8_t flags, std::byte modifiers, Function emit) {
+    std::vector<key_press_id_t> temporary;
+    const std::array<std::pair<unsigned, std::uint16_t>, 3> candidates {{{MODIFIER_SHIFT, VKEY_SHIFT}, {MODIFIER_CTRL, VKEY_CONTROL}, {MODIFIER_ALT, VKEY_MENU}}};
+    for (const auto &[bit, code] : candidates) {
+      if ((std::to_integer<unsigned>(modifiers) & bit) == 0) {
+        continue;
       }
-      if ((synthetic_modifiers & std::byte {MODIFIER_CTRL}) != std::byte {0}) {
-        emit_keyboard_update(VKEY_CONTROL, false, flags);
-      }
-      if ((synthetic_modifiers & std::byte {MODIFIER_ALT}) != std::byte {0}) {
-        emit_keyboard_update(VKEY_MENU, false, flags);
+      const bool held = std::ranges::any_of(key_press, [&](const auto &entry) {
+        const auto key = entry.second.host_code;
+        return entry.second.owners && ((code == VKEY_SHIFT && (key == VKEY_SHIFT || key == VKEY_LSHIFT || key == VKEY_RSHIFT)) ||
+                                       (code == VKEY_CONTROL && (key == VKEY_CONTROL || key == VKEY_LCONTROL || key == VKEY_RCONTROL)) ||
+                                       (code == VKEY_MENU && (key == VKEY_MENU || key == VKEY_LMENU || key == VKEY_RMENU)));
+      });
+      if (!held) {
+        const auto id = host_key_id(code, flags, false);
+        key_press[id] = {true, false, code, flags, 1};
+        temporary.push_back(id);
+        emit_keyboard_update(code, false, flags);
       }
     }
+    emit();
+    for (const auto id : temporary) {
+      release_host_key(id);
+    }
+  }
 
-    emit_keyboard_update(map_keycode(key_code), release, flags, extended);
+  /**
+   * @brief Repeat only the original connection/key/category generation.
+   * @param owner Connection that scheduled this repeat.
+   * @param client_key Original unmapped client key.
+   * @param epoch Original keyboard grant generation.
+   */
+  void repeat_owned_key(std::weak_ptr<input_t> owner, key_press_id_t client_key, std::uint64_t epoch) {
+    input_worker_scope_t scope;
+    auto input = owner.lock();
+    if (!input || repeat_owner.lock() != input || repeat_client_key != client_key || !current_epoch(input, permissions::keyboard, epoch)) {
+      return;
+    }
+    const auto held = input->held_keys.find(client_key);
+    if (held == input->held_keys.end()) {
+      return;
+    }
+    const auto state_it = key_press.find(held->second.host_id);
+    if (state_it == key_press.end()) {
+      return;
+    }
+    const auto state = state_it->second;
+    with_synthetic_modifiers(state.flags, held->second.synthetic_modifiers, [&]() {
+      emit_keyboard_update(state.host_code, false, state.flags, state.extended);
+    });
+    key_press_repeat_id = schedule_input_delay(repeat_owned_key, config::input.key_repeat_period, owner, client_key, epoch);
+  }
 
-    if (!release) {
-      // Raise any synthetic modifier keys we pressed
-      if ((synthetic_modifiers & std::byte {MODIFIER_SHIFT}) != std::byte {0}) {
-        emit_keyboard_update(VKEY_SHIFT, true, flags);
+  /**
+   * @brief Continue the global latest-key policy using only currently held connection contributions.
+   * @param delay Delay before the next repeat.
+   */
+  void select_repeat(std::chrono::milliseconds delay) {
+    task_pool.cancel(key_press_repeat_id);
+    key_press_repeat_id = nullptr;
+    repeat_owner.reset();
+    std::shared_ptr<input_t> selected;
+    std::uint64_t latest = 0;
+    key_press_id_t client_key = 0;
+    {
+      auto &state = retained_input_state();
+      std::lock_guard lock {state.mutex};
+      for (const auto &weak : state.live) {
+        if (auto input = weak.lock(); input && category_epoch(input, permissions::keyboard)) {
+          for (const auto &[key, held] : input->held_keys) {
+            if (held.order > latest) {
+              selected = input;
+              latest = held.order;
+              client_key = key;
+            }
+          }
+        }
       }
-      if ((synthetic_modifiers & std::byte {MODIFIER_CTRL}) != std::byte {0}) {
-        emit_keyboard_update(VKEY_CONTROL, true, flags);
-      }
-      if ((synthetic_modifiers & std::byte {MODIFIER_ALT}) != std::byte {0}) {
-        emit_keyboard_update(VKEY_MENU, true, flags);
+    }
+    if (selected) {
+      repeat_owner = selected;
+      repeat_client_key = client_key;
+      if (config::input.key_repeat_delay.count() > 0) {
+        if (const auto epoch = category_epoch(selected, permissions::keyboard)) {
+          key_press_repeat_id = schedule_input_delay(repeat_owned_key, delay, std::weak_ptr<input_t>(selected), client_key, *epoch);
+        }
       }
     }
   }
 
   /**
-   * @brief Re-emit a held key until its repeat task is cancelled.
-   *
-   * @param key_code Moonlight keyboard packet key code.
-   * @param flags Bit flags that modify the requested operation.
-   * @param synthetic_modifiers Byte mask of modifiers to press around the repeated key event.
+   * @brief Exercise the current owned repeat through the existing unit-test seam.
+   * @param key_code Original client key code.
+   * @param flags Original client flags.
+   * @param synthetic_modifiers Synthetic modifier mask retained on the original press.
    */
   void repeat_key(uint16_t key_code, uint8_t flags, std::byte synthetic_modifiers) {
-    // If key no longer pressed, stop repeating
-    const auto state = key_press[make_kpid(key_code, flags)];
-    if (!state.pressed) {
-      key_press_repeat_id = nullptr;
-      return;
+    (void) synthetic_modifiers;
+    if (auto input = repeat_owner.lock(); input && repeat_client_key == make_kpid(key_code, flags)) {
+      if (auto epoch = category_epoch(input, permissions::keyboard)) {
+        repeat_owned_key(input, repeat_client_key, *epoch);
+      }
     }
-
-    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers, state.extended);
-
-    key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
   }
 
   /**
@@ -1191,7 +1441,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_KEYBOARD_PACKET packet) {
-    if (!config::input.keyboard) {
+    if (!config::input.keyboard || !category_epoch(input, permissions::keyboard)) {
       return;
     }
 
@@ -1221,36 +1471,37 @@ namespace input {
       }
     }
 
-    auto &state = key_press[make_kpid(keyCode, packet->flags)];
-    if (!state.pressed) {
-      if (!release) {
-        // A new key has been pressed down, we need to check for key combo's
-        // If a key-combo has been pressed down, don't pass it through
-        if (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode) > 0) {
-          return;
-        }
-
-        state.extended = (modifiers & MODIFIER_EXTENDED) != 0;
-
-        if (key_press_repeat_id) {
-          task_pool.cancel(key_press_repeat_id);
-        }
-
-        if (config::input.key_repeat_delay.count() > 0) {
-          key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, keyCode, packet->flags, synthetic_modifiers).task_id;
-        }
-      } else {
-        // Already released
+    const auto client_key = make_kpid(keyCode, packet->flags);
+    const auto held = input->held_keys.find(client_key);
+    if (release) {
+      if (held == input->held_keys.end()) {
         return;
       }
-    } else if (!release) {
-      // Already pressed down key
-      return;
+      release_host_key(held->second.host_id);
+      input->held_keys.erase(held);
+      if (repeat_owner.lock() == input && repeat_client_key == client_key) {
+        select_repeat(std::chrono::duration_cast<std::chrono::milliseconds>(config::input.key_repeat_period));
+      }
+    } else {
+      if (held != input->held_keys.end() || (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode) > 0)) {
+        return;
+      }
+      const bool extended = (modifiers & MODIFIER_EXTENDED) != 0;
+      const auto host_code = static_cast<std::uint16_t>(map_keycode(keyCode));
+      const auto host_id = host_key_id(host_code, packet->flags, extended);
+      input->held_keys.emplace(client_key, held_key_t {host_id, synthetic_modifiers, ++press_sequence});
+      auto &aggregate = key_press[host_id];
+      if (aggregate.owners++ == 0) {
+        aggregate.pressed = true;
+        aggregate.extended = extended;
+        aggregate.host_code = host_code;
+        aggregate.flags = packet->flags;
+        with_synthetic_modifiers(packet->flags, synthetic_modifiers, [&]() {
+          emit_keyboard_update(host_code, false, packet->flags, extended);
+        });
+      }
+      select_repeat(std::chrono::duration_cast<std::chrono::milliseconds>(config::input.key_repeat_delay));
     }
-
-    state.pressed = !release;
-
-    send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers, state.extended);
 
     // Track the modifier state the client is holding, not the remapped host key.
     // This is compared against packet->modifiers above, which is client-side, so a
@@ -1327,12 +1578,16 @@ namespace input {
    * @return Assigned global gamepad slot, or -1 when allocation fails.
    */
   int alloc_gamepad(std::shared_ptr<input_t> &input, int client_index, const platf::gamepad_arrival_t &arrival) {
-    if (client_index < 0 || client_index >= input->gamepads.size()) {
+    if (!category_epoch(input, permissions::controller)) {
+      return -1;
+    }
+
+    if (client_index < 0 || client_index >= input->controllers->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << client_index << ']';
       return -1;
     }
 
-    auto &gamepad = input->gamepads[client_index];
+    auto &gamepad = input->controllers->gamepads[client_index];
     if (gamepad.id >= 0) {
       // Resume-time motion requests can arrive before the client assigns this
       // controller slot. Replay them after its arrival, without recreating the
@@ -1519,12 +1774,12 @@ namespace input {
       return;
     }
 
-    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
+    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->controllers->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
       return;
     }
 
-    auto &gamepad = input->gamepads[packet->controllerNumber];
+    auto &gamepad = input->controllers->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
       return;
@@ -1552,12 +1807,12 @@ namespace input {
       return;
     }
 
-    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
+    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->controllers->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
       return;
     }
 
-    auto &gamepad = input->gamepads[packet->controllerNumber];
+    auto &gamepad = input->controllers->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
       return;
@@ -1584,12 +1839,12 @@ namespace input {
       return;
     }
 
-    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
+    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->controllers->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
       return;
     }
 
-    auto &gamepad = input->gamepads[packet->controllerNumber];
+    auto &gamepad = input->controllers->gamepads[packet->controllerNumber];
     if (gamepad.id < 0) {
       BOOST_LOG(warning) << "ControllerNumber ["sv << packet->controllerNumber << "] not allocated"sv;
       return;
@@ -1615,13 +1870,13 @@ namespace input {
       return;
     }
 
-    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->gamepads.size()) {
+    if (packet->controllerNumber < 0 || packet->controllerNumber >= input->controllers->gamepads.size()) {
       BOOST_LOG(warning) << "ControllerNumber out of range ["sv << packet->controllerNumber << ']';
 
       return;
     }
 
-    auto &gamepad = input->gamepads[packet->controllerNumber];
+    auto &gamepad = input->controllers->gamepads[packet->controllerNumber];
 
     // If this is an event for a new gamepad, create the gamepad now. Ideally, the client would
     // send a controller arrival instead of this but it's still supported for legacy clients.
@@ -1631,6 +1886,10 @@ namespace input {
       }
     } else if (!(packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id >= 0) {
       // If this is the final event for a gamepad being removed, free the gamepad and return.
+      if (gamepad.back_timeout_id) {
+        task_pool.cancel(gamepad.back_timeout_id);
+        gamepad.back_timeout_id = nullptr;
+      }
       ::input::free_gamepad(platf_input, gamepad.id);
       gamepad.id = -1;
       return;
@@ -1681,8 +1940,16 @@ namespace input {
       if (platf::BACK & bf_new) {
         // Don't emulate home button if timeout < 0
         if (config::input.back_button_timeout >= 0ms) {
-          auto f = [input, controller = packet->controllerNumber]() {
-            auto &gamepad = input->gamepads[controller];
+          const auto epoch = category_epoch(input, permissions::controller);
+          if (!epoch) {
+            return;
+          }
+          auto f = [input, controller = packet->controllerNumber, epoch = *epoch]() {
+            input_worker_scope_t scope;
+            if (!current_epoch(input, permissions::controller, epoch)) {
+              return;
+            }
+            auto &gamepad = input->controllers->gamepads[controller];
 
             auto &state = gamepad.gamepad_state;
 
@@ -1705,7 +1972,7 @@ namespace input {
             gamepad.back_timeout_id = nullptr;
           };
 
-          gamepad.back_timeout_id = task_pool.pushDelayed(std::move(f), config::input.back_button_timeout).task_id;
+          gamepad.back_timeout_id = schedule_input_delay(std::move(f), config::input.back_button_timeout);
         }
       } else if (gamepad.back_timeout_id) {
         task_pool.cancel(gamepad.back_timeout_id);
@@ -2080,9 +2347,41 @@ namespace input {
   }
 
   /**
-   * @brief Process a bounded batch of queued packets for one stream.
-   *
-   * @param input Retained stream input state.
+   * @brief Map every implemented protocol packet class to its independent host input grant.
+   * @param magic Validated named packet magic.
+   * @return Required input category, or zero for an ignored unknown packet.
+   */
+  permissions::mask_t packet_category(std::uint32_t magic) {
+    switch (magic) {
+      case MOUSE_MOVE_REL_MAGIC_GEN5:
+      case MOUSE_MOVE_ABS_MAGIC:
+      case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
+      case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
+      case SCROLL_MAGIC_GEN5:
+      case SS_HSCROLL_MAGIC:
+        return permissions::mouse;
+      case KEY_DOWN_EVENT_MAGIC:
+      case KEY_UP_EVENT_MAGIC:
+      case UTF8_TEXT_EVENT_MAGIC:
+        return permissions::keyboard;
+      case SS_TOUCH_MAGIC:
+        return permissions::touch;
+      case SS_PEN_MAGIC:
+        return permissions::pen;
+      case MULTI_CONTROLLER_MAGIC_GEN5:
+      case SS_CONTROLLER_ARRIVAL_MAGIC:
+      case SS_CONTROLLER_TOUCH_MAGIC:
+      case SS_CONTROLLER_MOTION_MAGIC:
+      case SS_CONTROLLER_BATTERY_MAGIC:
+        return permissions::controller;
+      default:
+        return 0;
+    }
+  }
+
+  /**
+   * @brief Process a bounded batch of queued packets for one connection.
+   * @param input Connection input state.
    */
   void passthrough_queued_messages(std::shared_ptr<input_t> input);
 
@@ -2098,7 +2397,10 @@ namespace input {
       return;
     }
 #endif
-    task_pool.push(passthrough_queued_messages, input);
+    task_pool.push([input]() {
+      input_worker_scope_t scope;
+      passthrough_queued_messages(input);
+    });
   }
 
   /**
@@ -2109,7 +2411,7 @@ namespace input {
    */
   bool passthrough_next_message(std::shared_ptr<input_t> &input) {
     // 'entry' backs the 'payload' pointer, so they must remain in scope together
-    std::vector<uint8_t> entry;
+    queued_packet_t entry;
     PNV_INPUT_HEADER payload;
 
     // Lock the input queue while batching, but release it before sending
@@ -2126,14 +2428,17 @@ namespace input {
 
       // Pop off the first entry, which we will send
       entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
+      payload = (PNV_INPUT_HEADER) entry.bytes.data();
       input->input_queue.pop_front();
 
       // Try to batch with remaining items on the queue
       auto i = input->input_queue.begin();
       while (i != input->input_queue.end()) {
         auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
+        if (entry.category != batchable_entry.category || entry.epoch != batchable_entry.epoch) {
+          break;
+        }
+        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.bytes.data();
 
         auto batch_result = batch(payload, batchable_payload);
         if (batch_result == batch_result_e::terminate_batch) {
@@ -2157,6 +2462,13 @@ namespace input {
       hook(util::endian::little(payload->magic));
     }
 #endif
+
+    {
+      std::lock_guard lock {input->input_queue_lock};
+      if (input->closed || (entry.category && (!(input->allowed & entry.category) || input->epochs[category_index(entry.category)] != entry.epoch))) {
+        return true;
+      }
+    }
 
     // Send the batched input to the OS
     switch (util::endian::little(payload->magic)) {
@@ -2209,6 +2521,7 @@ namespace input {
   }
 
   void passthrough_queued_messages(std::shared_ptr<input_t> input) {
+    input_worker_scope_t scope;
     // Bound each turn so other task-pool work can run during sustained input.
     constexpr std::size_t packets_per_task = 32;
     for (std::size_t processed = 0; processed < packets_per_task; ++processed) {
@@ -2255,7 +2568,12 @@ namespace input {
     bool schedule_task = false;
     {
       std::lock_guard lock {input->input_queue_lock};
-      input->input_queue.push_back(std::move(input_data));
+      const auto category = packet_category(util::endian::little(header.magic));
+      if (input->closed || (category ? !(input->allowed & category) : !input->allowed)) {
+        return;
+      }
+      const auto epoch = category ? input->epochs[category_index(category)] : 0;
+      input->input_queue.push_back({std::move(input_data), category, epoch});
       if (!input->input_task_scheduled) {
         input->input_task_scheduled = true;
         schedule_task = true;
@@ -2272,8 +2590,15 @@ namespace input {
   void reset_mouse_buttons() {
     for (int button = 0; button < mouse_press.size(); ++button) {
       if (mouse_press[button]) {
-        platf::button_mouse(platf_input, button, true);
+        emit_mouse_button(button, true);
         mouse_press[button] = false;
+      }
+    }
+    auto &state = retained_input_state();
+    std::lock_guard lock {state.mutex};
+    for (const auto &weak : state.live) {
+      if (auto input = weak.lock()) {
+        input->held_mouse.reset();
       }
     }
   }
@@ -2282,13 +2607,24 @@ namespace input {
    * @brief Release every pressed keyboard key tracked by Sunshine.
    */
   void reset_keyboard_keys() {
-    for (auto &[key, state] : key_press) {
-      if (state.pressed) {
-        // key_press is keyed on the client's unmapped virtual-key code, but the press was
-        // emitted through map_keycode(). Release the host key that actually went down,
-        // otherwise a remapped modifier stays latched after the client disconnects.
-        emit_keyboard_update(map_keycode(vk_from_kpid(key) & 0x00FF), true, flags_from_kpid(key), state.extended);
-        state.pressed = false;
+    for (const auto &[key, state] : key_press) {
+      if (state.owners) {
+        emit_keyboard_update(state.host_code, true, state.flags, state.extended);
+      }
+    }
+    key_press.clear();
+    task_pool.cancel(key_press_repeat_id);
+    key_press_repeat_id = nullptr;
+    repeat_owner.reset();
+    auto &state = retained_input_state();
+    std::lock_guard lock {state.mutex};
+    for (auto &weak : state.live) {
+      if (auto input = weak.lock()) {
+        input->held_keys.clear();
+        input->shortcutFlags = 0;
+        input->shift_keys = {};
+        input->control_keys = {};
+        input->alt_keys = {};
       }
     }
   }
@@ -2299,8 +2635,8 @@ namespace input {
    * @param input Retained stream input state to neutralize.
    */
   void reset_gamepads(const std::shared_ptr<input_t> &input) {
-    for (int client_index = 0; client_index < input->gamepads.size(); ++client_index) {
-      auto &gamepad = input->gamepads[client_index];
+    for (int client_index = 0; client_index < input->controllers->gamepads.size(); ++client_index) {
+      auto &gamepad = input->controllers->gamepads[client_index];
       if (gamepad.back_timeout_id) {
         task_pool.cancel(gamepad.back_timeout_id);
         gamepad.back_timeout_id = nullptr;
@@ -2311,6 +2647,9 @@ namespace input {
           platf_input,
           {{gamepad.id, static_cast<std::uint8_t>(client_index)}, LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0F, 0.0F, 0.0F}
         );
+        for (const auto type : {LI_MOTION_TYPE_ACCEL, LI_MOTION_TYPE_GYRO}) {
+          platf::gamepad_motion(platf_input, {{gamepad.id, static_cast<std::uint8_t>(client_index)}, static_cast<std::uint8_t>(type), 0, 0, 0});
+        }
       }
       gamepad.gamepad_state = {};
       gamepad.back_button_state = button_state_e::NONE;
@@ -2318,58 +2657,191 @@ namespace input {
   }
 
   /**
-   * @brief Reset all pressed input state for a disconnected stream.
-   *
-   * @param input Retained stream input state to reset.
+   * @brief Release only the named categories owned by one connection.
+   * @param input Original connection state.
+   * @param removed Categories requiring cleanup.
    */
-  void reset_input_state(const std::shared_ptr<input_t> &input) {
-    reset_mouse_buttons();
-    reset_keyboard_keys();
-    reset_gamepads(input);
+  void cleanup_categories(const std::shared_ptr<input_t> &input, permissions::mask_t removed) {
+    if (removed & permissions::keyboard) {
+      for (const auto &[key, held] : input->held_keys) {
+        release_host_key(held.host_id);
+      }
+      input->held_keys.clear();
+      input->shortcutFlags = 0;
+      input->shift_keys = {};
+      input->control_keys = {};
+      input->alt_keys = {};
+      if (repeat_owner.lock() == input) {
+        select_repeat(std::chrono::duration_cast<std::chrono::milliseconds>(config::input.key_repeat_period));
+      }
+    }
+    if (removed & permissions::mouse) {
+      if (input->mouse_left_button_timeout > DISABLE_LEFT_BUTTON_DELAY) {
+        task_pool.cancel(input->mouse_left_button_timeout);
+      }
+      input->mouse_left_button_timeout = nullptr;
+      for (int button = 1; button < mouse_press.size(); ++button) {
+        owned_mouse_button(input, button, true);
+      }
+      input->accumulated_vscroll_delta = 0;
+      input->accumulated_hscroll_delta = 0;
+    }
+    if (removed & permissions::controller) {
+      reset_gamepads(input);
+      rebind_controllers(input, false);
+    }
+    if (removed & permissions::touch) {
+      platf::touch_input_t touch {};
+      touch.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      platf::touch_update(input->client_context.get(), platform_touch_port(input->touch_port), touch);
+    }
+    if (removed & permissions::pen) {
+      platf::pen_input_t pen {};
+      pen.eventType = LI_TOUCH_EVENT_CANCEL_ALL;
+      platf::pen_update(input->client_context.get(), platform_touch_port(input->touch_port), pen);
+    }
   }
 
-  /**
-   * @brief Reset the object to its initial empty state.
-   */
-  void reset(std::shared_ptr<input_t> &input) {
-    task_pool.cancel(key_press_repeat_id);
-    task_pool.cancel(input->mouse_left_button_timeout);
+  void update_permissions(const std::shared_ptr<input_t> &input, permissions::mask_t allowed) {
+    if (!input) {
+      return;
+    }
+    allowed &= permissions::inputs;
+    permissions::mask_t removed;
+    permissions::mask_t added;
+    {
+      std::lock_guard lock {input->input_queue_lock};
+      if (input->closed) {
+        return;
+      }
+      removed = input->allowed & ~allowed;
+      added = allowed & ~input->allowed;
+      input->allowed &= allowed;
+      for (auto category = permissions::controller; category <= permissions::keyboard; category <<= 1) {
+        if (removed & category) {
+          ++input->epochs[category_index(category)];
+        }
+      }
+      std::erase_if(input->input_queue, [&](const auto &packet) {
+        return (packet.category & removed) != 0;
+      });
+    }
+    sync_input_task([input, allowed, removed, added]() {
+      cleanup_categories(input, removed);
+      if (added & permissions::controller) {
+        claim_idle_controllers(input);
+        rebind_controllers(input, true);
+      }
+      std::lock_guard lock {input->input_queue_lock};
+      if (!input->closed) {
+        input->allowed = allowed;
+      }
+    });
+  }
 
-    // Ensure input is synchronous, by using the task_pool
-    task_pool.push(reset_input_state, input);
+  bool dispatch_controller_feedback(const std::shared_ptr<input_t> &input, const platf::feedback_queue_t &queue, const std::function<void(platf::gamepad_feedback_msg_t &)> &send) {
+    if (!input || !queue) {
+      return false;
+    }
+    const auto epoch = category_epoch(input, permissions::controller);
+#ifdef SUNSHINE_TESTS
+    if (feedback_dispatch_hook) {
+      feedback_dispatch_hook("before_pop");
+    }
+#endif
+    auto message = queue->pop(0ms);
+    if (!message) {
+      return false;
+    }
+#ifdef SUNSHINE_TESTS
+    if (feedback_dispatch_hook) {
+      feedback_dispatch_hook("before_delivery");
+    }
+#endif
+    // Serialize the local enqueue with gate closure; a completed revoke cannot be followed by an old send.
+    std::lock_guard lock {input->input_queue_lock};
+    if (epoch && !input->closed && (input->allowed & permissions::controller) && input->epochs[category_index(permissions::controller)] == *epoch) {
+      send(*message);
+    }
+    return true;
+  }
+
+  void reset(std::shared_ptr<input_t> &input) {
+    if (!input) {
+      return;
+    }
+    {
+      std::lock_guard lock {input->input_queue_lock};
+      if (input->closed) {
+        return;
+      }
+      input->closed = true;
+      input->allowed = 0;
+      for (auto &epoch : input->epochs) {
+        ++epoch;
+      }
+      input->input_queue.clear();
+    }
+    sync_input_task([input]() {
+      cleanup_categories(input, permissions::inputs);
+      if (input->retain_controllers && std::ranges::any_of(input->controllers->gamepads, [](const auto &pad) {
+            return pad.id >= 0;
+          })) {
+        auto &state = retained_input_state();
+        std::lock_guard lock {state.mutex};
+        state.inputs[input->session_id].push_back(std::move(input->controllers));
+        input->controllers = std::make_shared<controller_set_t>();
+      } else {
+        destroy_gamepads(input->controllers);
+      }
+    });
   }
 
   void terminate_gamepads() {
-    retained_input_map_t inputs;
-    {
-      auto &state = retained_input_state();
-      std::lock_guard lock {state.mutex};
-      state.inputs.swap(inputs);
-    }
-
-    if (!inputs.empty()) {
-      dispatch_input_task([inputs = std::move(inputs)]() {
-        destroy_gamepads(inputs);
-      });
-    }
+    sync_input_task([]() {
+      retained_input_map_t inputs;
+      std::vector<std::shared_ptr<input_t>> live;
+      {
+        auto &state = retained_input_state();
+        std::lock_guard lock {state.mutex};
+        state.inputs.swap(inputs);
+        for (const auto &weak : state.live) {
+          if (auto input = weak.lock()) {
+            live.push_back(input);
+          }
+        }
+      }
+      for (const auto &input : live) {
+        input->retain_controllers = false;
+        destroy_gamepads(input->controllers);
+      }
+      destroy_gamepads(inputs);
+    });
   }
 
   void terminate_gamepads(const std::string_view session_id) {
-    std::shared_ptr<input_t> input;
-    {
-      auto &state = retained_input_state();
-      std::lock_guard lock {state.mutex};
-      const auto iter = state.inputs.find(session_id);
-      if (iter == state.inputs.end()) {
-        return;
+    sync_input_task([session_id = std::string(session_id)]() {
+      retained_input_map_t inputs;
+      std::vector<std::shared_ptr<input_t>> live;
+      {
+        auto &state = retained_input_state();
+        std::lock_guard lock {state.mutex};
+        const auto it = state.inputs.find(session_id);
+        if (it != state.inputs.end()) {
+          inputs.emplace(it->first, std::move(it->second));
+          state.inputs.erase(it);
+        }
+        for (const auto &weak : state.live) {
+          if (auto input = weak.lock(); input && input->session_id == session_id) {
+            live.push_back(input);
+          }
+        }
       }
-
-      input = std::move(iter->second);
-      state.inputs.erase(iter);
-    }
-
-    dispatch_input_task([input = std::move(input)]() {
-      destroy_gamepads(input);
+      for (const auto &input : live) {
+        input->retain_controllers = false;
+        destroy_gamepads(input->controllers);
+      }
+      destroy_gamepads(inputs);
     });
   }
 
@@ -2429,43 +2901,54 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id) {
-    std::shared_ptr<input_t> input;
-    bool resumed = false;
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, permissions::mask_t allowed) {
+    auto input = std::make_shared<input_t>(mail->event<input::touch_port_t>(mail::touch_port), mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback));
+    input->session_id = std::move(session_id);
     {
       auto &state = retained_input_state();
       std::lock_guard lock {state.mutex};
-      const auto iter = state.inputs.find(session_id);
-      if (iter != state.inputs.end()) {
-        input = iter->second;
-        resumed = true;
-      } else {
-        input = std::make_shared<input_t>(
-          mail->event<input::touch_port_t>(mail::touch_port),
-          mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
-        );
-        state.inputs.try_emplace(std::move(session_id), input);
-      }
-    }
-
-    if (resumed) {
-      dispatch_input_task([input, mail = std::move(mail)]() {
-        rebind_input(input, mail);
+      std::erase_if(state.live, [](const auto &weak) {
+        return weak.expired();
       });
+      state.live.emplace_back(input);
     }
-
-    // Workaround to ensure new frames will be captured when a client connects
-    task_pool.pushDelayed([]() {
-      platf::move_mouse(platf_input, 1, 1);
-      platf::move_mouse(platf_input, -1, -1);
-    },
-                          100ms);
-
+    update_permissions(input, allowed);
+    // The capture workaround is mouse input too and cannot outlive its original grant.
+    if (const auto epoch = category_epoch(input, permissions::mouse)) {
+      schedule_input_delay([weak = std::weak_ptr<input_t>(input), epoch = *epoch]() {
+        input_worker_scope_t scope;
+        if (const auto input = weak.lock(); input && current_epoch(input, permissions::mouse, epoch)) {
+          platf::move_mouse(platf_input, 1, 1);
+          platf::move_mouse(platf_input, -1, -1);
+        }
+      },
+                           100ms);
+    }
     return input;
   }
 
 #ifdef SUNSHINE_TESTS
   namespace testing {
+    void set_feedback_dispatch_hook(std::function<void(std::string_view)> hook) {
+      feedback_dispatch_hook = std::move(hook);
+    }
+
+    void set_delayed_task_sink(std::function<void(std::function<void()>)> sink) {
+      delayed_task_sink = std::move(sink);
+    }
+
+    void set_mouse_button_sink(std::function<void(int, bool)> sink) {
+      mouse_button_sink = std::move(sink);
+    }
+
+    void send_mouse_button_packet(std::shared_ptr<input_t> &input, int button, bool release) {
+      NV_MOUSE_BUTTON_PACKET packet {};
+      packet.header.magic = util::endian::little<std::uint32_t>(release ? MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5 : MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5);
+      packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+      packet.button = static_cast<std::uint8_t>(button);
+      ::input::passthrough(input, &packet);
+    }
+
     void set_platform_input(platf::input_t input) {
       terminate_gamepads();
       platf_input = std::move(input);
@@ -2477,10 +2960,10 @@ namespace input {
     }
 
     int gamepad_id(const std::shared_ptr<input_t> &input, std::uint8_t client_index) {
-      if (!input || client_index >= input->gamepads.size()) {
+      if (!input || client_index >= input->controllers->gamepads.size()) {
         return -1;
       }
-      return input->gamepads[client_index].id;
+      return input->controllers->gamepads[client_index].id;
     }
 
     void set_input_packet_hook(std::function<void(std::uint32_t)> hook) {
@@ -2526,7 +3009,15 @@ namespace input {
     void reset_keyboard_state() {
       task_pool.cancel(key_press_repeat_id);
       key_press_repeat_id = nullptr;
+      repeat_owner.reset();
       key_press.clear();
+      auto &state = retained_input_state();
+      std::lock_guard lock {state.mutex};
+      for (const auto &weak : state.live) {
+        if (const auto input = weak.lock()) {
+          input->held_keys.clear();
+        }
+      }
     }
 
     void release_held_keys() {

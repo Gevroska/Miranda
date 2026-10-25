@@ -2,7 +2,7 @@
 
 - Identifier and milestone: P2a, source foundation before P3 display integration.
 - Requirements / feature IDs: D01-D07 and D09; DEC-13, DEC-16, DEC-17, DEC-20, DEC-22 and DEC-31 through DEC-33.
-- Candidate/base revision: based on the reviewed P1a candidate `b75f26710901e2688eb169056d775ac7db65a66a`; integration remains pending.
+- Candidate/base revision: `7836bdcf0f2f29f88e78e29288e951c4a704131f`, based on the reviewed P1a candidate `b75f26710901e2688eb169056d775ac7db65a66a`.
 - Scope and owned paths: `src/platform/windows/sudovda.{h,cpp}`, Windows fake-boundary regressions and narrow Windows source registration.
 - Interfaces and invariants: exact protocol, full caller-supplied persistent identity, checked rational mode conversion, adapter-and-target enumeration, one owned display-source lease and a cancellable heartbeat.
 - Explicit exclusions: no streaming/application/client call sites, topology/HDR/power changes, UI/settings, VDD abstraction, driver implementation or packages, installation, signing or hardware qualification.
@@ -40,8 +40,9 @@ Independent review of the actual source diff accepted the corrected candidate. I
 | Combined identity/driver focused regressions | P2a working candidate on P1a | Passed | 87 passed, zero skips/failures; includes all 38 fake-only `SudoVdaTest.*` cases and the P1a focused cases. |
 | Full native suite | P2a working candidate on P1a | Failed with unchanged baseline cases | 926 total: 913 passed, 11 skipped, two inherited external httpbin download failures with CURL code 7. No assertions or skips relaxed. |
 | Independent critical review | P2a working candidate | Completed | One-second watchdog defect corrected and re-reviewed; no outstanding actionable findings. Source review does not prove native driver behavior. |
+| Hosted platform CI | `7836bdcf0f2f29f88e78e29288e951c4a704131f` | Passed | All 26 main validation/build jobs, lint and CodeQL passed. Windows AMD64: 926 total, 914 passed, 12 skipped, zero failures, including all 38 fake-only adapter cases. Guarded publication and notarization were skipped. |
 | Installed driver, VM, GPU, streaming, HDR, human acceptance | P2a working candidate | Not run | No driver IOCTL, installation or hardware operation was executed. |
 
 ## Delivery
 
-This reviewed and natively tested source foundation awaits integration. It does not activate a production display feature or qualify a driver distribution. P3 must integrate source/application/viewer ownership, persistent policy/identity selection, modern display mapping/restoration and headless/shared-viewer acceptance. Driver provenance, notices, package trust and clean-target qualification remain separate release gates.
+[PR #3](https://github.com/Gevroska/Miranda/pull/3) merged normally as `d172333b1f9072523b26fb660047e02676db3e20` after independent review and exact-candidate hosted validation. Its tree matches the reviewed `7836bdcf0f2f29f88e78e29288e951c4a704131f` candidate. This inactive adapter foundation is complete; it does not activate a production display feature or qualify a driver distribution. P3 must integrate source/application/viewer ownership, persistent policy/identity selection, modern display mapping/restoration and headless/shared-viewer acceptance. Driver provenance, notices, package trust and clean-target qualification remain separate release gates.

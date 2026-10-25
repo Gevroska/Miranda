@@ -17,6 +17,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -37,6 +38,15 @@
 #ifdef SUNSHINE_BUILD_PORTAL
   #include <src/platform/linux/misc.h>
 #endif
+
+namespace confighttp {
+  /**
+   * @brief Production device-administration route exercised by the existing HTTPS fixture.
+   * @param response Response object.
+   * @param request Authenticated JSON request.
+   */
+  void updateClient(resp_https_t response, req_https_t request);
+}  // namespace confighttp
 
 using namespace std::literals;
 
@@ -186,6 +196,8 @@ protected:
     server->config.reuse_address = true;
     server->config.timeout_request = 5;
     server->config.timeout_content = 300;
+
+    server->resource["^/client-update-test$"]["POST"] = confighttp::updateClient;
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -499,7 +511,9 @@ class InvalidVirtualInputLicenseRequestTest: public ConfigHttpTest, public testi
 
 TEST_P(AuthenticatedConfigHttpEndpointTest, RejectsUnauthenticatedRequest) {
   const auto &request = GetParam();
-  const auto response = client->request(request.method, request.path, request.body);
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Content-Type", "application/json");
+  const auto response = client->request(request.method, request.path, request.body, headers);
   ASSERT_EQ(response->status_code, "401 Unauthorized");
   EXPECT_NE(response->header.find("WWW-Authenticate"), response->header.end());
 }
@@ -508,6 +522,7 @@ INSTANTIATE_TEST_SUITE_P(
   ConfigHttpEndpoints,
   AuthenticatedConfigHttpEndpointTest,
   testing::Values(
+    endpoint_request_t {"DeviceUpdate", "POST", "/client-update-test", "{}"},
     endpoint_request_t {"Page", "GET", "/page-test", ""},
     endpoint_request_t {"CsrfToken", "GET", "/csrf-token-test", ""},
     endpoint_request_t {"BrowseDirectory", "GET", "/browse-test", ""},
@@ -525,6 +540,7 @@ TEST_P(CsrfProtectedConfigHttpEndpointTest, RejectsCrossOriginRequestWithoutToke
   SimpleWeb::CaseInsensitiveMultimap headers;
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Origin", "https://example.invalid");
+  headers.emplace("Content-Type", "application/json");
 
   const auto response = client->request(request.method, request.path, request.body, headers);
   ASSERT_EQ(response->status_code, "400 Bad Request");
@@ -535,6 +551,7 @@ INSTANTIATE_TEST_SUITE_P(
   ConfigHttpEndpoints,
   CsrfProtectedConfigHttpEndpointTest,
   testing::Values(
+    endpoint_request_t {"DeviceUpdate", "POST", "/client-update-test", "{}"},
     endpoint_request_t {"CsrfValidation", "POST", "/csrf-validate-test", ""},
     endpoint_request_t {"PortalTokenReset", "POST", "/portal-token-reset-test", ""},
     endpoint_request_t {"VirtualInputLicenseUpdate", "POST", "/virtual-input-license-test", R"({"action":"validate"})"}
@@ -2063,3 +2080,78 @@ TEST_F(BrowseDirectoryTest, GetWindowsDrives_EntriesHaveCorrectFormat) {
   }
 }
 #endif
+
+/**
+ * @brief Exercise the actual authenticated, CSRF-protected device update endpoint with synthetic state.
+ */
+class DevicePermissionApiTest: public ConfigHttpTest {
+protected:
+  std::string state_file;  ///< Original configuration restored after the endpoint fixture.
+  bool fresh_state = false;  ///< Original fresh-state option.
+  std::string uuid;  ///< Synthetic paired identity.
+
+  void SetUp() override {
+    ConfigHttpTest::SetUp();
+    state_file = config::nvhttp.file_state;
+    fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    config::nvhttp.file_state = (test_web_dir / "client_state.json").string();
+    config::sunshine.flags[config::flag::FRESH_STATE] = false;
+    nvhttp::test_support::reset_client_state();
+    uuid = nvhttp::test_support::add_client("permission fixture", TEST_PUBLIC_CERT, true);
+    ASSERT_FALSE(uuid.empty());
+  }
+
+  void TearDown() override {
+    nvhttp::test_support::reset_client_state();
+    config::nvhttp.file_state = state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = fresh_state;
+    ConfigHttpTest::TearDown();
+  }
+
+  /**
+   * @brief Obtain a real CSRF token and submit a cross-origin administrator request.
+   * @param body Complete JSON update.
+   * @return Actual HTTPS response.
+   */
+  auto update(const nlohmann::json &body) {
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+    const auto token = client->request("GET", "/csrf-token-test", "", headers);
+    const auto parsed = nlohmann::json::parse(token->content.string());
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("Origin", "https://example.invalid");
+    headers.emplace("X-CSRF-Token", parsed["csrf_token"].get<std::string>());
+    return client->request("POST", "/client-update-test", body.dump(), headers);
+  }
+};
+
+TEST_F(DevicePermissionApiTest, GrantWithoutEnabledCannotReenableDisabledDevice) {
+  ASSERT_TRUE(nvhttp::set_client_enabled(uuid, false));
+  const auto response = update({{"uuid", uuid}, {"permissions", permissions::view | permissions::mouse}});
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  const auto devices = nvhttp::get_all_clients();
+  ASSERT_EQ(devices.size(), 1U);
+  EXPECT_FALSE(devices[0]["enabled"].get<bool>());
+  EXPECT_EQ(devices[0]["permissions"], permissions::view | permissions::mouse);
+}
+
+TEST_F(DevicePermissionApiTest, MalformedAndUnimplementedMasksAreRejectedWithoutChangingGrants) {
+  const std::array<nlohmann::json, 8> invalid {true, "16777216", -1, 1.5, nullptr, 1U, 0x10000U, std::numeric_limits<std::uint64_t>::max()};
+  for (const auto &mask : invalid) {
+    const auto response = update({{"uuid", uuid}, {"permissions", mask}});
+    EXPECT_EQ(response->status_code, "400 Bad Request");
+    EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+  }
+  EXPECT_EQ(update({{"uuid", uuid}, {"enabled", "true"}})->status_code, "400 Bad Request");
+}
+
+TEST_F(DevicePermissionApiTest, FailedPersistenceReturnsFailureAndLeavesPreviousAuthority) {
+  const auto valid_file = config::nvhttp.file_state;
+  config::nvhttp.file_state += "/missing/state.json";
+  const auto response = update({{"uuid", uuid}, {"permissions", permissions::launch}});
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_FALSE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+  config::nvhttp.file_state = valid_file;
+}

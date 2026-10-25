@@ -30,6 +30,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
@@ -1369,11 +1370,9 @@ namespace stream {
             has_session_awaiting_peer = true;
           } else {
             auto &feedback_queue = session->control.feedback_queue;
-            while (feedback_queue->peek()) {
-              auto feedback_msg = feedback_queue->pop();
-
-              send_feedback_msg(session, *feedback_msg);
-            }
+            while (input::dispatch_controller_feedback(session->input, feedback_queue, [session](auto &message) {
+              send_feedback_msg(session, message);
+            })) {}
 
             auto &hdr_queue = session->control.hdr_queue;
             while (session->control.peer && hdr_queue->peek()) {
@@ -2215,6 +2214,10 @@ namespace stream {
       return session.client_cert;
     }
 
+    void update_permissions(session_t &session, permissions::mask_t allowed) {
+      input::update_permissions(session.input, allowed);
+    }
+
     /**
      * @brief Stop the active streaming session and prevent new packets from being queued.
      */
@@ -2284,10 +2287,12 @@ namespace stream {
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail, session.input_session_id);
+      const auto client = nvhttp::current_client(session.client_uuid, session.client_cert);
+      session.input = input::alloc(session.mail, session.input_session_id, client ? client->permissions : 0);
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
+        input::reset(session.input);
         return -1;
       }
 

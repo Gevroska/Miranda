@@ -277,6 +277,7 @@ namespace {
         server.reset();
       }
       clients.clear();
+      rtsp_stream::stop_application({});
       nvhttp::test_support::reset_client_state();
       config::nvhttp.file_state = original_state_file;
       config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
@@ -290,8 +291,9 @@ namespace {
     /**
      * @brief Start a production listener whose test route creates real launch metadata.
      * @param authenticate Whether to install the production TLS certificate verifier.
+     * @param gamestream Whether to install the actual protected GameStream routes.
      */
-    void start_server(bool authenticate = true) {
+    void start_server(bool authenticate = true, bool gamestream = false) {
       server = nvhttp::test_support::make_https_server(certificate_file.string(), private_key_file.string(), handler_scope, authenticate);
       server->io_service = std::make_shared<boost::asio::io_context>();
       server->config.address = "127.0.0.1";
@@ -319,6 +321,9 @@ namespace {
         }
         response->write(identity.uuid);
       });
+      if (gamestream) {
+        nvhttp::test_support::set_gamestream_routes(*server, host_audio);
+      }
       server->start([this](unsigned short assigned_port) {
         port = assigned_port;
       });
@@ -489,6 +494,7 @@ namespace {
     std::vector<std::shared_ptr<client_t>> clients;  ///< Connections closed before the event loop is destroyed.
     std::vector<std::shared_ptr<rtsp_stream::launch_session_t>> launches;  ///< Actual metadata constructed by authorized requests.
     std::vector<request_t> requests;  ///< Requests retained to test expired connection identity access.
+    bool host_audio = false;  ///< Test-owned host audio preference used by real launch/resume routes.
     crypto::creds_t server_credentials;  ///< Server certificate/key fixture.
     crypto::creds_t credentials_a;  ///< First paired client credentials.
     crypto::creds_t credentials_b;  ///< Second paired client credentials.
@@ -634,4 +640,67 @@ namespace {
     EXPECT_EQ(error_callbacks.load(), 1);
     EXPECT_TRUE(launches.empty());
   }
+
+  TEST_F(HttpsClientIdentityTest, ZeroGrantProductionRoutesDenyActionsAndHideRestrictedMetadata) {
+    start_server(true, true);
+    const auto exchange = [&](const std::string &path) {
+      auto client = connect_client(&credentials_a);
+      send(*client, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+      return read_response(*client);
+    };
+    const auto metadata = exchange("/serverinfo?uniqueid=forged-owner");
+    EXPECT_TRUE(metadata.contains("<Permission>0</Permission>"));
+    EXPECT_TRUE(metadata.contains("<currentgame>0</currentgame>"));
+    EXPECT_TRUE(metadata.contains("SUNSHINE_SERVER_FREE"));
+    EXPECT_FALSE(metadata.contains("ServerCommand"));
+    EXPECT_FALSE(metadata.contains("InputOnly"));
+    const std::string stream_args = "rikey=00112233445566778899aabbccddeeff&rikeyid=1&appid=7&localAudioPlayMode=0";
+    for (const auto &path : {"/applist", "/appasset?appid=7", "/cancel"}) {
+      const auto body = exchange(path);
+      EXPECT_TRUE(body.contains("status_code=\"403\"")) << path;
+      EXPECT_FALSE(body.contains("AppTitle"));
+    }
+    EXPECT_TRUE(exchange("/launch?" + stream_args).contains("status_code=\"403\""));
+    EXPECT_TRUE(exchange("/resume?" + stream_args).contains("status_code=\"403\""));
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::list));
+    const auto listed = exchange("/applist");
+    EXPECT_TRUE(listed.contains("status_code=\"200\""));
+    EXPECT_TRUE(exchange("/resume?" + stream_args).contains("status_code=\"403\""));
+    EXPECT_TRUE(exchange("/cancel").contains("status_code=\"403\""));
+  }
+
+  TEST_F(HttpsClientIdentityTest, ExplicitLaunchStopInvalidatesEveryAdmissionWhileDeniedStopHasNoEffect) {
+    start_server(true, true);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    ASSERT_TRUE(nvhttp::update_client(uuid_b, std::nullopt, permissions::view));
+    const auto admission = [&](const auto &uuid, const auto &credentials) {
+      const auto identity = nvhttp::current_client(uuid, credentials.x509);
+      const SimpleWeb::CaseInsensitiveMultimap args {{"rikey", "00112233445566778899aabbccddeeff"}, {"rikeyid", "1"}};
+      return nvhttp::test_support::make_launch_session(*identity, args);
+    };
+    auto first = admission(uuid_a, credentials_a);
+    ASSERT_EQ(rtsp_stream::prepare_launch(first, []() {
+                return 200;
+              }),
+              200);
+    ASSERT_TRUE(rtsp_stream::test_support::claim_launch(first));
+    rtsp_stream::launch_session_clear(first->id);
+    auto second = admission(uuid_b, credentials_b);
+    ASSERT_EQ(rtsp_stream::prepare_launch(second, []() {
+                return 200;
+              }),
+              200);
+    const auto stop = [&](const auto &credentials) {
+      auto client = connect_client(&credentials);
+      send(*client, "GET /cancel HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+      return read_response(*client);
+    };
+    EXPECT_TRUE(stop(credentials_b).contains("status_code=\"403\""));
+    EXPECT_TRUE(rtsp_stream::test_support::token_authorized(first));
+    EXPECT_TRUE(rtsp_stream::test_support::token_authorized(second));
+    EXPECT_TRUE(stop(credentials_a).contains("<cancel>1</cancel>"));
+    EXPECT_FALSE(rtsp_stream::test_support::token_authorized(first));
+    EXPECT_FALSE(rtsp_stream::test_support::token_authorized(second));
+  }
+
 }  // namespace

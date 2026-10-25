@@ -17,9 +17,10 @@ import en from '../../src_assets/common/assets/web/public/assets/locale/en.json'
  * @param {object} licenseStatus License status overrides.
  * @param {Array} permissions Platform permissions.
  * @param {object|null} i18n Optional Vue I18n plugin.
+ * @param {Array} clients Authoritative paired device state.
  * @return {Promise<object>} Mounted troubleshooting wrapper.
  */
-async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {}, permissions = [], i18n = null) {
+async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {}, permissions = [], i18n = null, clients = []) {
   vi.stubGlobal('fetch', vi.fn(async (url) => {
     if (url === '/api/config') {
       return { json: async () => ({ platform, gamepad_driver: gamepadDriver }) }
@@ -50,7 +51,7 @@ async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {},
       return { text: async () => '' }
     }
     if (url === './api/clients/list') {
-      return { json: async () => ({ status: true, named_certs: [] }) }
+      return { ok: true, json: async () => ({ status: true, named_certs: clients }) }
     }
     return {
       ok: true,
@@ -292,6 +293,150 @@ describe('virtual input troubleshooting', () => {
       'troubleshooting.permissions_status_not_determined',
     ])
     expect(wrapper.findAll('.permission-table-shell tbody button')).toHaveLength(2)
+    wrapper.unmount()
+  })
+})
+
+describe('paired device rights', () => {
+  it('shows only implemented explicit grants and saves rights without changing the enabled gate', async () => {
+    const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: false, permissions: 0 }]
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, clients)
+    const rights = wrapper.findAll('[data-device-right]')
+    expect(rights).toHaveLength(8)
+    expect(rights.every(input => input.element.checked === false)).toBe(true)
+    expect(wrapper.text()).not.toContain('device_right_clipboard')
+    const originalFetch = fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/update') {
+        const body = JSON.parse(options.body)
+        expect(body).toEqual({ uuid: 'paired-device', permissions: 0x02000000 })
+        clients[0].permissions = body.permissions
+        return { ok: true, json: async () => ({ status: true }) }
+      }
+      return originalFetch(url, options)
+    }))
+    await wrapper.get('[data-device-right="33554432"]').setValue(true)
+    await wrapper.get('fieldset button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('#toggle-paired-device').element.checked).toBe(false)
+    expect(wrapper.get('[data-device-right="33554432"]').element.checked).toBe(true)
+    expect(wrapper.vm.clientUpdateError).toBe('')
+    wrapper.unmount()
+  })
+
+  it('reports rejected updates and restores the authoritative saved rights', async () => {
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, [
+      { uuid: 'paired-device', name: 'Paired device', enabled: true, permissions: 0 },
+    ])
+    const originalFetch = fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/update') { return { ok: true, json: async () => ({ status: false }) } }
+      return originalFetch(url, options)
+    }))
+    await wrapper.get('[data-device-right="16777216"]').setValue(true)
+    await wrapper.get('fieldset button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('troubleshooting.device_update_error')
+    expect(wrapper.get('[data-device-right="16777216"]').element.checked).toBe(false)
+    expect(wrapper.get('#toggle-paired-device').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it.each(['transport', 'JSON'])('confirms saved rights after the server commits but its %s response is lost', async failure => {
+    const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: false, permissions: 0 }]
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, clients)
+    const originalFetch = fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/update') {
+        clients[0].permissions = JSON.parse(options.body).permissions
+        if (failure === 'transport') throw new TypeError('The committed response was lost')
+        return { ok: true, json: async () => { throw new SyntaxError('Truncated committed response') } }
+      }
+      return originalFetch(url, options)
+    }))
+    await wrapper.get('[data-device-right="33554432"]').setValue(true)
+    await wrapper.get('fieldset button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-device-right="33554432"]').element.checked).toBe(true)
+    expect(wrapper.get('#toggle-paired-device').element.checked).toBe(false)
+    expect(wrapper.vm.clientUpdateError).toBe('')
+    expect(wrapper.vm.clientUpdatePending).toBe(null)
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['HTTP failure', () => ({ ok: false, json: async () => ({ status: true, named_certs: [] }) })],
+    ['rejected readback', () => ({ ok: true, json: async () => ({ status: false, named_certs: [] }) })],
+    ['malformed readback', () => ({ ok: true, json: async () => ({ status: true, named_certs: [{}] }) })],
+    ['unreadable JSON', () => ({ ok: true, json: async () => { throw new SyntaxError('Truncated response') } })],
+  ])('reports uncertainty when a committed response is lost and authoritative refresh has %s', async (_reason, readback) => {
+    const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: true, permissions: 0 }]
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, clients)
+    const originalFetch = fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/update') {
+        clients[0].permissions = JSON.parse(options.body).permissions
+        throw new TypeError('The committed response was lost')
+      }
+      if (url === './api/clients/list') return readback()
+      return originalFetch(url, options)
+    }))
+    await wrapper.get('[data-device-right="16777216"]').setValue(true)
+    await wrapper.get('fieldset button').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('troubleshooting.device_update_unknown')
+    expect(wrapper.vm.clientUpdateError).not.toBe('troubleshooting.device_update_error')
+    expect(wrapper.vm.clientUpdatePending).toBe(null)
+    wrapper.unmount()
+  })
+
+  it('keeps the mutation pending until its authoritative readback completes', async () => {
+    const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: true, permissions: 0 }]
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, clients)
+    const originalFetch = fetch
+    let finishReadback
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/update') {
+        clients[0].permissions = JSON.parse(options.body).permissions
+        return { ok: true, json: async () => ({ status: true }) }
+      }
+      if (url === './api/clients/list') return new Promise(resolve => { finishReadback = resolve })
+      return originalFetch(url, options)
+    }))
+    const operation = wrapper.vm.updateClient('paired-device', { permissions: 0x01000000 })
+    await flushPromises()
+    expect(wrapper.vm.clientUpdatePending).toBe('paired-device')
+    expect(finishReadback).toBeTypeOf('function')
+    finishReadback({ ok: true, json: async () => ({ status: true, named_certs: clients }) })
+    await operation
+    await flushPromises()
+    expect(wrapper.vm.clientUpdatePending).toBe(null)
+    expect(wrapper.get('[data-device-right="16777216"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it.each([true, false])('handles a committed unpair with a lost response and readback success=%s', async readbackSucceeds => {
+    const clients = [{ uuid: 'paired-device', name: 'Paired device', enabled: true, permissions: 0 }]
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, clients)
+    const originalFetch = fetch
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      if (url === './api/clients/unpair') {
+        clients.splice(0)
+        throw new TypeError('The committed response was lost')
+      }
+      if (url === './api/clients/list' && !readbackSucceeds) throw new TypeError('Readback unavailable')
+      return originalFetch(url, options)
+    }))
+    await wrapper.vm.unpairSingle('paired-device')
+    await flushPromises()
+    expect(wrapper.vm.clientUpdatePending).toBe(null)
+    if (readbackSucceeds) {
+      expect(wrapper.vm.clients).toEqual([])
+      expect(wrapper.vm.clientUpdateError).toBe('')
+    } else {
+      expect(wrapper.vm.clients).toHaveLength(1)
+      expect(wrapper.get('[role="alert"]').text()).toBe('troubleshooting.device_update_unknown')
+    }
     wrapper.unmount()
   })
 })

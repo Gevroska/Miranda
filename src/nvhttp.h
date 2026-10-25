@@ -25,6 +25,7 @@
 
 // local includes
 #include "crypto.h"
+#include "permissions.h"
 
 namespace rtsp_stream {
   struct launch_session_t;
@@ -99,7 +100,26 @@ namespace nvhttp {
     std::string uuid;  ///< Persistent pairing UUID, independent of client-supplied query identifiers.
     std::string cert;  ///< Canonical PEM of the exact authenticated client certificate.
     std::string name;  ///< Friendly client name recorded during pairing.
+    permissions::mask_t permissions = 0;  ///< Current explicit grants; never an enduring authorization cache.
+    std::uint64_t revision = 0;  ///< Authorization revision observed when this identity was resolved.
   };
+
+  /**
+   * @brief Resolve the current grants of one original, enabled pairing.
+   * @param uuid Original paired identity.
+   * @param cert Exact canonical paired certificate.
+   * @return Current identity and grants, or no value when stale, disabled or ambiguous.
+   */
+  std::optional<verified_client_t> current_client(std::string_view uuid, std::string_view cert);
+
+  /**
+   * @brief Persist and reconcile an administrator's explicit device update.
+   * @param uuid Paired identity to update.
+   * @param enabled Optional enable gate; omission preserves its value.
+   * @param permissions Optional complete grant; omission preserves its value.
+   * @return Whether the update was saved and revocation cleanup completed.
+   */
+  bool update_client(std::string_view uuid, std::optional<bool> enabled, std::optional<permissions::mask_t> permissions);
 
   /**
    * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.
@@ -447,8 +467,9 @@ namespace nvhttp {
    * @examples
    * nvhttp::erase_all_clients();
    * @examples_end
+   * @return Whether removal was persisted and affected sessions were reconciled.
    */
-  void erase_all_clients();
+  bool erase_all_clients();
 
   /**
    * @brief Get codec mode flags.
@@ -462,6 +483,12 @@ namespace nvhttp {
    * @brief Test-only accessors for paired-client authorization state.
    */
   namespace test_support {
+    /**
+     * @brief Install the actual protected GameStream routes on a loopback test listener.
+     * @param server Production HTTPS specialization.
+     * @param host_audio Test-owned host audio preference retained by the route callbacks.
+     */
+    void set_gamestream_routes(SimpleWeb::Server<SunshineHTTPS> &server, bool &host_audio);
     /**
      * @brief Create the production HTTPS server and expose its callback lifetime guard.
      *

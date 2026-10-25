@@ -18,7 +18,10 @@
 #include <Windows.h>
 
 // standard includes
+#include <algorithm>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -34,6 +37,7 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/virtualhid_input.h"
+#include "third-party/libvirtualhid/src/platform/windows/keylayout.hpp"
 
 namespace platf {
   using namespace std::literals;
@@ -47,6 +51,250 @@ namespace platf {
    */
   using target_t = util::safe_ptr<_VIGEM_TARGET_T, &vigem_target_free>;
 
+  namespace {
+#ifdef SUNSHINE_TESTS
+    std::function<std::uint16_t(std::uint16_t, bool)> keyboard_native_mapper;  ///< Fixture-only static layout, never an installed host layout.
+    std::optional<bool> keyboard_hid_path;  ///< Fixture-only selected keyboard path.
+#endif
+
+    /**
+     * @brief Match the pinned keyboard's forced extension before deriving an output identity.
+     * @param code Mapped virtual key.
+     * @return Whether the Windows backend forces extension for that key.
+     */
+    bool keyboard_forces_extension(std::uint16_t code) {
+      switch (code) {
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_RMENU:
+        case VK_RCONTROL:
+        case VK_INSERT:
+        case VK_DELETE:
+        case VK_HOME:
+        case VK_END:
+        case VK_PRIOR:
+        case VK_NEXT:
+        case VK_UP:
+        case VK_DOWN:
+        case VK_LEFT:
+        case VK_RIGHT:
+        case VK_DIVIDE:
+        case VK_APPS:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    /**
+     * @brief Distinguish fixed HID direct-VK usages from keys routed to SendInput.
+     * @param code Mapped virtual key.
+     * @return Whether the pinned HID keyboard supports a direct virtual-key usage or modifier.
+     */
+    bool keyboard_hid_virtual_key(std::uint16_t code) {
+      if ((code >= '0' && code <= '9') || (code >= 'A' && code <= 'Z') || (code >= VK_F1 && code <= VK_F24) || (code >= VK_NUMPAD0 && code <= VK_NUMPAD9) || (code >= VK_LSHIFT && code <= VK_RMENU)) {
+        return true;
+      }
+      switch (code) {
+        case VK_SHIFT:
+        case VK_CONTROL:
+        case VK_MENU:
+        case VK_LWIN:
+        case VK_RWIN:
+        case VK_RETURN:
+        case VK_ESCAPE:
+        case VK_BACK:
+        case VK_TAB:
+        case VK_SPACE:
+        case VK_OEM_MINUS:
+        case VK_OEM_PLUS:
+        case VK_OEM_4:
+        case VK_OEM_6:
+        case VK_OEM_5:
+        case VK_OEM_1:
+        case VK_OEM_7:
+        case VK_OEM_3:
+        case VK_OEM_COMMA:
+        case VK_OEM_PERIOD:
+        case VK_OEM_2:
+        case VK_CAPITAL:
+        case VK_SNAPSHOT:
+        case VK_SCROLL:
+        case VK_PAUSE:
+        case VK_INSERT:
+        case VK_HOME:
+        case VK_PRIOR:
+        case VK_DELETE:
+        case VK_END:
+        case VK_NEXT:
+        case VK_RIGHT:
+        case VK_LEFT:
+        case VK_DOWN:
+        case VK_UP:
+        case VK_NUMLOCK:
+        case VK_DIVIDE:
+        case VK_MULTIPLY:
+        case VK_SUBTRACT:
+        case VK_ADD:
+        case VK_DECIMAL:
+        case VK_OEM_102:
+        case VK_APPS:
+        case VK_EXECUTE:
+        case VK_HELP:
+        case VK_SELECT:
+        case VK_VOLUME_MUTE:
+        case VK_VOLUME_UP:
+        case VK_VOLUME_DOWN:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    /**
+     * @brief Canonicalize non-injective scan translations in the pinned HID path.
+     * @param scan Effective scan code.
+     * @param extended Effective extension.
+     * @param hid Whether the current backend is a HID keyboard.
+     * @return Stable output identity with separate scan and virtual-key domains.
+     */
+    std::uint32_t keyboard_scan_identity(std::uint16_t scan, bool extended, bool hid) {
+      if (hid) {
+        const auto prefix = scan & 0xFF00U;
+        const auto low = static_cast<std::uint8_t>(scan & 0xFFU);
+        const bool effective_extended = extended || prefix == 0xE000U || prefix == 0xE100U;
+        constexpr std::array<std::uint8_t, 20> extended_usages {0x1C, 0x20, 0x2E, 0x30, 0x35, 0x37, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4B, 0x4D, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x5D, 0x5E};
+        const bool modifier = low == 0x1D || low == 0x2A || low == 0x36 || low == 0x38 || low == 0x5B || low == 0x5C;
+        const bool mapped = modifier || (effective_extended ? std::ranges::find(extended_usages, low) != extended_usages.end() :
+                                                              ((low >= 0x01 && low <= 0x53) || (low >= 0x56 && low <= 0x58) || (low >= 0x64 && low <= 0x6F)));
+        if (!mapped) {
+          // Unknown HID scans fall back to the original SendInput event, preserving its scan encoding.
+          return keyboard_scan_identity(scan, extended, false);
+        }
+        scan = low;
+        extended = effective_extended;
+        switch (low) {
+          case 0x1D:
+          case 0x38:  // Control/Alt retain the effective side, not the prefix encoding.
+            scan &= 0xFFU;
+            break;
+          case 0x2A:
+          case 0x36:  // HID Shift modifiers ignore extension.
+            scan &= 0xFFU;
+            extended = false;
+            break;
+          case 0x5B:
+          case 0x5C:  // HID Windows modifiers ignore extension.
+            scan &= 0xFFU;
+            extended = true;
+            break;
+          case 0x45:
+          case 0x46:  // Both extended scans select HID Pause usage.
+            if (extended) {
+              scan = 0x45;
+            }
+            break;
+          case 0x6F:  // HID F24 and its SendInput fallback use different Set-1 encodings.
+            scan = lvh::detail::windows_us_english_scan_code(VK_F24);
+            break;
+        }
+      }
+      return 0x10000000U | (static_cast<std::uint32_t>(scan) << 1) | extended;
+    }
+
+    /**
+     * @brief Immutable feedback destination with duplicate caches owned by one binding generation.
+     */
+    struct feedback_binding_t {
+      feedback_queue_t queue;  ///< Current owner or a detached sink queue.
+      std::uint8_t index;  ///< Client-relative controller index.
+      gamepad_feedback_msg_t last_rumble {};  ///< Last rumble sent in this binding.
+      gamepad_feedback_msg_t last_rgb {};  ///< Last RGB sent in this binding.
+    };
+
+    std::mutex feedback_mutex;  ///< Serializes callback capture with rebind and invalidation.
+    std::map<std::uintptr_t, std::shared_ptr<feedback_binding_t>> feedback_bindings;  ///< Native callback IDs, independent of target address reuse.
+    std::uintptr_t next_feedback_id = 0;  ///< Never reused during the process lifetime.
+
+    /**
+     * @brief Publish a fresh feedback generation, including when resuming the same native target.
+     * @param id Existing callback ID, or zero for a newly allocated native target.
+     * @param queue Destination for feedback after this operation.
+     * @param index Client-relative controller index.
+     * @return Native callback ID that is safe to carry as opaque userdata.
+     */
+    std::uintptr_t bind_feedback(std::uintptr_t id, feedback_queue_t queue, std::uint8_t index) {
+      std::lock_guard lock {feedback_mutex};
+      if (!id) {
+        id = ++next_feedback_id;
+      }
+      feedback_bindings[id] = std::make_shared<feedback_binding_t>(feedback_binding_t {std::move(queue), index});
+      return id;
+    }
+
+    /**
+     * @brief Invalidate callback ingress and every already queued generation before native removal.
+     * @param id Original callback ID.
+     */
+    void unbind_feedback(std::uintptr_t id) {
+      std::lock_guard lock {feedback_mutex};
+      feedback_bindings.erase(id);
+    }
+
+    /**
+     * @brief Capture the arrival-time binding without retaining a raw ViGEm context or native target.
+     * @param id Original opaque callback ID.
+     * @param large Large-motor amplitude.
+     * @param small Small-motor amplitude.
+     * @param rgb Optional DS4 lightbar event from the same callback.
+     * @return Worker operation rejecting a replaced or removed generation before delivery.
+     */
+    std::function<void()> capture_feedback(std::uintptr_t id, std::uint8_t large, std::uint8_t small, std::optional<std::array<std::uint8_t, 3>> rgb = {}) {
+      std::shared_ptr<feedback_binding_t> binding;
+      {
+        std::lock_guard lock {feedback_mutex};
+        if (const auto it = feedback_bindings.find(id); it != feedback_bindings.end()) {
+          binding = it->second;
+        }
+      }
+      return [id, binding, large, small, rgb]() {
+        std::lock_guard lock {feedback_mutex};
+        const auto current = feedback_bindings.find(id);
+        if (!binding || current == feedback_bindings.end() || current->second != binding || !binding->queue) {
+          return;
+        }
+        const auto low = vigem::scale_rumble(large);
+        const auto high = vigem::scale_rumble(small);
+        if (binding->last_rumble.data.rumble.lowfreq != low || binding->last_rumble.data.rumble.highfreq != high) {
+          const auto message = gamepad_feedback_msg_t::make_rumble(binding->index, low, high);
+          binding->queue->raise(message);
+          binding->last_rumble = message;
+        }
+        if (rgb && (binding->last_rgb.data.rgb_led.r != (*rgb)[0] || binding->last_rgb.data.rgb_led.g != (*rgb)[1] || binding->last_rgb.data.rgb_led.b != (*rgb)[2])) {
+          const auto message = gamepad_feedback_msg_t::make_rgb_led(binding->index, (*rgb)[0], (*rgb)[1], (*rgb)[2]);
+          binding->queue->raise(message);
+          binding->last_rgb = message;
+        }
+      };
+    }
+  }  // namespace
+
+#ifdef SUNSHINE_TESTS
+  namespace vigem {
+    std::uintptr_t bind_feedback_for_testing(std::uintptr_t id, feedback_queue_t queue, std::uint8_t index) {
+      return bind_feedback(id, std::move(queue), index);
+    }
+
+    void unbind_feedback_for_testing(std::uintptr_t id) {
+      unbind_feedback(id);
+    }
+
+    std::function<void()> capture_feedback_for_testing(std::uintptr_t id, std::uint8_t large, std::uint8_t small) {
+      return capture_feedback(id, large, small, std::array<std::uint8_t, 3> {1, 2, 3});
+    }
+  }  // namespace vigem
+#endif
+
   /**
    * @brief Handle Xbox 360 virtual gamepad notification events.
    *
@@ -57,8 +305,8 @@ namespace platf {
    * @param userdata User data pointer.
    */
   void CALLBACK x360_notify(
-    client_t::pointer client,
-    target_t::pointer target,
+    client_t::pointer /* client */,
+    target_t::pointer /* target */,
     std::uint8_t largeMotor,
     std::uint8_t smallMotor,
     std::uint8_t /* led_number */,
@@ -76,8 +324,8 @@ namespace platf {
    * @param userdata User data pointer.
    */
   void CALLBACK ds4_notify(
-    client_t::pointer client,
-    target_t::pointer target,
+    client_t::pointer /* client */,
+    target_t::pointer /* target */,
     std::uint8_t largeMotor,
     std::uint8_t smallMotor,
     DS4_LIGHTBAR_COLOR /* led_color */,
@@ -98,7 +346,8 @@ namespace platf {
    */
   struct gamepad_context_t {
     target_t gp;  ///< Gp.
-    feedback_queue_t feedback_queue;  ///< Feedback queue.
+    feedback_queue_t feedback_queue;  ///< Feedback queue, accessed only on the single input worker.
+    std::uintptr_t callback_id = 0;  ///< Opaque native callback identity; never a pointer to this context.
 
     union {
       XUSB_REPORT x360;  ///< Current Xbox 360 controller report.
@@ -113,9 +362,6 @@ namespace platf {
 
     thread_pool_util::ThreadPool::task_id_t repeat_task {};  ///< Repeat task.
     std::chrono::steady_clock::time_point last_report_ts;  ///< Last report ts.
-
-    gamepad_feedback_msg_t last_rumble;  ///< Last rumble.
-    gamepad_feedback_msg_t last_rgb_led;  ///< Last RGB led.
   };
 
   constexpr float EARTH_G = 9.80665f;  ///< Meters per second squared represented by one gravity unit.
@@ -243,6 +489,102 @@ namespace platf {
     }
   }
 
+  std::uint32_t keyboard_key_identity(input_t &input, std::uint16_t code, std::uint8_t flags, bool extended) {
+    const auto &keyboard = virtualhid::get_input_context(input).keyboard;
+    bool hid = keyboard && !keyboard->device_nodes().empty();
+    const auto map_scan = [&](std::uint16_t key, bool direct_virtual) {
+#ifdef SUNSHINE_TESTS
+      if (keyboard_native_mapper) {
+        return keyboard_native_mapper(key, direct_virtual);
+      }
+#endif
+      return static_cast<std::uint16_t>(MapVirtualKeyW(key, direct_virtual ? MAPVK_VK_TO_VSC_EX : MAPVK_VK_TO_VSC));
+    };
+#ifdef SUNSHINE_TESTS
+    if (keyboard_hid_path) {
+      hid = *keyboard_hid_path;
+    }
+#endif
+    const bool normalized = !(flags & SS_KBE_FLAG_NON_NORMALIZED);
+    const bool can_map = code != VK_LWIN && code != VK_RWIN && code != VK_PAUSE;
+    const auto us_scan = lvh::detail::windows_us_english_scan_code(code);
+    const auto windows_identity = [&]() {
+      std::uint16_t scan = normalized ? us_scan :
+                                        (config::input.always_send_scancodes && can_map ? map_scan(code, false) : std::uint16_t {});
+      bool effective_extended = extended || keyboard_forces_extension(code);
+      if (!scan) {
+        scan = map_scan(code, true);
+        if ((scan & 0xFF00U) == 0xE000U) {
+          scan &= 0xFFU;
+          effective_extended = true;
+        }
+      }
+      // E1 remains distinct from ordinary/E0 scans; only unmappable VKs retain their own domain.
+      return scan ? keyboard_scan_identity(scan, effective_extended, false) :
+                    0x20000000U | (static_cast<std::uint32_t>(code) << 1) | effective_extended;
+    };
+    if (!hid) {
+      return windows_identity();
+    }
+    std::uint16_t scan = normalized ? us_scan :
+                                      ((config::input.always_send_scancodes || extended) && can_map ? map_scan(code, false) : std::uint16_t {});
+    if (scan) {
+      const auto prefix = scan & 0xFF00U;
+      const auto low = static_cast<std::uint8_t>(scan & 0xFFU);
+      const bool effective_extended = extended || keyboard_forces_extension(code) || prefix == 0xE000U || prefix == 0xE100U;
+      constexpr std::array<std::uint8_t, 20> extended_usages {0x1C, 0x20, 0x2E, 0x30, 0x35, 0x37, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4B, 0x4D, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x5D, 0x5E};
+      const bool modifier = low == 0x1D || low == 0x2A || low == 0x36 || low == 0x38 || low == 0x5B || low == 0x5C;
+      const bool mapped = modifier || (effective_extended ? std::ranges::find(extended_usages, low) != extended_usages.end() :
+                                                            ((low >= 0x01 && low <= 0x53) || (low >= 0x56 && low <= 0x58) || (low >= 0x64 && low <= 0x6F)));
+      return mapped ? keyboard_scan_identity(scan, extended || keyboard_forces_extension(code), true) : windows_identity();
+    }
+    if (!keyboard_hid_virtual_key(code)) {
+      return windows_identity();
+    }
+    // Supported HID direct VKs select fixed usages, independent of the current native layout.
+    scan = us_scan;
+    switch (code) {
+      case VK_LWIN:
+        scan = 0x5B;
+        break;
+      case VK_RWIN:
+        scan = 0x5C;
+        break;
+      case VK_PAUSE:
+        scan = 0x45;
+        extended = true;
+        break;
+      case VK_SNAPSHOT:
+        scan = 0x37;
+        extended = true;
+        break;
+      case VK_VOLUME_MUTE:
+        scan = 0x20;
+        extended = true;
+        break;
+      case VK_VOLUME_DOWN:
+        scan = 0x2E;
+        extended = true;
+        break;
+      case VK_VOLUME_UP:
+        scan = 0x30;
+        extended = true;
+        break;
+    }
+    extended |= keyboard_forces_extension(code);
+    return scan ? keyboard_scan_identity(scan, extended, true) :
+                  0x20000000U | (static_cast<std::uint32_t>(code) << 1) | extended;
+  }
+
+#ifdef SUNSHINE_TESTS
+  namespace testing {
+    void set_keyboard_identity_environment(std::function<std::uint16_t(std::uint16_t, bool)> mapper, std::optional<bool> hid) {
+      keyboard_native_mapper = std::move(mapper);
+      keyboard_hid_path = hid;
+    }
+  }  // namespace testing
+#endif
+
   /**
    * @brief ViGEm client connection and virtual gamepad collection.
    */
@@ -326,11 +668,12 @@ namespace platf {
       }
 
       gamepad.feedback_queue = std::move(feedback_queue);
+      gamepad.callback_id = bind_feedback(0, gamepad.feedback_queue, gamepad.client_relative_index);
 
       if (gp_type == Xbox360Wired) {
-        status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, this);
+        status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, reinterpret_cast<void *>(gamepad.callback_id));
       } else {
-        status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, this);
+        status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, reinterpret_cast<void *>(gamepad.callback_id));
       }
 
       if (!VIGEM_SUCCESS(status)) {
@@ -359,8 +702,7 @@ namespace platf {
 
       gamepad.client_relative_index = id.clientRelativeIndex;
       gamepad.feedback_queue = std::move(feedback_queue);
-      gamepad.last_rumble = {};
-      gamepad.last_rgb_led = {};
+      bind_feedback(gamepad.callback_id, gamepad.feedback_queue, gamepad.client_relative_index);
 
       if (gamepad.feedback_queue && vigem_target_get_type(gamepad.gp.get()) == DualShock4Wired) {
         gamepad.feedback_queue->raise(gamepad_feedback_msg_t::make_motion_event_state(id.clientRelativeIndex, LI_MOTION_TYPE_ACCEL, 100));
@@ -376,6 +718,7 @@ namespace platf {
      */
     void free_target(int nr) {
       auto &gamepad = gamepads[nr];
+      unbind_feedback(gamepad.callback_id);
 
       if (gamepad.repeat_task) {
         task_pool.cancel(gamepad.repeat_task);
@@ -407,64 +750,12 @@ namespace platf {
     }
 
     /**
-     * @brief Pass rumble data back to the client.
-     * @param target The gamepad.
-     * @param largeMotor The large motor.
-     * @param smallMotor The small motor.
-     */
-    void rumble(target_t::pointer target, std::uint8_t largeMotor, std::uint8_t smallMotor) {
-      for (int x = 0; x < gamepads.size(); ++x) {
-        auto &gamepad = gamepads[x];
-
-        if (gamepad.gp.get() == target) {
-          // Convert from 8-bit to 16-bit values
-          const auto normalizedLargeMotor = vigem::scale_rumble(largeMotor);
-          // Don't resend duplicate rumble data
-          if (const auto normalizedSmallMotor = vigem::scale_rumble(smallMotor); normalizedSmallMotor != gamepad.last_rumble.data.rumble.highfreq || normalizedLargeMotor != gamepad.last_rumble.data.rumble.lowfreq) {
-            // We have to use the client-relative index when communicating back to the client
-            gamepad_feedback_msg_t msg = gamepad_feedback_msg_t::make_rumble(
-              gamepad.client_relative_index,
-              normalizedLargeMotor,
-              normalizedSmallMotor
-            );
-            gamepad.feedback_queue->raise(msg);
-            gamepad.last_rumble = msg;
-          }
-          return;
-        }
-      }
-    }
-
-    /**
-     * @brief Pass RGB LED data back to the client.
-     * @param target The gamepad.
-     * @param r The red channel.
-     * @param g The red channel.
-     * @param b The red channel.
-     */
-    void set_rgb_led(target_t::pointer target, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
-      for (int x = 0; x < gamepads.size(); ++x) {
-        auto &gamepad = gamepads[x];
-
-        if (gamepad.gp.get() == target) {
-          // Don't resend duplicate RGB data
-          if (r != gamepad.last_rgb_led.data.rgb_led.r || g != gamepad.last_rgb_led.data.rgb_led.g || b != gamepad.last_rgb_led.data.rgb_led.b) {
-            // We have to use the client-relative index when communicating back to the client
-            gamepad_feedback_msg_t msg = gamepad_feedback_msg_t::make_rgb_led(gamepad.client_relative_index, r, g, b);
-            gamepad.feedback_queue->raise(msg);
-            gamepad.last_rgb_led = msg;
-          }
-          return;
-        }
-      }
-    }
-
-    /**
      * @brief Detach all virtual gamepads and disconnect from the ViGEm client.
      */
     ~vigem_t() {
       if (client) {
         for (auto &gamepad : gamepads) {
+          unbind_feedback(gamepad.callback_id);
           if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
             auto status = vigem_target_remove(client.get(), gamepad.gp.get());
             if (!VIGEM_SUCCESS(status)) {
@@ -494,7 +785,7 @@ namespace platf {
       << "largeMotor: "sv << (int) largeMotor << std::endl
       << "smallMotor: "sv << (int) smallMotor;
 
-    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
+    task_pool.push(capture_feedback(reinterpret_cast<std::uintptr_t>(userdata), largeMotor, smallMotor));
   }
 
   void CALLBACK ds4_notify(
@@ -512,8 +803,7 @@ namespace platf {
       << util::hex(led_color.Green).to_string_view() << ' '
       << util::hex(led_color.Blue).to_string_view() << std::endl;
 
-    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
-    task_pool.push(&vigem_t::set_rgb_led, (vigem_t *) userdata, target, led_color.Red, led_color.Green, led_color.Blue);
+    task_pool.push(capture_feedback(reinterpret_cast<std::uintptr_t>(userdata), largeMotor, smallMotor, std::array<std::uint8_t, 3> {led_color.Red, led_color.Green, led_color.Blue}));
   }
 
   /**

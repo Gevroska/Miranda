@@ -13,6 +13,8 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <future>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +29,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -477,6 +480,12 @@ namespace rtsp_stream {
      * @param req Parsed RTSP request being handled.
      */
     void handle_msg(tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+      if (!authorized(session)) {
+        respond(sock, session, nullptr, 403, "Forbidden", req->sequenceNumber, {});
+        boost::system::error_code error;
+        sock.shutdown(boost::asio::socket_base::shutdown_both, error);
+        return;
+      }
       if (auto func = _map_cmd_cb.find(req->message.request.command); func != std::end(_map_cmd_cb)) {
         func->second(this, sock, session, std::move(req));
       } else {
@@ -504,7 +513,7 @@ namespace rtsp_stream {
       auto socket = std::move(next_socket);
 
       auto launch_session {launch_event.view(0s)};
-      if (launch_session) {
+      if (launch_session && launch_session->ready && authorized(*launch_session)) {
         // Associate the current RTSP session with this socket and start reading
         socket->session = launch_session;
         socket->read();
@@ -542,43 +551,164 @@ namespace rtsp_stream {
      *       the session will be discarded.
      * @param launch_session Streaming session information.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
-      // If a launch event is still pending, don't overwrite it.
-      if (launch_event.view(0s)) {
-        return;
+    bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      if (stopping || launch_event.view(0s) || !authorized(*launch_session, false)) {
+        return false;
       }
-
-      // Raise the new launch session to prepare for the RTSP handshake
+      tokens.emplace_back(launch_session);
+      std::erase_if(tokens, [](const auto &token) {
+        return token.expired();
+      });
       launch_event.raise(std::move(launch_session));
-
-      // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
       raised_timer.async_wait([this](const boost::system::error_code &ec) {
         if (!ec) {
           auto discarded = launch_event.pop(0s);
-          if (discarded) {
-            BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+          if (discarded && !discarded->admitted) {
+            discarded->cancelled = true;
           }
         }
       });
+      return true;
     }
 
     /**
-     * @brief Clear state for the oldest launch session.
-     * @param launch_session_id The ID of the session to clear.
+     * @brief Remove only the caller's reservation; accepted sockets retain a checked token.
+     * @param launch_session_id Original reservation identifier.
      */
     void session_clear(uint32_t launch_session_id) {
-      // We currently only support a single pending RTSP session,
-      // so the ID should always match the one for that session.
-      auto launch_session = launch_event.view(0s);
-      if (launch_session) {
-        if (launch_session->id != launch_session_id) {
-          BOOST_LOG(error) << "Attempted to clear unexpected session: "sv << launch_session_id << " vs "sv << launch_session->id;
-        } else {
-          raised_timer.cancel();
-          launch_event.pop();
+      auto pending = launch_event.view(0s);
+      if (pending && pending->id == launch_session_id) {
+        if (!pending->admitted) {
+          pending->cancelled = true;
+        }
+        raised_timer.cancel();
+        launch_event.pop(0s);
+      }
+    }
+
+    /**
+     * @brief Check a launch's current authority, including held accepted-socket tokens.
+     * @param session Original launch token.
+     * @param require_ready Whether completed source preparation is required.
+     * @return Whether the token may still dispatch RTSP.
+     */
+    bool authorized(const launch_session_t &session, bool require_ready = true) {
+      const auto client = nvhttp::current_client(session.client_uuid, session.client_cert);
+      return !session.cancelled && (!require_ready || session.ready) && client &&
+             client->revision == session.authorization_revision && permissions::allows(client->permissions, permissions::view);
+    }
+
+    /**
+     * @brief Claim the single stream admission before allocating any streaming resources.
+     * @param session Original launch token.
+     * @return Whether this is its first currently authorized ANNOUNCE.
+     */
+    bool claim(launch_session_t &session) {
+      if (session.admitted || !authorized(session)) {
+        return false;
+      }
+      session.admitted = true;
+      return true;
+    }
+
+    /**
+     * @brief Serialize control operations with socket dispatch without involving streaming threads.
+     * @param operation Operation to run and await on the RTSP owner.
+     * @return Operation result, if any.
+     */
+    template<class Function>
+    auto sync(Function operation) {
+      if (io_context.get_executor().running_in_this_thread()) {
+        return operation();
+      }
+      std::unique_lock lock {lifecycle_mutex};
+      if (stopping && shutdown_done.valid()) {
+        const auto done = shutdown_done;
+#ifdef SUNSHINE_TESTS
+        notify_owner("stopping_wait");
+#endif
+        lock.unlock();
+        done.wait();
+        lock.lock();
+      }
+      if (!running) {
+        return operation();
+      }
+      auto task = std::make_shared<std::packaged_task<decltype(operation())()>>(std::move(operation));
+      auto result = task->get_future();
+      asio::post(io_context, [task]() {
+        (*task)();
+      });
+#ifdef SUNSHINE_TESTS
+      notify_owner("operation_posted");
+#endif
+      lock.unlock();
+      return result.get();
+    }
+
+    /**
+     * @brief Post control-thread launch cleanup without waiting for an owner joining that thread.
+     * @param id Launch reservation identifier.
+     */
+    void post_clear(uint32_t id) {
+      std::lock_guard lock {lifecycle_mutex};
+      if (stopping) {
+        return;
+      }
+      if (!running) {
+        session_clear(id);
+      } else {
+        asio::post(io_context, [this, id]() {
+          session_clear(id);
+        });
+      }
+    }
+
+    /**
+     * @brief Reconcile one pairing after its durable authorization change.
+     * @param uuid Original pairing UUID.
+     * @param cert Original exact paired certificate.
+     * @param destroy Whether retained controllers must be destroyed.
+     */
+    void reconcile(std::string_view uuid, std::string_view cert, bool destroy) {
+      for (auto &weak : tokens) {
+        if (auto token = weak.lock(); token && token->client_uuid == uuid) {
+          token->cancelled = true;
+          session_clear(token->id);
         }
       }
+      const auto client = nvhttp::current_client(uuid, cert);
+      auto lock = _session_slots.lock();
+      for (auto it = _session_slots->begin(); it != _session_slots->end();) {
+        auto &session = **it;
+        if (stream::session::client_uuid(session) != uuid) {
+          ++it;
+        } else if (!client || !permissions::allows(client->permissions, permissions::view)) {
+          stream::session::stop(session);
+          stream::session::join(session);
+          it = _session_slots->erase(it);
+        } else {
+          stream::session::update_permissions(session, client->permissions);
+          ++it;
+        }
+      }
+      if (destroy) {
+        input::terminate_gamepads(cert);
+      }
+    }
+
+    /**
+     * @brief Invalidate every token, including accepted sockets no longer in the pending slot.
+     */
+    void invalidate_launches() {
+      for (auto &weak : tokens) {
+        if (auto token = weak.lock()) {
+          token->cancelled = true;
+        }
+      }
+      raised_timer.cancel();
+      launch_event.pop(0s);
     }
 
     /**
@@ -621,6 +751,13 @@ namespace rtsp_stream {
      * @param cert Certificate data or object used by the operation.
      */
     void clear_by_cert(std::string_view cert) {
+      for (auto &weak : tokens) {
+        if (auto token = weak.lock(); token && token->client_cert == cert) {
+          token->cancelled = true;
+          session_clear(token->id);
+        }
+      }
+
       auto lg = _session_slots.lock();
       for (auto i = _session_slots->begin(); i != _session_slots->end();) {
         auto &slot = *(*i);
@@ -670,10 +807,88 @@ namespace rtsp_stream {
      * @brief Stop the RTSP server.
      */
     void stop() {
-      acceptor.close();
+      std::unique_lock lock {lifecycle_mutex};
+      if (stopping) {
+        const auto done = shutdown_done;
+        lock.unlock();
+        if (done.valid()) {
+          done.wait();
+        }
+        return;
+      }
+      stopping = true;
+      auto completion = std::make_shared<std::promise<void>>();
+      shutdown_done = completion->get_future().share();
+      const auto finish = [this, completion]() {
+#ifdef SUNSHINE_TESTS
+        notify_owner("stop_begin");
+#endif
+        invalidate_launches();
+        boost::system::error_code error;
+        acceptor.close(error);
+        clear();
+        {
+          std::lock_guard lock {lifecycle_mutex};
+          running = false;
+          stopped = true;
+        }
+        completion->set_value();
+      };
+      if (running) {
+        asio::post(io_context, finish);
+        const auto done = shutdown_done;
+        lock.unlock();
+        done.wait();
+      } else {
+        lock.unlock();
+        finish();
+      }
       io_context.stop();
-      clear();
     }
+
+    /**
+     * @brief Publish the owner before requests may post and restart its context for isolated tests.
+     */
+    void begin() {
+      std::lock_guard lock {lifecycle_mutex};
+      io_context.restart();
+      running = true;
+      stopping = false;
+      stopped = false;
+      shutdown_done = {};
+    }
+
+#ifdef SUNSHINE_TESTS
+    std::function<void(std::string_view)> owner_hook;  ///< Deterministic lifecycle boundaries for tests.
+    std::mutex owner_hook_mutex;  ///< Protects test observer publication across the owner and posting threads.
+
+    void notify_owner(std::string_view event) {
+      std::function<void(std::string_view)> hook;
+      {
+        std::lock_guard lock {owner_hook_mutex};
+        hook = owner_hook;
+      }
+      if (hook) {
+        hook(event);
+      }
+    }
+
+    void reset_test_owner() {
+      std::lock_guard lock {lifecycle_mutex};
+      stopping = false;
+      stopped = false;
+      shutdown_done = {};
+      std::lock_guard observer {owner_hook_mutex};
+      owner_hook = {};
+    }
+
+    auto test_work_guard() {
+      return asio::make_work_guard(io_context);
+    }
+#endif
+
+    std::atomic_bool stopping {false};
+    std::atomic_bool stopped {false};  ///< Owner loop termination follows the serialized stop operation.
 
   private:
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
@@ -685,6 +900,10 @@ namespace rtsp_stream {
     boost::asio::steady_timer raised_timer {io_context};
 
     std::shared_ptr<socket_t> next_socket;
+    std::vector<std::weak_ptr<launch_session_t>> tokens;  ///< Accepted-socket tokens that a global Stop must invalidate.
+    std::recursive_mutex lifecycle_mutex;  ///< Protects offline direct execution versus owner dispatch.
+    bool running = false;  ///< A live RTSP owner will drain posted operations.
+    std::shared_future<void> shutdown_done;  ///< Completes all accepted work before offline calls may proceed.
   };
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
@@ -692,33 +911,148 @@ namespace rtsp_stream {
   /**
    * @brief Queue a launch session until the RTSP client connects.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.sync([&]() {
+      launch_session->ready = true;
+      return server.session_raise(launch_session);
+    });
+  }
+
+  int prepare_launch(std::shared_ptr<launch_session_t> launch_session, std::function<int()> prepare, std::function<void()> rollback) {
+    return server.sync([&]() {
+      if (!server.authorized(*launch_session, false)) {
+        return 403;
+      }
+      if (!server.session_raise(launch_session)) {
+        return 503;
+      }
+      bool completed = false;
+      auto guard = util::fail_guard([&]() {
+        if (!completed) {
+          launch_session->cancelled = true;
+          server.session_clear(launch_session->id);
+          if (rollback) {
+            rollback();
+          }
+        }
+      });
+      const auto result = prepare();
+      if (result != 200) {
+        return result;
+      }
+      if (!server.authorized(*launch_session, false)) {
+        return 403;
+      }
+      launch_session->ready = true;
+      completed = true;
+      return 200;
+    });
+  }
+
+  bool authorize_operation(std::string_view uuid, std::string_view cert, permissions::mask_t required, std::function<void()> operation) {
+    return server.sync([&]() {
+      const auto client = nvhttp::current_client(uuid, cert);
+      if (!client || (required && !permissions::allows(client->permissions, required))) {
+        return false;
+      }
+      operation();
+      return true;
+    });
+  }
+
+  void reconcile_client(std::string_view uuid, std::string_view cert, bool destroy) {
+    server.sync([&]() {
+      server.reconcile(uuid, cert, destroy);
+    });
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
-    server.session_clear(launch_session_id);
+    server.post_clear(launch_session_id);
   }
 
   int session_count() {
-    // Ensure session_count is up-to-date
-    server.clear(false);
-
-    return server.session_count();
+    return server.sync([]() {
+      server.clear(false);
+      return server.session_count();
+    });
   }
 
   void terminate_sessions() {
-    server.clear(true);
-    input::terminate_gamepads();
+    stop_application({});
   }
 
-  /**
-   * @brief Terminate active sessions associated with a client certificate.
-   */
-  void terminate_sessions_by_cert(std::string_view cert) {
-    server.clear_by_cert(cert);
-    input::terminate_gamepads(cert);
+  void stop_application(std::function<void()> stop) {
+    server.sync([&]() {
+      server.invalidate_launches();
+      server.clear(true);
+      input::terminate_gamepads();
+      if (stop) {
+        stop();
+      }
+    });
   }
+
+  void terminate_sessions_by_cert(std::string_view cert) {
+    server.sync([&]() {
+      server.clear_by_cert(cert);
+      input::terminate_gamepads(cert);
+    });
+  }
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /**
+     * @brief Own only the production admission executor, without network or media initialization.
+     */
+    class owner_t: public platf::deinit_t {
+      decltype(server.test_work_guard()) guard {server.test_work_guard()};  ///< Keeps an idle test executor runnable.
+      std::jthread thread;  ///< Actual single RTSP owner.
+
+    public:
+      owner_t() {
+        server.begin();
+        thread = std::jthread([]() {
+          while (!server.stopped) {
+            server.iterate();
+          }
+        });
+      }
+
+      ~owner_t() override {
+        server.stop();
+        thread.join();
+        server.reset_test_owner();
+      }
+    };
+
+    std::unique_ptr<platf::deinit_t> start_owner() {
+      return std::make_unique<owner_t>();
+    }
+
+    void stop_owner() {
+      server.stop();
+    }
+
+    void set_owner_hook(std::function<void(std::string_view)> hook) {
+      server.sync([&]() {
+        std::lock_guard lock {server.owner_hook_mutex};
+        server.owner_hook = std::move(hook);
+      });
+    }
+
+    bool token_authorized(const std::shared_ptr<launch_session_t> &launch) {
+      return server.sync([&]() {
+        return server.authorized(*launch);
+      });
+    }
+
+    bool claim_launch(const std::shared_ptr<launch_session_t> &launch) {
+      return server.sync([&]() {
+        return server.claim(*launch);
+      });
+    }
+  }  // namespace test_support
+#endif
 
   /**
    * @brief Send the serialized response over the active socket.
@@ -1248,6 +1582,11 @@ namespace rtsp_stream {
       return;
     }
 
+    if (!rtsp_server->claim(session)) {
+      respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
+      return;
+    }
+
     auto stream_session = stream::session::alloc(config, session);
     rtsp_server->insert(stream_session);
 
@@ -1255,6 +1594,8 @@ namespace rtsp_stream {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       rtsp_server->remove(stream_session);
+      session.cancelled = true;
+      rtsp_server->session_clear(session.id);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
@@ -1300,11 +1641,12 @@ namespace rtsp_stream {
       return;
     }
 
-    std::jthread rtsp_thread {[&shutdown_event] {
+    server.begin();
+    std::jthread rtsp_thread {[] {
       platf::set_thread_name("rtsp::handler");
       auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
 
-      while (!shutdown_event->peek()) {
+      while (!server.stopped) {
         server.iterate();
 
         if (broadcast_shutdown_event->peek()) {
