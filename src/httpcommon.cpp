@@ -284,7 +284,9 @@ namespace http {
       rename_close,  ///< Report checked source-handle closure after the rename.
       verify,  ///< Verify the committed candidate.
       restore,  ///< Restore a verified original.
-      cleanup  ///< Remove a known transaction-owned file.
+      cleanup,  ///< Remove a known transaction-owned file.
+      guard_open,  ///< Open the verified backup while the original guard remains held.
+      guard_close  ///< Report checked original-guard closure after transferring ownership.
     };
   #endif
 
@@ -1122,6 +1124,29 @@ namespace http {
           state_require(state_stage(state_stage_e::backup, destination, temporary, backup) && CreateHardLinkW(backup.c_str(), destination.c_str(), nullptr), "State original hard-link backup could not be created");
           backup_owned = true;
           state_require(state_path_matches(backup, *original) && state_path_matches(destination, *original), "State hard-link backup identity, bytes or policy could not be verified");
+          if (!state_stage(state_stage_e::guard_open, destination, temporary, backup)) {
+            throw state_file_error_t {"State backup guard open was refused", GetLastError()};
+          }
+          state_handle_t backup_guard {state_open(backup, GENERIC_READ | DELETE)};
+          if (backup_guard.value == INVALID_HANDLE_VALUE) {
+            throw state_file_error_t {"State backup could not be guarded against ordinary writers", GetLastError()};
+          }
+          state_require(state_same(*original, state_capture(backup_guard.value, backup)) && state_same(*original, state_capture(original_handle.value, destination)) && state_path_matches(backup, *original) && state_path_matches(destination, *original), "State original or backup changed during guard handoff");
+          // The function-lifetime owner must hold the verified backup guard before the old guard closes.
+          auto old_guard = std::exchange(original_handle.value, std::exchange(backup_guard.value, INVALID_HANDLE_VALUE));
+          const auto closing = std::exchange(old_guard, INVALID_HANDLE_VALUE);
+          const auto closed = CloseHandle(closing);
+          const DWORD close_error = closed ? ERROR_SUCCESS : GetLastError();
+          // Observe or fault closure only after the single native close attempt; keep its real error intact.
+          const bool close_accepted = state_stage(state_stage_e::guard_close, destination, temporary, backup);
+          const DWORD injected_close_error = close_accepted ? ERROR_SUCCESS : GetLastError();
+          if (!closed || !close_accepted) {
+            if (!closed && !close_accepted) {
+              state_log_failure({"State original guard close was refused", injected_close_error});
+            }
+            throw state_file_error_t {"State original guard could not be closed", closed ? injected_close_error : close_error};
+          }
+          state_require(state_same(*original, state_capture(original_handle.value, backup)) && state_path_matches(backup, *original) && state_path_matches(destination, *original), "State original or backup changed after guard handoff");
         }
         auto creation = original ? original->security : std::vector<std::uint8_t> {};
         PSECURITY_DESCRIPTOR initial = nullptr;
@@ -1175,7 +1200,7 @@ namespace http {
         prepared = expected;
         state_require(state_path_matches(temporary, *prepared), "State closed temporary bytes or metadata failed verification");
         if (original) {
-          state_require(state_same(*original, state_capture(original_handle.value, destination)) && state_path_matches(destination, *original) && state_path_matches(backup, *original), "State original or backup changed before commit");
+          state_require(state_same(*original, state_capture(original_handle.value, backup)) && state_path_matches(destination, *original) && state_path_matches(backup, *original), "State original or backup changed before commit");
         } else {
           state_require(state_missing(destination), "State destination appeared before initial commit");
         }
@@ -1188,7 +1213,7 @@ namespace http {
         state_require(state_stage(state_stage_e::rename, destination, temporary, backup), "State replacing rename was refused");
         state_require((original ? state_path_matches(destination, *original) && state_path_id(destination, original->identity) : state_missing(destination)) && state_path_matches(temporary, *prepared), "State identity or policy changed at the commit boundary");
         state_rename(temporary, destination, backup, *prepared, original.has_value(), [&]() {
-          return original ? state_path_matches(destination, *original) && state_path_matches(backup, *original) && state_same(*original, state_capture(original_handle.value, destination)) : state_missing(destination);
+          return original ? state_path_matches(destination, *original) && state_path_matches(backup, *original) && state_same(*original, state_capture(original_handle.value, backup)) : state_missing(destination);
         });
         // Only this post-rename initial-absence boundary permits native filename tunneling of creation time.
         const auto committed_creation_time = original ? state_creation_time_e::exact : state_creation_time_e::initial_commit;

@@ -72,7 +72,9 @@ namespace http {
       rename_close,  ///< Report checked source-handle closure after the rename.
       verify,  ///< Verify the committed candidate.
       restore,  ///< Restore a verified original backup.
-      cleanup  ///< Delete a known transaction-owned file.
+      cleanup,  ///< Delete a known transaction-owned file.
+      guard_open,  ///< Observe the original guard before opening the verified backup guard.
+      guard_close  ///< Report checked original-guard closure after transferring ownership.
     };
     /**
      * @brief Fault a real Windows transaction stage using only fixture-owned paths.

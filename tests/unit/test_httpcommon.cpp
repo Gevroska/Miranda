@@ -206,6 +206,63 @@ protected:
     return http::test_support::state_file_security_matches(std::move(expected), std::move(current));
   }
 
+  /** @brief Independently captured original components for exact precommit failure checks. */
+  struct fixture_snapshot_t {
+    BY_HANDLE_FILE_INFORMATION identity {};  ///< Original file identity and creation time.
+    std::string bytes;  ///< Synthetic bytes, never printed in assertion output.
+    std::vector<std::uint8_t> security;  ///< Exact owner/group/ordered DACL and controls.
+    std::array<std::vector<std::uint8_t>, 3> selected;  ///< Every separately selected policy.
+  };
+
+  /** @brief Observe a test-owned original without excluding compatible transaction guards. */
+  fixture_snapshot_t fixture_snapshot(const std::filesystem::path &path) {
+    fixture_snapshot_t result;
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+      ADD_FAILURE() << "Fixture snapshot could not open";
+      return result;
+    }
+    auto close = util::fail_guard([&]() {
+      EXPECT_TRUE(CloseHandle(handle));
+    });
+    EXPECT_TRUE(GetFileInformationByHandle(handle, &result.identity));
+    result.bytes = read_fixture_handle(handle);
+    result.security = security_snapshot(path);
+    EXPECT_TRUE(same_security(result.security, result.security));
+    constexpr std::array<DWORD, 3> selectors {LABEL_SECURITY_INFORMATION, ATTRIBUTE_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION};
+    for (std::size_t index = 0; index < selectors.size(); ++index) {
+      result.selected[index] = security_snapshot(path, selectors[index]);
+      EXPECT_TRUE(http::test_support::state_selected_security_matches(result.selected[index], result.selected[index], index == 2));
+    }
+    return result;
+  }
+
+  /** @brief Require exact identity, bytes, creation time, attributes and every authority component. */
+  void expect_fixture_snapshot(const std::filesystem::path &path, const fixture_snapshot_t &expected) {
+    const auto current = fixture_snapshot(path);
+    EXPECT_EQ(current.identity.dwVolumeSerialNumber, expected.identity.dwVolumeSerialNumber);
+    EXPECT_EQ(current.identity.nFileIndexHigh, expected.identity.nFileIndexHigh);
+    EXPECT_EQ(current.identity.nFileIndexLow, expected.identity.nFileIndexLow);
+    EXPECT_EQ(CompareFileTime(&current.identity.ftCreationTime, &expected.identity.ftCreationTime), 0);
+    EXPECT_EQ(current.identity.dwFileAttributes, expected.identity.dwFileAttributes);
+    EXPECT_TRUE(current.bytes == expected.bytes);
+    EXPECT_TRUE(same_security(expected.security, current.security));
+    for (std::size_t index = 0; index < expected.selected.size(); ++index) {
+      EXPECT_TRUE(http::test_support::state_selected_security_matches(expected.selected[index], current.selected[index], index == 2));
+    }
+  }
+
+  /** @brief Prove an ordinary data writer cannot open an alias of the guarded original. */
+  void expect_fixture_writer_denied(const std::filesystem::path &path) {
+    HANDLE writer = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const auto open_error = writer == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+    EXPECT_EQ(writer, INVALID_HANDLE_VALUE);
+    EXPECT_EQ(open_error, ERROR_SHARING_VIOLATION);
+    if (writer != INVALID_HANDLE_VALUE) {
+      EXPECT_TRUE(CloseHandle(writer));
+    }
+  }
+
   /**
    * @brief Describe fixture authority differences without disclosing SIDs or descriptor bytes.
    * @param expected Reference fixture snapshot.
@@ -772,8 +829,25 @@ TEST_F(StateFileTransactionTest, CompatibleReaderKeepsOldBytesWhileThePathPublis
     http::test_support::set_state_file_hook({});
   });
   std::string prepared_bytes;
-  bool verified = false;
-  http::test_support::set_state_file_hook([&](auto stage, const auto &destination, const auto &source, const auto &) -> std::optional<std::uint32_t> {
+  bool verified = false, old_only = false, overlapping = false, new_only = false;
+  std::filesystem::path handoff_backup;
+  http::test_support::set_state_file_hook([&](auto stage, const auto &destination, const auto &source, const auto &backup) -> std::optional<std::uint32_t> {
+    if (stage == stage_t::guard_open) {
+      handoff_backup = backup;
+      old_only = true;
+    }
+    if (stage == stage_t::metadata && !handoff_backup.empty() && destination == handoff_backup && !overlapping) {
+      overlapping = true;
+      EXPECT_TRUE(read_fixture_handle(reader) == original);
+      EXPECT_TRUE(read_fixture_bytes(file) == original);
+      EXPECT_TRUE(read_fixture_bytes(handoff_backup) == original);
+    }
+    if (stage == stage_t::guard_open || stage == stage_t::guard_close) {
+      EXPECT_TRUE(read_fixture_handle(reader) == original);
+      EXPECT_TRUE(read_fixture_bytes(destination) == original);
+      EXPECT_TRUE(read_fixture_bytes(backup) == original);
+      new_only = stage == stage_t::guard_close;
+    }
     if (stage == stage_t::rename_api) {
       prepared_bytes = read_fixture_bytes(source);
       EXPECT_TRUE(prepared_bytes.contains("complete replacement"));
@@ -791,6 +865,7 @@ TEST_F(StateFileTransactionTest, CompatibleReaderKeepsOldBytesWhileThePathPublis
   }));
   http::test_support::set_state_file_hook({});
   EXPECT_TRUE(verified);
+  EXPECT_TRUE(old_only && overlapping && new_only);
   EXPECT_TRUE(read_fixture_handle(reader) == original);
   EXPECT_TRUE(state_bytes() == prepared_bytes);
   EXPECT_TRUE(same_security(policy, security_snapshot(file)));
@@ -802,15 +877,6 @@ TEST_F(StateFileTransactionTest, OriginalAndBackupAliasesExcludeDataWritersThrou
   const auto policy = security_snapshot(file);
   const auto alias = directory / "original-alias.json";
   ASSERT_TRUE(CreateHardLinkW(alias.c_str(), file.c_str(), nullptr));
-  const auto assert_writer_denied = [&](const auto &path) {
-    HANDLE writer = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    const auto open_error = writer == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
-    EXPECT_EQ(writer, INVALID_HANDLE_VALUE);
-    EXPECT_EQ(open_error, ERROR_SHARING_VIOLATION);
-    if (writer != INVALID_HANDLE_VALUE) {
-      EXPECT_TRUE(CloseHandle(writer));
-    }
-  };
   for (const auto &path : {file, alias}) {
     HANDLE writer = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     ASSERT_NE(writer, INVALID_HANDLE_VALUE);
@@ -826,20 +892,37 @@ TEST_F(StateFileTransactionTest, OriginalAndBackupAliasesExcludeDataWritersThrou
     EXPECT_TRUE(state_bytes() == original);
   }
   unsigned rename_sources = 0;
-  bool saw_restore = false;
+  bool saw_restore = false, old_only = false, overlapping = false, new_only = false;
+  std::filesystem::path handoff_backup;
   auto clear = util::fail_guard([]() {
     http::test_support::set_state_file_hook({});
   });
   http::test_support::set_state_file_hook([&](auto stage, const auto &destination, const auto &source, const auto &backup) -> std::optional<std::uint32_t> {
+    if (stage == stage_t::guard_open) {
+      handoff_backup = backup;
+      old_only = true;
+    }
+    if (stage == stage_t::metadata && !handoff_backup.empty() && destination == handoff_backup && !overlapping) {
+      overlapping = true;
+      for (const auto &path : {file, handoff_backup, alias}) {
+        expect_fixture_writer_denied(path);
+      }
+    }
+    if (stage == stage_t::guard_open || stage == stage_t::guard_close) {
+      for (const auto &path : {destination, backup, alias}) {
+        expect_fixture_writer_denied(path);
+      }
+      new_only = stage == stage_t::guard_close;
+    }
     if (stage == stage_t::rename_api || stage == stage_t::restore) {
-      assert_writer_denied(alias);
-      assert_writer_denied(backup);
+      expect_fixture_writer_denied(alias);
+      expect_fixture_writer_denied(backup);
     }
     if (stage == stage_t::rename_api) {
       ++rename_sources;
-      assert_writer_denied(source);
+      expect_fixture_writer_denied(source);
       if (source != backup) {
-        assert_writer_denied(destination);
+        expect_fixture_writer_denied(destination);
       }
     }
     if (stage == stage_t::restore) {
@@ -853,6 +936,7 @@ TEST_F(StateFileTransactionTest, OriginalAndBackupAliasesExcludeDataWritersThrou
   http::test_support::set_state_file_hook({});
   EXPECT_EQ(rename_sources, 2U);
   EXPECT_TRUE(saw_restore);
+  EXPECT_TRUE(old_only && overlapping && new_only);
   EXPECT_TRUE(state_bytes() == original);
   EXPECT_TRUE(read_fixture_bytes(alias) == original);
   EXPECT_TRUE(same_security(policy, security_snapshot(file)));
@@ -860,6 +944,310 @@ TEST_F(StateFileTransactionTest, OriginalAndBackupAliasesExcludeDataWritersThrou
     tree.put("fixture", "recovered after guarded rollback");
   }));
   EXPECT_TRUE(read_fixture_bytes(alias) == original);
+}
+
+TEST_F(StateFileTransactionTest, GuardOpenAndCheckedCloseFailuresRemainPreEffectAndPermitExactRetry) {
+  using stage_t = http::test_support::state_file_stage_e;
+  const auto alias = directory / "handoff-original-alias.json";
+  ASSERT_TRUE(CreateHardLinkW(alias.c_str(), file.c_str(), nullptr));
+  for (const auto rejected : {stage_t::guard_open, stage_t::guard_close}) {
+    SCOPED_TRACE(static_cast<int>(rejected));
+    const auto original = fixture_snapshot(file);
+    std::filesystem::path candidate;
+    bool reached = false, prepared = false, wrote_or_renamed = false;
+    http::test_support::set_state_security_hook([&](auto, const auto &) {
+      prepared = true;
+    });
+    http::test_support::set_state_update_hook([&]() {
+      prepared = true;
+    });
+    http::test_support::set_state_file_hook([&](auto stage, const auto &destination, const auto &temporary, const auto &backup) -> std::optional<std::uint32_t> {
+      if (stage == stage_t::guard_open) {
+        candidate = temporary;
+      }
+      if (stage == stage_t::metadata && !candidate.empty() && destination == candidate) {
+        prepared = true;
+      }
+      if (stage == stage_t::write || stage == stage_t::flush || stage == stage_t::close || stage == stage_t::rename || stage == stage_t::rename_open || stage == stage_t::rename_api || stage == stage_t::rename_close || stage == stage_t::verify) {
+        wrote_or_renamed = true;
+      }
+      if (stage != rejected) {
+        return std::nullopt;
+      }
+      reached = true;
+      EXPECT_FALSE(std::filesystem::exists(temporary));
+      for (const auto &path : {destination, backup, alias}) {
+        expect_fixture_writer_denied(path);
+        expect_fixture_snapshot(path, original);
+      }
+      return ERROR_INVALID_HANDLE;
+    });
+    EXPECT_FALSE(http::update_state_file(file.string(), [](auto &tree) {
+      tree.put("fixture", "unpublished guard failure");
+    }));
+    http::test_support::set_state_file_hook({});
+    http::test_support::set_state_security_hook({});
+    http::test_support::set_state_update_hook({});
+    EXPECT_TRUE(reached);
+    EXPECT_FALSE(prepared || wrote_or_renamed);
+    expect_fixture_snapshot(file, original);
+    expect_fixture_snapshot(alias, original);
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator()), 2);
+    ASSERT_TRUE(http::update_state_file(file.string(), [](auto &tree) {
+      tree.put("fixture", "clean retry after guard failure");
+    }));
+    expect_fixture_snapshot(alias, original);
+    ASSERT_TRUE(DeleteFileW(alias.c_str()));
+    ASSERT_TRUE(CreateHardLinkW(alias.c_str(), file.c_str(), nullptr));
+  }
+}
+
+TEST_F(StateFileTransactionTest, HandoffSelectorFailuresRejectBothOverlappingAndTransferredGuardsBeforePreparation) {
+  using stage_t = http::test_support::state_file_stage_e;
+  for (const auto boundary : {stage_t::guard_open, stage_t::guard_close}) {
+    for (const auto rejected : {stage_t::metadata, stage_t::label, stage_t::attributes, stage_t::scope}) {
+      SCOPED_TRACE(static_cast<int>(boundary));
+      SCOPED_TRACE(static_cast<int>(rejected));
+      const auto original = fixture_snapshot(file);
+      std::filesystem::path backup;
+      bool reached = false, prepared = false;
+      http::test_support::set_state_security_hook([&](auto, const auto &) {
+        prepared = true;
+      });
+      http::test_support::set_state_file_hook([&](auto stage, const auto &path, const auto &temporary, const auto &old_backup) -> std::optional<std::uint32_t> {
+        if (stage == boundary) {
+          backup = old_backup;
+          EXPECT_FALSE(std::filesystem::exists(temporary));
+        }
+        if (!reached && !backup.empty() && stage == rejected && path == backup) {
+          reached = true;
+          expect_fixture_writer_denied(file);
+          expect_fixture_writer_denied(backup);
+          return ERROR_ACCESS_DENIED;
+        }
+        return std::nullopt;
+      });
+      EXPECT_FALSE(http::update_state_file(file.string(), [](auto &tree) {
+        tree.put("fixture", "unreadable guard authority");
+      }));
+      http::test_support::set_state_file_hook({});
+      http::test_support::set_state_security_hook({});
+      EXPECT_TRUE(reached);
+      EXPECT_FALSE(prepared);
+      expect_fixture_snapshot(file, original);
+      EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator()), 1);
+      ASSERT_TRUE(http::update_state_file(file.string(), [](auto &tree) {
+        tree.put("fixture", "clean retry after handoff selector refusal");
+      }));
+    }
+  }
+}
+
+TEST_F(StateFileTransactionTest, HandoffRejectsRealOrderedDaclAndControlDriftWithoutRepairingAuthority) {
+  using stage_t = http::test_support::state_file_stage_e;
+  auto baseline = security_from_sddl(L"D:P(A;;FA;;;OW)(A;;FR;;;BU)");
+  ASSERT_FALSE(baseline.empty());
+  unsigned next = 0;
+  for (const auto boundary : {stage_t::guard_open, stage_t::guard_close}) {
+    for (const auto text : {L"D:P(A;;FA;;;OW)(A;;FW;;;BU)", L"D:P(A;;FR;;;BU)(A;;FA;;;OW)", L"D:(A;;FA;;;OW)(A;;FR;;;BU)"}) {
+      SCOPED_TRACE(static_cast<int>(boundary));
+      SCOPED_TRACE(next);
+      const auto destination = directory / ("authority-drift-" + std::to_string(++next) + ".json");
+      ASSERT_TRUE(http::update_state_file(destination.string(), [](auto &tree) {
+        tree.put("fixture", "original authority drift state");
+      }));
+      ASSERT_TRUE(SetFileSecurityW(destination.c_str(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, baseline.data()));
+      const auto original = fixture_snapshot(destination);
+      ASSERT_FALSE(unprotected(original.security));
+      auto changed = security_from_sddl(text);
+      ASSERT_FALSE(changed.empty());
+      const bool change_control = unprotected(changed);
+      PACL changed_acl = nullptr;
+      BOOL present = FALSE, defaulted = FALSE;
+      ASSERT_TRUE(GetSecurityDescriptorDacl(changed.data(), &present, &changed_acl, &defaulted));
+      ASSERT_TRUE(present && changed_acl);
+      std::vector<std::uint8_t> changed_policy;
+      std::filesystem::path backup;
+      bool mutated = false, observed_drift = false, prepared = false;
+      http::test_support::set_state_security_hook([&](auto, const auto &) {
+        prepared = true;
+      });
+      http::test_support::set_state_file_hook([&](auto stage, const auto &path, const auto &temporary, const auto &old_backup) -> std::optional<std::uint32_t> {
+        if (stage == boundary) {
+          EXPECT_FALSE(std::filesystem::exists(temporary));
+          if (change_control) {
+            auto name = path.wstring();
+            const auto result = SetNamedSecurityInfoW(name.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, changed_acl, nullptr);
+            EXPECT_EQ(result, ERROR_SUCCESS);
+            mutated = result == ERROR_SUCCESS;
+          } else {
+            mutated = SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, changed.data());
+          }
+          EXPECT_TRUE(mutated);
+          changed_policy = security_snapshot(path);
+          const bool valid_authority = same_security(changed_policy, changed_policy);
+          EXPECT_TRUE(valid_authority);
+          const bool same_authority = same_security(original.security, changed_policy);
+          EXPECT_FALSE(same_authority);
+          const bool control_changed = !change_control || unprotected(changed_policy);
+          EXPECT_TRUE(control_changed);
+          observed_drift = valid_authority && !same_authority && control_changed;
+          backup = old_backup;
+        }
+        return std::nullopt;
+      });
+      const bool saved = http::update_state_file(destination.string(), [](auto &tree) {
+        tree.put("fixture", "unpublished authority drift state");
+      });
+      http::test_support::set_state_file_hook({});
+      http::test_support::set_state_security_hook({});
+      ASSERT_TRUE(mutated);
+      ASSERT_TRUE(observed_drift);
+      EXPECT_FALSE(saved);
+      EXPECT_FALSE(prepared);
+      auto externally_changed = original;
+      externally_changed.security = changed_policy;
+      expect_fixture_snapshot(destination, externally_changed);
+      expect_fixture_snapshot(backup, externally_changed);
+      EXPECT_FALSE(http::update_state_file(destination.string(), [](auto &tree) {
+        tree.put("fixture", "blocked after authority drift");
+      }));
+      expect_fixture_snapshot(destination, externally_changed);
+    }
+  }
+}
+
+TEST_F(StateFileTransactionTest, HandoffRefusesDeletedOrSubstitutedBackupBeforePreparingPayload) {
+  using stage_t = http::test_support::state_file_stage_e;
+  unsigned next = 0;
+  for (const auto boundary : {stage_t::guard_open, stage_t::guard_close}) {
+    for (const bool substitute : {false, true}) {
+      SCOPED_TRACE(static_cast<int>(boundary));
+      SCOPED_TRACE(substitute);
+      const auto suffix = std::to_string(++next);
+      const auto destination = directory / ("backup-target-" + suffix + ".json");
+      const auto external = directory / ("backup-external-" + suffix + ".json");
+      const auto displaced = directory / ("displaced-backup-" + suffix + ".json");
+      ASSERT_TRUE(http::update_state_file(destination.string(), [](auto &tree) {
+        tree.put("fixture", "original backup target");
+      }));
+      ASSERT_TRUE(http::update_state_file(external.string(), [](auto &tree) {
+        tree.put("fixture", "unrelated backup substitute");
+      }));
+      const auto original = fixture_snapshot(destination);
+      const auto unrelated = fixture_snapshot(external);
+      std::filesystem::path backup, temporary;
+      bool changed = false, prepared = false, published = false;
+      http::test_support::set_state_security_hook([&](auto, const auto &) {
+        prepared = true;
+      });
+      http::test_support::set_state_file_hook([&](auto stage, const auto &, const auto &candidate, const auto &old_backup) -> std::optional<std::uint32_t> {
+        if (stage == stage_t::write || stage == stage_t::rename || stage == stage_t::rename_api || stage == stage_t::verify) {
+          published = true;
+        }
+        if (stage == boundary) {
+          backup = old_backup;
+          temporary = candidate;
+          EXPECT_FALSE(std::filesystem::exists(temporary));
+          if (substitute) {
+            changed = MoveFileExW(backup.c_str(), displaced.c_str(), MOVEFILE_WRITE_THROUGH) && CreateHardLinkW(backup.c_str(), external.c_str(), nullptr);
+          } else {
+            changed = DeleteFileW(backup.c_str());
+          }
+          EXPECT_TRUE(changed);
+        }
+        return std::nullopt;
+      });
+      EXPECT_FALSE(http::update_state_file(destination.string(), [](auto &tree) {
+        tree.put("fixture", "unpublished after backup interference");
+      }));
+      http::test_support::set_state_file_hook({});
+      http::test_support::set_state_security_hook({});
+      ASSERT_TRUE(changed);
+      EXPECT_FALSE(prepared || published);
+      EXPECT_FALSE(std::filesystem::exists(temporary));
+      expect_fixture_snapshot(destination, original);
+      expect_fixture_snapshot(external, unrelated);
+      if (substitute) {
+        expect_fixture_snapshot(backup, unrelated);
+        expect_fixture_snapshot(displaced, original);
+      } else {
+        EXPECT_FALSE(std::filesystem::exists(backup));
+      }
+    }
+  }
+}
+
+TEST_F(StateFileTransactionTest, HandoffNeverOverwritesUnrelatedDestinationAndRetainsTheOriginalBackup) {
+  using stage_t = http::test_support::state_file_stage_e;
+  for (const auto boundary : {stage_t::guard_open, stage_t::guard_close}) {
+    SCOPED_TRACE(static_cast<int>(boundary));
+    const auto suffix = std::to_string(static_cast<int>(boundary));
+    const auto destination = directory / ("destination-target-" + suffix + ".json");
+    const auto external = directory / ("destination-external-" + suffix + ".json");
+    const auto displaced = directory / ("displaced-destination-" + suffix + ".json");
+    ASSERT_TRUE(http::update_state_file(destination.string(), [](auto &tree) {
+      tree.put("fixture", "original handoff destination");
+    }));
+    ASSERT_TRUE(http::update_state_file(external.string(), [](auto &tree) {
+      tree.put("fixture", "unrelated handoff destination");
+    }));
+    const auto original = fixture_snapshot(destination);
+    const auto unrelated = fixture_snapshot(external);
+    std::filesystem::path backup, temporary;
+    bool substituted = false, prepared = false;
+    http::test_support::set_state_security_hook([&](auto, const auto &) {
+      prepared = true;
+    });
+    http::test_support::set_state_file_hook([&](auto stage, const auto &path, const auto &candidate, const auto &old_backup) -> std::optional<std::uint32_t> {
+      if (stage == boundary) {
+        backup = old_backup;
+        temporary = candidate;
+        EXPECT_FALSE(std::filesystem::exists(temporary));
+        substituted = MoveFileExW(path.c_str(), displaced.c_str(), MOVEFILE_WRITE_THROUGH) && CreateHardLinkW(path.c_str(), external.c_str(), nullptr);
+        EXPECT_TRUE(substituted);
+      }
+      return std::nullopt;
+    });
+    EXPECT_FALSE(http::update_state_file(destination.string(), [](auto &tree) {
+      tree.put("fixture", "unpublished after destination interference");
+    }));
+    http::test_support::set_state_file_hook({});
+    http::test_support::set_state_security_hook({});
+    ASSERT_TRUE(substituted);
+    EXPECT_FALSE(prepared);
+    EXPECT_FALSE(std::filesystem::exists(temporary));
+    expect_fixture_snapshot(destination, unrelated);
+    expect_fixture_snapshot(external, unrelated);
+    expect_fixture_snapshot(displaced, original);
+    expect_fixture_snapshot(backup, original);
+    EXPECT_FALSE(http::update_state_file(destination.string(), [](auto &tree) {
+      tree.put("fixture", "must remain blocked after destination interference");
+    }));
+    expect_fixture_snapshot(destination, unrelated);
+    expect_fixture_snapshot(backup, original);
+  }
+}
+
+TEST_F(StateFileTransactionTest, InitialAbsencePerformsNoOriginalGuardHandoff) {
+  using stage_t = http::test_support::state_file_stage_e;
+  const auto destination = directory / "no-original-handoff.json";
+  ASSERT_FALSE(std::filesystem::exists(destination));
+  bool handoff = false;
+  http::test_support::set_state_file_hook([&](auto stage, const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+    if (stage == stage_t::guard_open || stage == stage_t::guard_close) {
+      handoff = true;
+      return ERROR_INVALID_HANDLE;
+    }
+    return std::nullopt;
+  });
+  EXPECT_TRUE(http::update_state_file(destination.string(), [](auto &tree) {
+    tree.put("fixture", "initial creation without handoff");
+  }));
+  http::test_support::set_state_file_hook({});
+  EXPECT_FALSE(handoff);
+  EXPECT_TRUE(read_fixture_bytes(destination).contains("initial creation without handoff"));
+  EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory), std::filesystem::directory_iterator()), 2);
 }
 
 TEST_F(StateFileTransactionTest, NativeStageFailuresPreserveOrRestoreOriginalAndRecover) {
