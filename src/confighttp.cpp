@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <limits>
 #include <new>
 #include <optional>
 #include <string_view>
@@ -1253,7 +1254,10 @@ namespace confighttp {
 
     print_req(request);
 
-    proc::proc.terminate();
+    rtsp_stream::stop_application([]() {
+      proc::proc.terminate();
+      display_device::revert_configuration();
+    });
 
     nlohmann::json output_tree;
     output_tree["status"] = true;
@@ -1334,7 +1338,7 @@ namespace confighttp {
   }
 
   /**
-   * @brief Enable or disable a client.
+   * @brief Persist explicit device rights and its separate enabled gate.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    * The body for the POST request should be JSON serialized in the following format:
@@ -1367,18 +1371,30 @@ namespace confighttp {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
       std::string uuid = input_tree.value("uuid", "");
-      bool enabled = input_tree.value("enabled", true);
-      output_tree["status"] = nvhttp::set_client_enabled(uuid, enabled);
-
-      if (!enabled && output_tree["status"]) {
-        auto cert = nvhttp::get_cert_by_uuid(uuid);
-        if (!cert.empty()) {
-          rtsp_stream::terminate_sessions_by_cert(cert);
+      std::optional<bool> enabled;
+      std::optional<permissions::mask_t> grant;
+      if (input_tree.contains("enabled")) {
+        if (!input_tree["enabled"].is_boolean()) {
+          bad_request(response, "enabled must be a boolean");
+          return;
         }
-
-        if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
-          proc::proc.terminate();
+        enabled = input_tree["enabled"].get<bool>();
+      }
+      if (input_tree.contains("permissions")) {
+        const auto &value = input_tree["permissions"];
+        if ((!value.is_number_unsigned() && !value.is_number_integer()) || (value.is_number_integer() && value.get<std::int64_t>() < 0) || value.get<std::uint64_t>() > std::numeric_limits<permissions::mask_t>::max() || !permissions::valid(value.get<permissions::mask_t>())) {
+          bad_request(response, "permissions must contain only implemented permission bits");
+          return;
         }
+        grant = value.get<permissions::mask_t>();
+      }
+      if (uuid.empty() || (!enabled && !grant)) {
+        bad_request(response, "A device UUID and at least one update field are required");
+        return;
+      }
+      output_tree["status"] = nvhttp::update_client(uuid, enabled, grant);
+      if (!output_tree["status"].get<bool>()) {
+        output_tree["error"] = "Device update was not saved; previous authorization remains in effect";
       }
 
       send_response(response, output_tree);
@@ -1427,10 +1443,6 @@ namespace confighttp {
       const bool removed = nvhttp::unpair_client(uuid);
       output_tree["status"] = removed;
 
-      if (removed && nvhttp::get_all_clients().empty()) {
-        proc::proc.terminate();
-      }
-
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "Unpair: "sv << e.what();
@@ -1457,11 +1469,10 @@ namespace confighttp {
 
     print_req(request);
 
-    nvhttp::erase_all_clients();
-    proc::proc.terminate();
+    const bool removed = nvhttp::erase_all_clients();
 
     nlohmann::json output_tree;
-    output_tree["status"] = true;
+    output_tree["status"] = removed;
     send_response(response, output_tree);
   }
 

@@ -37,6 +37,9 @@
 #include "src/config.h"
 #include "src/input.h"
 #include "src/platform/virtualhid_input.h"
+#ifdef _WIN32
+  #include "src/platform/windows/input.h"
+#endif
 
 namespace input {
   /**
@@ -356,7 +359,7 @@ namespace {
       });
 
       static int session = 0;
-      stream_ = input::alloc(std::make_shared<safe::mail_raw_t>(), std::format("keyboard-test-{}", ++session));
+      stream_ = input::alloc(std::make_shared<safe::mail_raw_t>(), std::format("keyboard-test-{}", ++session), permissions::inputs);
       ASSERT_NE(stream_, nullptr);
     }
 
@@ -364,6 +367,9 @@ namespace {
      * @brief Stop recording, drop tracked key state, and restore configuration.
      */
     void TearDown() override {
+#ifdef _WIN32
+      platf::testing::set_keyboard_identity_environment({});
+#endif
       input::testing::set_keyboard_sink({});
       input::testing::reset_keyboard_state();
       stream_.reset();
@@ -439,8 +445,10 @@ namespace {
       return *context_->keyboard;
     }
 
-  private:
+  protected:
     std::shared_ptr<input::input_t> stream_;  ///< Stream input state under test.
+
+  private:
     std::vector<input::testing::keyboard_event_t> events_;  ///< Keyboard output recorded for the current test.
     platf::virtualhid::input_context_t *context_ = nullptr;  ///< Fake input context installed in the global backend.
     config::input_t original_input_;  ///< Input configuration restored after each test.
@@ -980,3 +988,334 @@ TEST_F(KeyboardPassthroughTest, ReleasesTheRemappedRightAltForKeyRightaltToKeyWi
 
   EXPECT_EQ(taken(), (std::vector<std::string> {released(VKEY_LWIN)}));
 }
+
+TEST_F(KeyboardPassthroughTest, RemappedAliasesAndRevocationPreserveAnotherConnectionsHeldKey) {
+  config::input.keybindings[0x41] = 0x42;
+  config::input.keybindings[0x43] = 0x42;
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "keyboard other", permissions::keyboard);
+  press(0x41);
+  input::testing::send_keyboard_packet(other, 0x43, 0, 0, false);
+  auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, 0x42);
+  config::input.keybindings[0x41] = 0x5A;
+  input::update_permissions(stream_, 0);
+  EXPECT_TRUE(taken_events().empty());
+  input::testing::send_keyboard_packet(other, 0x43, 0, 0, true);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, 0x42);
+  EXPECT_TRUE(events.front().release);
+  input::reset(other);
+}
+
+TEST_F(KeyboardPassthroughTest, SyntheticModifiersCannotLiftAnotherConnectionsRealModifier) {
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "modifier owner", permissions::keyboard);
+  input::testing::send_keyboard_packet(other, VKEY_LSHIFT, MODIFIER_SHIFT, 0, false);
+  taken_events();
+  press(VKEY_A, MODIFIER_SHIFT);
+  auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, VKEY_A);
+  input::update_permissions(stream_, 0);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, VKEY_A);
+  EXPECT_TRUE(events.front().release);
+  input::testing::send_keyboard_packet(other, VKEY_LSHIFT, 0, 0, true);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, VKEY_LSHIFT);
+  EXPECT_TRUE(events.front().release);
+  input::reset(other);
+}
+
+TEST_F(KeyboardPassthroughTest, ForcedRightControlAliasesPreserveAnotherConnectionsHeldKey) {
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "right control owner", permissions::keyboard);
+  press(VKEY_RCONTROL, MODIFIER_CTRL);
+  input::testing::send_keyboard_packet(other, VKEY_RCONTROL, MODIFIER_CTRL | MODIFIER_EXTENDED, 0, false);
+  auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, VKEY_RCONTROL);
+  input::update_permissions(stream_, 0);
+  EXPECT_TRUE(taken_events().empty());
+  input::testing::send_keyboard_packet(other, VKEY_RCONTROL, 0, 0, true);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, VKEY_RCONTROL);
+  EXPECT_TRUE(events.front().release);
+  input::reset(other);
+}
+
+#ifdef _WIN32
+TEST_F(KeyboardPassthroughTest, NativeAndNormalizedUsKeysShareTheSameActualScanOwnership) {
+  config::input.always_send_scancodes = true;
+  platf::testing::set_keyboard_identity_environment([](auto, auto) {
+    return std::uint16_t {0x1E};
+  },
+                                                    false);
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "native US owner", permissions::keyboard);
+  press(VKEY_A);
+  input::testing::send_keyboard_packet(other, VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+  ASSERT_EQ(taken_events().size(), 1U);
+  input::update_permissions(stream_, 0);
+  EXPECT_TRUE(taken_events().empty());
+  input::reset(other);
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_TRUE(events.front().release);
+}
+
+TEST_F(KeyboardPassthroughTest, DifferentNativeLayoutScanRetainsIndependentOwnership) {
+  config::input.always_send_scancodes = true;
+  platf::testing::set_keyboard_identity_environment([](auto, auto) {
+    return std::uint16_t {0x10};
+  },
+                                                    false);
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "different layout owner", permissions::keyboard);
+  press(VKEY_A);
+  input::testing::send_keyboard_packet(other, VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+  ASSERT_EQ(taken_events().size(), 2U);
+  input::update_permissions(stream_, 0);
+  auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().flags, 0);
+  EXPECT_TRUE(events.front().release);
+  input::reset(other);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().flags, SS_KBE_FLAG_NON_NORMALIZED);
+  EXPECT_TRUE(events.front().release);
+}
+
+TEST_F(KeyboardPassthroughTest, DirectVirtualKeysFollowTheSelectedHidOrSendInputPath) {
+  config::input.always_send_scancodes = false;
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "selected path owner", permissions::keyboard);
+  for (const bool hid : {false, true}) {
+    SCOPED_TRACE(hid);
+    platf::testing::set_keyboard_identity_environment([](auto, auto) {
+      return std::uint16_t {0x10};
+    },
+                                                      hid);
+    press(VKEY_A);
+    input::testing::send_keyboard_packet(other, VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+    EXPECT_EQ(taken_events().size(), hid ? 1U : 2U);
+    release(VKEY_A);
+    EXPECT_EQ(taken_events().size(), hid ? 0U : 1U);
+    input::testing::send_keyboard_packet(other, VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED, true);
+    const auto events = taken_events();
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_TRUE(events.front().release);
+  }
+  input::reset(other);
+}
+
+TEST_F(KeyboardPassthroughTest, DirectWindowsModifiersShareNormalizedOwnershipOnTheFreePath) {
+  platf::testing::set_keyboard_identity_environment([](auto code, bool direct) {
+    EXPECT_TRUE(direct);
+    return std::uint16_t(0xE000U | code);
+  },
+                                                    false);
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "Windows key owner", permissions::keyboard);
+  for (const auto code : {VKEY_LWIN, VKEY_RWIN}) {
+    SCOPED_TRACE(code);
+    press(code);
+    input::testing::send_keyboard_packet(other, code, MODIFIER_EXTENDED, SS_KBE_FLAG_NON_NORMALIZED, false);
+    ASSERT_EQ(taken_events().size(), 1U);
+    release(code);
+    EXPECT_TRUE(taken_events().empty());
+    input::testing::send_keyboard_packet(other, code, 0, SS_KBE_FLAG_NON_NORMALIZED, true);
+    ASSERT_EQ(taken_events().size(), 1U);
+  }
+  input::reset(other);
+}
+
+TEST_F(KeyboardPassthroughTest, UnsupportedHidDirectVirtualMediaCannotAliasAnOrdinaryKey) {
+  config::input.always_send_scancodes = false;
+  for (const bool hid : {false, true}) {
+    SCOPED_TRACE(hid);
+    platf::testing::set_keyboard_identity_environment([](auto, bool direct) {
+      return std::uint16_t(direct ? 0xE022 : 0x22);
+    },
+                                                      hid);
+    auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "media key owner", permissions::keyboard);
+    auto alias = input::alloc(std::make_shared<safe::mail_raw_t>(), "extended media alias", permissions::keyboard);
+    press(0x47);  // Normalized G uses scan 0x22.
+    input::testing::send_keyboard_packet(other, 0xB3, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+    input::testing::send_keyboard_packet(alias, 0x47, MODIFIER_EXTENDED, 0, false);
+    const auto presses = taken_events();
+    ASSERT_EQ(presses.size(), 2U);
+    EXPECT_EQ(presses[1].key_code, 0xB3);
+    release(0x47);
+    ASSERT_EQ(taken_events().size(), 1U);
+    input::reset(other);
+    EXPECT_TRUE(taken_events().empty());
+    input::reset(alias);
+    const auto releases = taken_events();
+    ASSERT_EQ(releases.size(), 1U);
+    EXPECT_EQ(releases.front().key_code, 0xB3);
+    EXPECT_TRUE(releases.front().release);
+  }
+}
+
+TEST_F(KeyboardPassthroughTest, FreeDirectVolumeKeysRetainTheirImplicitExtendedIdentity) {
+  config::input.always_send_scancodes = false;
+  const std::array<std::array<std::uint16_t, 3>, 3> cases {{{0xAD, 0x44, 0x20}, {0xAE, 0x43, 0x2E}, {0xAF, 0x42, 0x30}}};
+  for (const auto &[volume, printable, scan] : cases) {
+    SCOPED_TRACE(volume);
+    platf::testing::set_keyboard_identity_environment([scan](auto, bool direct) {
+      return std::uint16_t(scan | (direct ? 0xE000U : 0U));
+    },
+                                                      false);
+    auto media = input::alloc(std::make_shared<safe::mail_raw_t>(), "volume key owner", permissions::keyboard);
+    auto alias = input::alloc(std::make_shared<safe::mail_raw_t>(), "extended scan owner", permissions::keyboard);
+    press(printable);
+    input::testing::send_keyboard_packet(media, volume, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+    input::testing::send_keyboard_packet(alias, printable, MODIFIER_EXTENDED, 0, false);
+    ASSERT_EQ(taken_events().size(), 2U);
+    release(printable);
+    auto events = taken_events();
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events.front().key_code, printable);
+    input::reset(media);
+    EXPECT_TRUE(taken_events().empty());
+    input::reset(alias);
+    events = taken_events();
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events.front().key_code, volume);
+    EXPECT_TRUE(events.front().release);
+  }
+}
+
+TEST_F(KeyboardPassthroughTest, DirectVirtualE1AndUnmappableKeysRetainSeparateDomains) {
+  config::input.always_send_scancodes = false;
+  platf::testing::set_keyboard_identity_environment([](auto code, bool direct) {
+    EXPECT_TRUE(direct);
+    return std::uint16_t(code == 0x13 ? 0xE11D : 0);
+  },
+                                                    false);
+  auto pause = input::alloc(std::make_shared<safe::mail_raw_t>(), "E1 owner", permissions::keyboard);
+  auto unknown = input::alloc(std::make_shared<safe::mail_raw_t>(), "unmappable owner", permissions::keyboard);
+  press(VKEY_RCONTROL);
+  input::testing::send_keyboard_packet(pause, 0x13, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+  input::testing::send_keyboard_packet(unknown, 0x07, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+  ASSERT_EQ(taken_events().size(), 3U);
+  release(VKEY_RCONTROL);
+  ASSERT_EQ(taken_events().size(), 1U);
+  input::reset(pause);
+  ASSERT_EQ(taken_events().size(), 1U);
+  input::reset(unknown);
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, 0x07);
+}
+
+TEST_F(KeyboardPassthroughTest, HidModifierAndPauseScanAliasesShareTheirActualOutput) {
+  config::input.always_send_scancodes = true;
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "HID aliases", permissions::keyboard);
+  platf::testing::set_keyboard_identity_environment([](auto code, auto) {
+    return std::uint16_t(code == VKEY_A ? 0x45 : 0x46);
+  },
+                                                    true);
+  press(VKEY_LSHIFT, MODIFIER_SHIFT | MODIFIER_EXTENDED);
+  input::testing::send_keyboard_packet(other, VKEY_LSHIFT, MODIFIER_SHIFT, 0, false);
+  ASSERT_EQ(taken_events().size(), 1U);
+  release(VKEY_LSHIFT);
+  EXPECT_TRUE(taken_events().empty());
+  input::testing::send_keyboard_packet(other, VKEY_LSHIFT, 0, 0, true);
+  ASSERT_EQ(taken_events().size(), 1U);
+  press(VKEY_A, MODIFIER_EXTENDED, SS_KBE_FLAG_NON_NORMALIZED);
+  input::testing::send_keyboard_packet(other, VKEY_B, MODIFIER_EXTENDED, SS_KBE_FLAG_NON_NORMALIZED, false);
+  ASSERT_EQ(taken_events().size(), 1U);
+  release(VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED);
+  EXPECT_TRUE(taken_events().empty());
+  input::testing::send_keyboard_packet(other, VKEY_B, 0, SS_KBE_FLAG_NON_NORMALIZED, true);
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_TRUE(events.front().release);
+  platf::testing::set_keyboard_identity_environment([](auto, auto) {
+    return std::uint16_t {0x6F};
+  },
+                                                    true);
+  press(0x87);  // The normalized F24 scan falls back to SendInput.
+  input::testing::send_keyboard_packet(other, VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED, false);
+  ASSERT_EQ(taken_events().size(), 1U);
+  release(0x87);
+  EXPECT_TRUE(taken_events().empty());
+  input::testing::send_keyboard_packet(other, VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED, true);
+  ASSERT_EQ(taken_events().size(), 1U);
+  input::reset(other);
+}
+
+TEST_F(KeyboardPassthroughTest, IgnoredWindowsPacketFlagsCannotSplitHostOwnership) {
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "ignored flag owner", permissions::keyboard);
+  press(VKEY_A);
+  input::testing::send_keyboard_packet(other, VKEY_A, 0, 0x80, false);
+  ASSERT_EQ(taken_events().size(), 1U);
+  input::reset(stream_);
+  EXPECT_TRUE(taken_events().empty());
+  input::reset(other);
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().flags, 0);
+  EXPECT_TRUE(events.front().release);
+}
+
+TEST_F(KeyboardPassthroughTest, GenericAndSideSpecificExtendedControlShareTheActualRightControl) {
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "extended control owner", permissions::keyboard);
+  for (const auto client_code : {VKEY_CONTROL, VKEY_LCONTROL}) {
+    SCOPED_TRACE(client_code);
+    press(client_code, MODIFIER_CTRL | MODIFIER_EXTENDED);
+    input::testing::send_keyboard_packet(other, VKEY_RCONTROL, MODIFIER_CTRL, SS_KBE_FLAG_NON_NORMALIZED, false);
+    ASSERT_EQ(taken_events().size(), 1U);
+    release(client_code);
+    EXPECT_TRUE(taken_events().empty());
+    input::testing::send_keyboard_packet(other, VKEY_RCONTROL, 0, SS_KBE_FLAG_NON_NORMALIZED, true);
+    const auto events = taken_events();
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_TRUE(events.front().release);
+  }
+  input::reset(other);
+}
+
+TEST_F(KeyboardPassthroughTest, ExtendedEnterAndFreshReconnectCleanupKeepTheirActualOwners) {
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "enter owner", permissions::keyboard);
+  press(VKEY_RETURN, MODIFIER_EXTENDED);
+  input::testing::send_keyboard_packet(other, VKEY_RETURN, 0, 0, false);
+  auto events = taken_events();
+  ASSERT_EQ(events.size(), 2U);
+  EXPECT_TRUE(events[0].extended);
+  EXPECT_FALSE(events[1].extended);
+  input::reset(stream_);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_TRUE(events.front().extended);
+  EXPECT_TRUE(events.front().release);
+  auto reconnected = input::alloc(std::make_shared<safe::mail_raw_t>(), "enter owner", permissions::keyboard);
+  input::testing::send_keyboard_packet(reconnected, VKEY_RETURN, 0, 0, false);
+  EXPECT_TRUE(taken_events().empty());
+  input::reset(stream_);
+  EXPECT_TRUE(taken_events().empty());
+  input::reset(other);
+  EXPECT_TRUE(taken_events().empty());
+  input::reset(reconnected);
+  events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_FALSE(events.front().extended);
+  EXPECT_TRUE(events.front().release);
+}
+#else
+TEST_F(KeyboardPassthroughTest, IgnoredPacketFlagsAndExtendedEnterCannotSplitHostOwnership) {
+  auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "ignored field owner", permissions::keyboard);
+  press(VKEY_RETURN, MODIFIER_EXTENDED);
+  input::testing::send_keyboard_packet(other, VKEY_RETURN, 0, SS_KBE_FLAG_NON_NORMALIZED | 0x80, false);
+  ASSERT_EQ(taken_events().size(), 1U);
+  input::reset(stream_);
+  EXPECT_TRUE(taken_events().empty());
+  input::reset(other);
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 1U);
+  EXPECT_EQ(events.front().key_code, VKEY_RETURN);
+  EXPECT_TRUE(events.front().release);
+}
+#endif

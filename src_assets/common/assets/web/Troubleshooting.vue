@@ -450,21 +450,46 @@
           {{ $t('troubleshooting.unpair_all_error') }}
         </div>
       </div>
+      <div class="card-body border-top">
+        <p class="mb-0">{{ $t('troubleshooting.device_permissions_desc') }}</p>
+        <div v-if="clientUpdateError" class="alert alert-danger mt-2" role="alert">{{ clientUpdateError }}</div>
+      </div>
       <ul class="list-group list-group-flush" v-if="clients && clients.length > 0">
-        <li v-for="client in clients" :key="client.uuid" class="list-group-item d-flex align-items-center">
-          <div class="flex-grow-1">
-            {{ client.name !== "" ? client.name : $t('troubleshooting.unpair_single_unknown') }}
+        <li v-for="client in clients" :key="client.uuid" class="list-group-item">
+          <div class="d-flex align-items-center">
+            <div class="flex-grow-1">
+              {{ client.name !== "" ? client.name : $t('troubleshooting.unpair_single_unknown') }}
+            </div>
+            <div class="form-check form-switch ms-2 mb-0">
+              <input class="form-check-input" type="checkbox" role="switch"
+                     :id="'toggle-' + client.uuid"
+                     :checked="client.enabled"
+                     :aria-checked="client.enabled.toString()"
+                     :aria-label="$t('troubleshooting.device_enabled')"
+                     :disabled="clientUpdatePending === client.uuid"
+                     @change="toggleClient(client.uuid, !client.enabled)">
+            </div>
+            <button class="btn btn-danger btn-sm ms-2" :disabled="clientUpdatePending === client.uuid" @click="unpairSingle(client.uuid)">
+              <trash-2 :size="18" class="icon"></trash-2>
+            </button>
           </div>
-          <div class="form-check form-switch ms-2 mb-0">
-            <input class="form-check-input" type="checkbox" role="switch"
-                   :id="'toggle-' + client.uuid"
-                   :checked="client.enabled"
-                   :aria-checked="client.enabled.toString()"
-                   @change="toggleClient(client.uuid, !client.enabled)">
-          </div>
-          <button class="btn btn-danger btn-sm ms-2" @click="unpairSingle(client.uuid)">
-            <trash-2 :size="18" class="icon"></trash-2>
-          </button>
+          <fieldset class="mt-3" :disabled="clientUpdatePending === client.uuid">
+            <legend class="fs-6">{{ $t('troubleshooting.device_permissions') }}</legend>
+            <div class="d-flex flex-wrap gap-3">
+              <label v-for="right in deviceRights" :key="right.bit" class="form-check">
+                <input type="checkbox" class="form-check-input"
+                       :data-device-right="right.bit"
+                       :checked="(client.draftPermissions & right.bit) !== 0"
+                       @change="toggleDeviceRight(client, right.bit, $event.target.checked)">
+                <span class="form-check-label">{{ $t('troubleshooting.device_right_' + right.name) }}</span>
+              </label>
+            </div>
+            <button type="button" class="btn btn-primary btn-sm mt-2"
+                    :disabled="client.draftPermissions === client.permissions"
+                    @click="updateClient(client.uuid, { permissions: client.draftPermissions })">
+              {{ $t('troubleshooting.device_permissions_save') }}
+            </button>
+          </fieldset>
         </li>
       </ul>
       <ul v-else class="list-group list-group-flush">
@@ -577,6 +602,18 @@
       data() {
         return {
           clients: [],
+          clientUpdatePending: null,
+          clientUpdateError: '',
+          deviceRights: [
+            { name: 'list', bit: 0x01000000 },
+            { name: 'view', bit: 0x02000000 },
+            { name: 'launch', bit: 0x04000000 },
+            { name: 'controller', bit: 0x00000100 },
+            { name: 'touch', bit: 0x00000200 },
+            { name: 'pen', bit: 0x00000400 },
+            { name: 'mouse', bit: 0x00000800 },
+            { name: 'keyboard', bit: 0x00001000 },
+          ],
           closeAppPressed: false,
           closeAppStatus: null,
           ddResetPressed: false,
@@ -904,41 +941,68 @@
               this.refreshClients();
             });
         },
-        unpairSingle(uuid) {
-          apiFetch("./api/clients/unpair", {
-            method: "POST",
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ uuid })
-          }).then(() => {
+        async unpairSingle(uuid) {
+          if (await this.mutateClient(uuid, './api/clients/unpair', {}, clients => !clients.some(client => client.uuid === uuid))) {
             this.showApplyMessage = true;
-            this.refreshClients();
-          });
+          }
+        },
+        toggleDeviceRight(client, bit, checked) {
+          client.draftPermissions = checked ? client.draftPermissions | bit : client.draftPermissions & ~bit;
         },
         toggleClient(uuid, enabled) {
-          fetch("./api/clients/update", {
-            method: "POST",
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ uuid, enabled })
-          }).then(() => {
-            this.refreshClients();
-          });
+          return this.updateClient(uuid, { enabled });
         },
-        refreshClients() {
-          fetch("./api/clients/list")
-            .then((response) => response.json())
-            .then((response) => {
-              if (response.status === true && response.named_certs && response.named_certs.length) {
-                this.clients = response.named_certs.sort((a, b) => {
-                  return (a.name.toLowerCase() > b.name.toLowerCase() || a.name === "" ? 1 : -1)
-                });
-              } else {
-                this.clients = [];
-              }
+        async updateClient(uuid, fields) {
+          return this.mutateClient(uuid, './api/clients/update', fields, clients => clients.some(client =>
+            client.uuid === uuid && Object.entries(fields).every(([field, value]) => client[field] === value)));
+        },
+        /** Reconcile uncertain mutation outcomes with an awaited, checked device readback. */
+        async mutateClient(uuid, endpoint, fields, matches) {
+          this.clientUpdatePending = uuid;
+          this.clientUpdateError = '';
+          let outcome = 'unknown';
+          try {
+            const response = await apiFetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ uuid, ...fields }),
             });
+            const result = await response.json();
+            if (response.ok && typeof result?.status === 'boolean') {
+              outcome = result.status ? 'saved' : 'rejected';
+            }
+          } catch (error) {
+            // A missing response does not establish whether the server committed the request.
+          }
+          const refreshed = await this.refreshClients();
+          const confirmed = refreshed && (outcome === 'saved' || (outcome === 'unknown' && matches(this.clients)));
+          if (!refreshed || (outcome === 'unknown' && !confirmed)) {
+            this.clientUpdateError = this.$t('troubleshooting.device_update_unknown');
+          } else if (outcome === 'rejected') {
+            this.clientUpdateError = this.$t('troubleshooting.device_update_error');
+          }
+          this.clientUpdatePending = null;
+          return confirmed;
+        },
+        async refreshClients() {
+          try {
+            const response = await fetch('./api/clients/list');
+            if (!response.ok) throw new Error('Device readback failed');
+            const result = await response.json();
+            const supported = this.deviceRights.reduce((mask, right) => mask | right.bit, 0);
+            if (result?.status !== true || !Array.isArray(result.named_certs) || !result.named_certs.every(client =>
+              client && typeof client.uuid === 'string' && client.uuid && typeof client.name === 'string' && typeof client.enabled === 'boolean' &&
+              Number.isInteger(client.permissions ?? 0) && (client.permissions ?? 0) >= 0 && (client.permissions ?? 0) <= supported && ((client.permissions ?? 0) & ~supported) === 0)) {
+              throw new Error('Invalid device readback');
+            }
+            this.clients = result.named_certs.map(client => ({ ...client, permissions: client.permissions ?? 0, draftPermissions: client.permissions ?? 0 })).sort((a, b) => {
+              return (a.name.toLowerCase() > b.name.toLowerCase() || a.name === "" ? 1 : -1)
+            });
+            return true;
+          } catch (error) {
+            this.clientUpdateError = this.$t('troubleshooting.device_update_unknown');
+            return false;
+          }
         },
         clickedApplyBanner() {
           this.showApplyMessage = false;

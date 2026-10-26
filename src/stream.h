@@ -13,6 +13,7 @@
 // local includes
 #include "audio.h"
 #include "crypto.h"
+#include "permissions.h"
 #include "video.h"
 
 namespace stream {
@@ -100,5 +101,11 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+    /**
+     * @brief Apply current device input rights and wait for category cleanup.
+     * @param session Active stream whose viewing authority remains valid.
+     * @param allowed Current explicit grants.
+     */
+    void update_permissions(session_t &session, permissions::mask_t allowed);
   }  // namespace session
 }  // namespace stream

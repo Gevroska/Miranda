@@ -14,6 +14,7 @@
 #include <vector>
 
 // local includes
+#include "permissions.h"
 #include "platform/common.h"
 #include "thread_safe.h"
 
@@ -32,6 +33,22 @@ namespace input {
    * @param input Shared stream input state to reset.
    */
   void reset(std::shared_ptr<input_t> &input);
+
+  /**
+   * @brief Close removed categories and wait for their isolated input cleanup barrier.
+   * @param input Connection input state; never reused by a reconnect.
+   * @param allowed Current implemented input grants.
+   */
+  void update_permissions(const std::shared_ptr<input_t> &input, permissions::mask_t allowed);
+
+  /**
+   * @brief Consume one feedback message without waiting and deliver only within its original controller grant.
+   * @param input Original connection input state.
+   * @param queue Controller feedback mailbox shared with the control stream.
+   * @param send Short local send operation; must not wait for input cleanup or call an input lifecycle API.
+   * @return Whether one message was consumed, including a message discarded after revocation.
+   */
+  bool dispatch_controller_feedback(const std::shared_ptr<input_t> &input, const platf::feedback_queue_t &queue, const std::function<void(platf::gamepad_feedback_msg_t &)> &send);
 
   /**
    * @brief Destroy every retained virtual gamepad session.
@@ -80,12 +97,35 @@ namespace input {
    *
    * @param mail Mailbox used to exchange messages with worker threads.
    * @param session_id Stable paired-client identity shared by launch and resume connections.
+   * @param allowed Explicit current input grants; zero creates a viewer with no input authority.
    * @return Shared input state bound to the stream mailbox.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id);
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, permissions::mask_t allowed);
 
 #ifdef SUNSHINE_TESTS
   namespace testing {
+    /**
+     * @brief Observe production feedback boundaries before dequeue and before delivery.
+     * @param hook Boundary observer, or empty to restore production behavior.
+     */
+    void set_feedback_dispatch_hook(std::function<void(std::string_view)> hook);
+    /**
+     * @brief Capture real delayed callbacks for deterministic revocation tests.
+     * @param sink Recorder receiving a runnable callback, or empty for the production scheduler.
+     */
+    void set_delayed_task_sink(std::function<void(std::function<void()>)> sink);
+    /**
+     * @brief Record aggregate mouse transitions without delivering them to the host.
+     * @param sink Recorder receiving button and release, or empty for the platform backend.
+     */
+    void set_mouse_button_sink(std::function<void(int, bool)> sink);
+    /**
+     * @brief Deliver a validated mouse button through the production ownership path.
+     * @param input Connection owner.
+     * @param button Mouse button number from one through five.
+     * @param release Whether the button is being released.
+     */
+    void send_mouse_button_packet(std::shared_ptr<input_t> &input, int button, bool release);
     /**
      * @brief Replace the global platform input backend for a unit test.
      *

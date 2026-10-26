@@ -9,10 +9,16 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 // local includes
 #include "crypto.h"
+#include "permissions.h"
 #include "thread_safe.h"
+
+namespace platf {
+  class deinit_t;
+}
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
@@ -100,14 +106,53 @@ namespace rtsp_stream {
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_uuid;  ///< Persistent UUID of the authenticated pairing that requested this launch.
     std::string client_cert;  ///< Canonical PEM of the authenticated paired Moonlight client certificate.
+    std::uint64_t authorization_revision = 0;  ///< Original authorization revision of this admission.
+    bool cancelled = false;  ///< Token invalidation, accessed only on the RTSP owner thread.
+    bool ready = false;  ///< Preparation succeeded before sockets may use this token.
+    bool admitted = false;  ///< At most one ANNOUNCE may allocate a stream from this token.
+    bool joining = false;  ///< This launch joins an existing source without preparing or executing it.
   };
 
   /**
    * @brief Queue a launch session until the RTSP client connects.
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
+   * @return Whether the authorized pending reservation was accepted.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+
+  /**
+   * @brief Reserve the pending slot and prepare a launch on the RTSP owner thread.
+   * @param launch_session Caller-owned admission token.
+   * @param prepare Operation returning a protocol status after authorized preparation.
+   * @param rollback Caller-owned cleanup after preparation fails or authority changes.
+   * @return Explicit success, denied, busy or preparation-failure status.
+   */
+  int prepare_launch(std::shared_ptr<launch_session_t> launch_session, std::function<int()> prepare, std::function<void()> rollback = {});
+
+  /**
+   * @brief Run a protected operation at the same ordering point as admissions and revocations.
+   * @param uuid Original paired UUID.
+   * @param cert Exact paired certificate.
+   * @param required Effective action right required by the operation.
+   * @param operation Operation executed only after checking current authority.
+   * @return Whether current authority allowed dispatch.
+   */
+  bool authorize_operation(std::string_view uuid, std::string_view cert, permissions::mask_t required, std::function<void()> operation);
+
+  /**
+   * @brief Reconcile a completed authorization mutation on the admission owner thread.
+   * @param uuid Changed original pairing UUID.
+   * @param cert Original paired certificate for retained-controller cleanup.
+   * @param destroy Retained devices must be destroyed after disable/unpair.
+   */
+  void reconcile_client(std::string_view uuid, std::string_view cert, bool destroy);
+
+  /**
+   * @brief Run an explicit authorized global Stop at the admission serialization point.
+   * @param stop Application/display cleanup after all connections and pending tokens are stopped.
+   */
+  void stop_application(std::function<void()> stop);
 
   /**
    * @brief Clear state for the specified launch session.
@@ -136,4 +181,35 @@ namespace rtsp_stream {
    * @brief Runs the RTSP server loop.
    */
   void start();
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /**
+     * @brief Run the actual RTSP owner without binding a listener or starting media workers.
+     * @return Handle stopping and joining that owner on destruction.
+     */
+    std::unique_ptr<platf::deinit_t> start_owner();
+    /**
+     * @brief Observe real owner ordering boundaries for deterministic race tests.
+     * @param hook Boundary observer, or empty to remove it.
+     */
+    void set_owner_hook(std::function<void(std::string_view)> hook);
+    /**
+     * @brief Stop the isolated owner through its production shutdown fence.
+     */
+    void stop_owner();
+    /**
+     * @brief Check the same token guard used for every RTSP dispatch.
+     * @param launch Original retained launch object.
+     * @return Whether this token remains currently authorized.
+     */
+    bool token_authorized(const std::shared_ptr<launch_session_t> &launch);
+    /**
+     * @brief Exercise the one-admission guard used immediately before stream allocation.
+     * @param launch Original retained launch object.
+     * @return Whether a first authorized ANNOUNCE can claim it.
+     */
+    bool claim_launch(const std::shared_ptr<launch_session_t> &launch);
+  }  // namespace test_support
+#endif
 }  // namespace rtsp_stream
