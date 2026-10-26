@@ -21,6 +21,15 @@
 // lib includes
 #include <boost/property_tree/json_parser.hpp>
 
+// platform includes
+#ifdef _WIN32
+  // Winsock must precede Windows.h.
+  // clang-format off
+  #include <WinSock2.h>
+  #include <Windows.h>
+// clang-format on
+#endif
+
 // local includes
 #include <src/config.h>
 #include <src/httpcommon.h>
@@ -59,6 +68,9 @@ protected:
    */
   void TearDown() override {
     http::test_support::set_state_update_hook({});
+#ifdef _WIN32
+    http::test_support::set_state_file_hook({});
+#endif
     rtsp_stream::stop_application({});
     nvhttp::test_support::reset_client_state();
     std::error_code remove_error;
@@ -618,6 +630,115 @@ TEST_F(ClientAuthorizationTest, LegacyEmptyPersistedDeviceCollectionStillAccepts
   ASSERT_EQ(saved["root"]["named_devices"].size(), 1U);
   EXPECT_EQ(saved["root"]["named_devices"][0]["uuid"], uuid);
 }
+
+#ifdef _WIN32
+TEST_F(ClientAuthorizationTest, NativePersistenceOutcomesPreserveOrPublishRealAuthorityAndAdmissions) {
+  using stage_t = http::test_support::state_file_stage_e;
+  const auto state = config::nvhttp.file_state;
+  auto restore = util::fail_guard([&]() {
+    http::test_support::set_state_file_hook({});
+    config::nvhttp.file_state = state;
+    const fs::path base {state};
+    for (const auto &entry : fs::directory_iterator(base.parent_path())) {
+      if (entry.path().filename().string().starts_with(base.filename().string() + ".")) {
+        std::error_code error;
+        fs::remove(entry.path(), error);
+      }
+    }
+  });
+  const auto read_bytes = [](const std::string &path) {
+    std::ifstream input {path};
+    return std::string {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  };
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("native state outcomes", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  for (const auto rejected : {stage_t::backup, stage_t::write, stage_t::flush, stage_t::close, stage_t::rename, stage_t::rename_open, stage_t::rename_api, stage_t::rename_close, stage_t::verify}) {
+    SCOPED_TRACE(static_cast<int>(rejected));
+    const auto original = *nvhttp::current_client(uuid, credentials.x509);
+    const auto bytes = read_bytes(state);
+    const auto token = permission_launch(uuid, credentials.x509);
+    ASSERT_EQ(rtsp_stream::prepare_launch(token, []() {
+                return 200;
+              }),
+              200);
+    unsigned closes = 0;
+    http::test_support::set_state_file_hook([&](auto stage, const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+      if (stage == rejected && (rejected != stage_t::rename_close || ++closes % 2 == 1)) {
+        return ERROR_WRITE_FAULT;
+      }
+      return std::nullopt;
+    });
+    EXPECT_FALSE(nvhttp::update_client(uuid, std::nullopt, permissions::view | permissions::keyboard));
+    EXPECT_FALSE(nvhttp::update_client(uuid, std::nullopt, 0U));
+    http::test_support::set_state_file_hook({});
+    const auto after = nvhttp::current_client(uuid, credentials.x509);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->permissions, original.permissions);
+    EXPECT_EQ(after->revision, original.revision);
+    EXPECT_TRUE(read_bytes(state) == bytes);
+    EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
+    ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view | permissions::keyboard));
+    EXPECT_FALSE(rtsp_stream::test_support::token_authorized(token));
+    ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  }
+
+  const auto before_cleanup = *nvhttp::current_client(uuid, credentials.x509);
+  http::test_support::set_state_file_hook([](auto stage, const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+    return stage == stage_t::cleanup ? std::optional<std::uint32_t> {ERROR_ACCESS_DENIED} : std::nullopt;
+  });
+  EXPECT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view | permissions::keyboard));
+  http::test_support::set_state_file_hook({});
+  const auto committed = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(committed);
+  EXPECT_EQ(committed->permissions, permissions::view | permissions::keyboard);
+  EXPECT_NE(committed->revision, before_cleanup.revision);
+  boost::property_tree::ptree saved;
+  boost::property_tree::read_json(state, saved);
+  EXPECT_EQ(saved.get_child("root.named_devices").front().second.get<permissions::mask_t>("permissions"), committed->permissions);
+
+  // Keep the intentionally blocked recovery key separate from every other authorization fixture.
+  config::nvhttp.file_state = state + ".uncertain";
+  ASSERT_TRUE(http::update_state_file(config::nvhttp.file_state, [&](auto &tree) {
+    tree = saved;
+  }));
+  const auto original = *nvhttp::current_client(uuid, credentials.x509);
+  const auto old_bytes = read_bytes(config::nvhttp.file_state);
+  const auto token = permission_launch(uuid, credentials.x509);
+  ASSERT_EQ(rtsp_stream::prepare_launch(token, []() {
+              return 200;
+            }),
+            200);
+  http::test_support::set_state_file_hook([](auto stage, const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+    return stage == stage_t::verify || stage == stage_t::restore ? std::optional<std::uint32_t> {ERROR_ACCESS_DENIED} : std::nullopt;
+  });
+  EXPECT_FALSE(nvhttp::update_client(uuid, std::nullopt, 0U));
+  http::test_support::set_state_file_hook({});
+  auto after = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->permissions, original.permissions);
+  EXPECT_EQ(after->revision, original.revision);
+  EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
+  fs::path backup;
+  const fs::path uncertain {config::nvhttp.file_state};
+  for (const auto &entry : fs::directory_iterator(uncertain.parent_path())) {
+    if (entry.path().filename().string().starts_with(uncertain.filename().string() + ".backup-")) {
+      backup = entry.path();
+    }
+  }
+  ASSERT_FALSE(backup.empty());
+  EXPECT_TRUE(read_bytes(backup.string()) == old_bytes);
+  ASSERT_TRUE(MoveFileExW(backup.c_str(), uncertain.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH));
+  EXPECT_TRUE(read_bytes(uncertain.string()) == old_bytes);
+  EXPECT_FALSE(nvhttp::update_client(uuid, std::nullopt, 0U));
+  after = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->permissions, original.permissions);
+  EXPECT_EQ(after->revision, original.revision);
+  EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
+}
+#endif
 
 TEST_F(ClientAuthorizationTest, ReservationsFailExplicitlyInvalidateHeldTokensAndClaimAnnounceOnce) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
