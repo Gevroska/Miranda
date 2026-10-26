@@ -468,12 +468,14 @@ protected:
 TEST_F(ProcessPublicationTest, SuccessfulExitBeforeInitialPublicationPreservesLogicalLauncher) {
   configure_launcher(false);
   int observations = 0;
+  bool exited_before_publication = false;
   proc::test_support::set_refresh_published_hook([&]() {
     ++observations;
-    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+    exited_before_publication = proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2});
   });
   ASSERT_EQ(proc::proc.execute(43, std::make_shared<rtsp_stream::launch_session_t>()), 0);
   ASSERT_EQ(observations, 1);
+  ASSERT_TRUE(exited_before_publication);
   expect_placeholder_before_another_refresh();
   EXPECT_EQ(observations, 1);
 }
@@ -484,13 +486,15 @@ TEST_F(ProcessPublicationTest, SuccessfulExitAfterLiveObservationBeforePublicati
   ASSERT_EQ(proc::proc.running(), 43);
   ASSERT_TRUE(proc::proc.published_snapshot()->lifetime.tracked);
   int observations = 0;
+  bool exited_before_publication = false;
   proc::test_support::set_refresh_published_hook([&]() {
     ++observations;
     std::ofstream {gate} << "release";
-    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+    exited_before_publication = proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2});
   });
   proc::proc.refresh_published();
   ASSERT_EQ(observations, 1);
+  ASSERT_TRUE(exited_before_publication);
   expect_placeholder_before_another_refresh();
   EXPECT_EQ(observations, 1);
 }
