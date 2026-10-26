@@ -570,7 +570,7 @@ namespace http {
     if (!update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
           auto tree = original.empty() && !fs::exists(file) ? proc::catalog::json::object() : proc::catalog::parse(original);
           if (!tree.is_object()) {
-            return std::nullopt;
+            throw std::invalid_argument {"credentials: expected a document object"};
           }
           tree["username"] = username;
           tree["salt"] = salt;

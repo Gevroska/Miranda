@@ -165,12 +165,20 @@ TEST(DisplayPolicyTest, DisplayFreeAdmissionsNeverAcquireOrPinAnExistingVideoSou
 
 TEST(DisplayPreferencesTest, TypedOverridesRejectMalformedOrLossyValues) {
   for (const auto *invalid : {
-         R"(null)", R"([])", R"({"force_virtual":"true"})", R"({"resolution":"1920x1080"})",
-         R"({"resolution":{"width":1920}})", R"({"resolution":{"width":0,"height":1080}})",
-         R"({"resolution":{"width":-1,"height":1080}})", R"({"resolution":{"width":1920.5,"height":1080}})",
-         R"({"resolution":{"width":2147483648,"height":1080}})", R"({"resolution":{"width":true,"height":1080}})",
-         R"({"refresh_rate":59.94})", R"({"refresh_rate":{"numerator":60}})",
-         R"({"refresh_rate":{"numerator":60000,"denominator":0}})", R"({"refresh_rate":{"numerator":"60000","denominator":1001}})",
+         R"(null)",
+         R"([])",
+         R"({"force_virtual":"true"})",
+         R"({"resolution":"1920x1080"})",
+         R"({"resolution":{"width":1920}})",
+         R"({"resolution":{"width":0,"height":1080}})",
+         R"({"resolution":{"width":-1,"height":1080}})",
+         R"({"resolution":{"width":1920.5,"height":1080}})",
+         R"({"resolution":{"width":2147483648,"height":1080}})",
+         R"({"resolution":{"width":true,"height":1080}})",
+         R"({"refresh_rate":59.94})",
+         R"({"refresh_rate":{"numerator":60}})",
+         R"({"refresh_rate":{"numerator":60000,"denominator":0}})",
+         R"({"refresh_rate":{"numerator":"60000","denominator":1001}})",
          R"({"refresh_rate":{"numerator":18446744073709551615,"denominator":1001}})",
        }) {
     const auto value = display_policy::json::parse(invalid);

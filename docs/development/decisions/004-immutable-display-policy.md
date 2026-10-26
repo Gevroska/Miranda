@@ -46,7 +46,7 @@ Continuing property-tree writes would coerce unknown booleans, numbers, nulls an
 
 The [P3a work item](../work-items/P3a-display-policy.md) lists the candidate and checks. Added source regressions cover the 32-way opt-in/headless matrix, fixed GUID vectors and domain separation, exact fractional overrides, active-source object preservation, Desktop retention, malformed settings, typed metadata/credential preservation, write rollback, prepared-token continuity, Web authentication/CSRF and settings readback. Independent Python `hashlib`/`uuid` fixture generation supplied the UUID constants; it does not execute or validate the C++ implementation.
 
-No native/Web tests, builds, formatter, CI, driver operations or streaming were run by this worker. Production enabling requires the display transaction, admission/lifetime and capture binding slices to be integrated and independently reviewed together. The dormant adapter and this resolver prove no actual monitor or topology behavior.
+Coordinator validation now includes an independently reviewed final diff, locked formatting, native application/test builds, five persistence-refusal regressions, the corrected authenticated/CSRF fixture, and the full native suite: 1,025 pass, 11 skip and the two inherited external-download connection failures. All 248 Web tests across 13 files and the production bundle pass. Hosted qualification and final P1b ancestry remain pending. Production enabling requires the display transaction, admission/lifetime and capture binding slices to be integrated and independently reviewed together. The dormant adapter and this resolver prove no actual monitor or topology behavior.
 
 ## Supersession
 

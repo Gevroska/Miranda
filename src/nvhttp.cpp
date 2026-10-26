@@ -260,8 +260,9 @@ namespace nvhttp {
   bool save_state(const client_t &client = client_root) {
     return http::update_state_file_bytes(config::nvhttp.file_state, [&](const std::string &original) -> std::optional<std::string> {
       auto tree = original.empty() && !fs::exists(config::nvhttp.file_state) ? proc::catalog::json::object() : proc::catalog::parse(original);
+      // No replacement means a successful read-only transaction; invalid state must throw.
       if (!tree.is_object() || (tree.contains("root") && !tree["root"].is_object())) {
-        return std::nullopt;
+        throw std::invalid_argument {"paired state: expected document and root objects"};
       }
       auto &root = tree["root"];
       if (root.is_null()) {
@@ -269,7 +270,7 @@ namespace nvhttp {
       }
       const auto previous = root.value("named_devices", proc::catalog::json::array());
       if (!previous.is_array() && previous != "") {
-        return std::nullopt;
+        throw std::invalid_argument {"paired state: expected a device array or legacy empty string"};
       }
       root["uniqueid"] = http::unique_id;
       root.erase("devices");
@@ -281,7 +282,7 @@ namespace nvhttp {
           for (const auto &saved : previous) {
             if (saved.is_object() && saved.value("uuid", "") == device.uuid) {
               if (matched) {
-                return std::nullopt;
+                throw std::invalid_argument {"paired state: duplicate saved pairing UUID"};
               }
               node = saved;
               matched = true;

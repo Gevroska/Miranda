@@ -36,6 +36,7 @@
 
 // local includes
 #include <src/app_catalog.h>
+#include <src/config.h>
 #include <src/crypto.h>
 #include <src/httpcommon.h>
 #include <src/utility.h>
@@ -317,6 +318,45 @@ TEST_F(StateFileTransactionTest, FailedCredentialEditLeavesEveryOriginalByteAndT
   });
   EXPECT_NE(http::save_user_creds(file.string(), "must not publish", "synthetic password"), 0);
   EXPECT_EQ(state_bytes(), original);
+}
+
+TEST_F(StateFileTransactionTest, NonobjectCredentialDocumentsReportFailureWithoutChangingBytesOrActiveCredentials) {
+  const auto previous_username = config::sunshine.username;
+  const auto previous_password = config::sunshine.password;
+  const auto previous_salt = config::sunshine.salt;
+  const auto restore_credentials = util::fail_guard([&]() {
+    config::sunshine.username = previous_username;
+    config::sunshine.password = previous_password;
+    config::sunshine.salt = previous_salt;
+  });
+  ASSERT_EQ(http::save_user_creds(file.string(), "synthetic active administrator", "synthetic active password"), 0);
+  ASSERT_EQ(http::reload_user_creds(file.string()), 0);
+  const auto active_username = config::sunshine.username;
+  const auto active_password = config::sunshine.password;
+  const auto active_salt = config::sunshine.salt;
+  const auto valid_bytes = state_bytes();
+  for (const auto *malformed : {"[]", "null", "false", "17", R"("invalid document")", R"([{"username":"preserved","password":"synthetic old hash","salt":"synthetic old salt"}])"}) {
+    {
+      std::ofstream output {file, std::ios::binary};
+      output << malformed;
+      ASSERT_TRUE(output.good());
+    }
+    EXPECT_NE(http::save_user_creds(file.string(), "must not publish", "synthetic replacement password"), 0);
+    EXPECT_EQ(state_bytes(), malformed);
+    EXPECT_EQ(config::sunshine.username, active_username);
+    EXPECT_EQ(config::sunshine.password, active_password);
+    EXPECT_EQ(config::sunshine.salt, active_salt);
+  }
+  {
+    std::ofstream output {file, std::ios::binary};
+    output << valid_bytes;
+    ASSERT_TRUE(output.good());
+  }
+  EXPECT_EQ(http::save_user_creds(file.string(), "synthetic recovered administrator", "synthetic replacement password"), 0);
+  const auto saved = proc::catalog::parse(state_bytes());
+  EXPECT_EQ(saved["username"], "synthetic recovered administrator");
+  const auto salt = saved["salt"].get<std::string>();
+  EXPECT_EQ(saved["password"], util::hex(crypto::hash("synthetic replacement password" + salt)).to_string());
 }
 
 TEST_F(StateFileTransactionTest, RestrictsEmptyTemporaryBeforeWritingAndPreservesSecurityMetadata) {

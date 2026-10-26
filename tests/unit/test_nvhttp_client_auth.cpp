@@ -507,6 +507,105 @@ TEST_F(ClientAuthorizationTest, DisplayOnlyEditsPreserveAuthorizationRevisionAnd
   rtsp_stream::launch_session_clear(token->id);
 }
 
+TEST_F(ClientAuthorizationTest, InvalidPersistedDocumentShapesCannotPublishDeviceUpdatesOrCancelPreparedTokens) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  display_policy::device_preferences_t original_preferences;
+  original_preferences.force_virtual = true;
+  original_preferences.resolution = {2560, 1440};
+  original_preferences.refresh_rate = {60000, 1001};
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view, original_preferences));
+  const auto before = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(before);
+  auto read = [&]() {
+    std::ifstream input {config::nvhttp.file_state, std::ios::binary};
+    return std::string {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
+  };
+  const auto valid_bytes = read();
+  auto duplicated = proc::catalog::parse(valid_bytes);
+  auto &devices = duplicated["root"]["named_devices"];
+  const auto duplicate = devices[0];
+  devices.push_back(duplicate);
+  const std::vector<std::string> malformed_documents {
+    "[]",
+    "null",
+    R"({"root":false})",
+    R"({"root":null})",
+    R"({"root":{"named_devices":false}})",
+    R"({"root":{"named_devices":{}}})",
+    duplicated.dump(),
+  };
+  const auto token = permission_launch(uuid, credentials.x509);
+  ASSERT_EQ(rtsp_stream::prepare_launch(token, []() {
+              return 200;
+            }),
+            200);
+  display_policy::device_preferences_t changed_preferences;
+  changed_preferences.resolution = {3840, 2160};
+  for (std::size_t shape = 0; shape < malformed_documents.size(); ++shape) {
+    SCOPED_TRACE(shape);
+    const auto &malformed = malformed_documents[shape];
+    {
+      std::ofstream output {config::nvhttp.file_state, std::ios::binary};
+      output << malformed;
+      ASSERT_TRUE(output.good());
+    }
+    const auto expect_rejected = [&](std::optional<bool> enabled, std::optional<permissions::mask_t> grant, std::optional<display_policy::device_preferences_t> display) {
+      EXPECT_FALSE(nvhttp::update_client(uuid, enabled, grant, display));
+      EXPECT_EQ(read(), malformed);
+      const auto after = nvhttp::current_client(uuid, credentials.x509);
+      ASSERT_TRUE(after);
+      EXPECT_EQ(after->permissions, before->permissions);
+      EXPECT_EQ(after->revision, before->revision);
+      EXPECT_EQ(after->display, before->display);
+      EXPECT_EQ(after->display_valid, before->display_valid);
+      EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
+    };
+    expect_rejected(std::nullopt, std::nullopt, changed_preferences);
+    expect_rejected(std::nullopt, permissions::launch, std::nullopt);
+    expect_rejected(false, permissions::launch, changed_preferences);
+  }
+  {
+    std::ofstream output {config::nvhttp.file_state, std::ios::binary};
+    output << valid_bytes;
+    ASSERT_TRUE(output.good());
+  }
+  EXPECT_TRUE(nvhttp::update_client(uuid, std::nullopt, std::nullopt, changed_preferences));
+  const auto recovered = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(recovered);
+  EXPECT_EQ(recovered->display, changed_preferences);
+  EXPECT_EQ(recovered->revision, before->revision);
+  EXPECT_TRUE(rtsp_stream::test_support::claim_launch(token));
+  rtsp_stream::launch_session_clear(token->id);
+}
+
+TEST_F(ClientAuthorizationTest, LegacyEmptyPersistedDeviceCollectionStillAcceptsAValidPreferenceSave) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  {
+    std::ifstream input {config::nvhttp.file_state, std::ios::binary};
+    auto legacy = display_policy::json::parse(input);
+    input.close();
+    legacy["root"]["named_devices"] = "";
+    std::ofstream output {config::nvhttp.file_state, std::ios::binary};
+    output << legacy.dump();
+    ASSERT_TRUE(output.good());
+  }
+  display_policy::device_preferences_t preferences;
+  preferences.force_virtual = true;
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, std::nullopt, preferences));
+  const auto paired = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(paired);
+  EXPECT_EQ(paired->permissions, 0U);
+  EXPECT_EQ(paired->display, preferences);
+  std::ifstream input {config::nvhttp.file_state, std::ios::binary};
+  const auto saved = display_policy::json::parse(input);
+  ASSERT_TRUE(saved["root"]["named_devices"].is_array());
+  ASSERT_EQ(saved["root"]["named_devices"].size(), 1U);
+  EXPECT_EQ(saved["root"]["named_devices"][0]["uuid"], uuid);
+}
+
 TEST_F(ClientAuthorizationTest, ReservationsFailExplicitlyInvalidateHeldTokensAndClaimAnnounceOnce) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
   const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);

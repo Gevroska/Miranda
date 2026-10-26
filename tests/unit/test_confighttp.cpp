@@ -2170,8 +2170,17 @@ TEST_F(DevicePermissionApiTest, OnlyAuthenticatedCsrfProtectedAdministrationCanS
   EXPECT_EQ(client->request("POST", "/client-update-test", body, headers)->status_code, "401 Unauthorized");
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Origin", "https://example.invalid");
-  EXPECT_EQ(client->request("POST", "/client-update-test", body, headers)->status_code, "403 Forbidden");
+  const auto missing_token = client->request("POST", "/client-update-test", body, headers);
+  EXPECT_EQ(missing_token->status_code, "400 Bad Request");
+  EXPECT_NE(missing_token->content.string().find("Missing CSRF token"), std::string::npos);
   EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+  headers.emplace("X-CSRF-Token", "invalid_token_12345678901234567890");
+  const auto invalid_token = client->request("POST", "/client-update-test", body, headers);
+  EXPECT_EQ(invalid_token->status_code, "400 Bad Request");
+  EXPECT_NE(invalid_token->content.string().find("Invalid CSRF token"), std::string::npos);
+  EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
   const auto response = update({{"uuid", uuid}, {"display", display}});
   ASSERT_EQ(response->status_code, "200 OK");
   EXPECT_TRUE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
