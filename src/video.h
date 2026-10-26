@@ -6,9 +6,14 @@
 
 // standard includes
 #include <chrono>
+#include <functional>
+#include <memory>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // local includes
+#include "capture_source.h"
 #include "input.h"
 #include "platform/common.h"
 #include "thread_safe.h"
@@ -43,7 +48,25 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    std::shared_ptr<const rtsp_stream::capture_source_t> source;  ///< Optional immutable managed source; never changes global selection.
+    std::shared_ptr<rtsp_stream::capture_pin_t> source_pin;  ///< Separate, preissued resource lifetime shared by capture and teardown.
   };
+
+  /**
+   * @brief Allocate a resource whose actual control block retains its existing lifetime ticket.
+   * @details The resource is deleted before the ticket is released, including references obtained
+   * through enable_shared_from_this. No owner operation or new ticket acquisition occurs here.
+   */
+  template<class Resource, class Lifetime, class... Args>
+  std::shared_ptr<Resource> make_capture_resource(std::shared_ptr<Lifetime> lifetime, Args &&...args) {
+    if (!lifetime) {
+      return std::make_shared<Resource>(std::forward<Args>(args)...);
+    }
+    return std::shared_ptr<Resource>(new Resource(std::forward<Args>(args)...), [lifetime = std::move(lifetime)](Resource *resource) mutable {
+      delete resource;
+      lifetime.reset();
+    });
+  }
 
   namespace amf {
 
@@ -745,6 +768,72 @@ namespace video {
    * @return 0 when a usable encoder is selected; nonzero when probing fails.
    */
   int probe_encoders();
+
+  /**
+   * @brief Probe only the frozen managed source, retaining the owner-issued pin until resources drain.
+   * @warning The owner must drain previous resource pins before dispatching a fresh epoch.
+   * @param source Immutable source accepted by the owner.
+   * @param pin Resource ticket issued before dispatch; this worker never acquires another ticket.
+   * @return Zero on success, nonzero when the exact binding or encoder is unavailable.
+   */
+  int probe_encoders(const rtsp_stream::capture_source_t &source, std::shared_ptr<rtsp_stream::capture_pin_t> pin);
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /** @brief Inert boundaries for the actual capture/probe/worker paths; absent in production builds. */
+    struct capture_hooks_t {
+      std::function<bool()> allow_probe;  ///< Substitute display enumeration's probe guard.
+      std::function<bool()> needs_reenumeration;  ///< Substitute encoder-device change detection.
+      std::function<bool(encoder_t &, bool, const config_t &)> validate_encoder;  ///< Inert validator reached through the actual managed probe entry.
+      std::function<std::shared_ptr<platf::display_t>(platf::mem_type_e, const std::string &, const config_t &)> open_display;  ///< Substitute the platform display open boundary.
+      std::function<std::vector<std::string>(platf::mem_type_e)> enumerate_displays;  ///< Substitute legacy display enumeration.
+      std::function<void(std::chrono::milliseconds)> retry_wait;  ///< Observe bounded reset retries without sleeping.
+      std::function<std::unique_ptr<encode_session_t>()> sync_encode_session;  ///< Inert encoder inside the real detached synchronous worker.
+      std::function<void()> before_sync_worker_release;  ///< Observe final shared-context release after all local resources and join signaling.
+    };
+
+    /** @brief Install/copy test boundaries under a guard; tests remove them after workers drain. */
+    void set_capture_hooks(std::shared_ptr<const capture_hooks_t> hooks);
+
+    /** @brief Queue harness using the actual producer admission, rejection and worker cleanup functions. */
+    class capture_queue_t {
+    public:
+      explicit capture_queue_t(bool synchronous);
+      ~capture_queue_t();
+      bool submit(config_t config, safe::mail_t mailbox, safe::signal_t *joined, img_event_t *images = nullptr);
+      void stop();
+      void finish();
+      std::size_t pending() const;
+      std::vector<std::shared_ptr<const rtsp_stream::capture_source_t>> sources() const;
+
+    private:
+      struct impl_t;
+      std::unique_ptr<impl_t> impl_;
+    };
+
+    /** @brief Observations from the common production initial-open, switch and reopen decisions. */
+    struct display_cycle_t {
+      bool initial_open = false;  ///< Initial display creation succeeded.
+      bool switch_reinit = false;  ///< The switch request actually requires reinitialization.
+      bool switch_consumed = false;  ///< No pending switch remains after the decision.
+      bool reopened = false;  ///< Explicit reopen succeeded after the bounded retry sequence.
+    };
+
+    display_cycle_t capture_display_cycle(const config_t &config, bool synchronous, int switch_request);
+    /** @brief Invoke the same detached teardown closure used by encode_run. */
+    void detach_encoder_teardown(std::unique_ptr<encode_session_t> session, std::shared_ptr<rtsp_stream::capture_pin_t> pin);
+    /** @brief Check whether an actual encoder selection remains for a particular immutable source. */
+    bool encoder_selected(const std::shared_ptr<const rtsp_stream::capture_source_t> &source);
+    /** @brief Exercise admission at either real shared queue without starting hardware workers. */
+    bool capture_queue_accepts(const config_t &first, const config_t &next, bool synchronous);
+    /** @brief Resolve the selector used by initial capture and all reopen attempts. */
+    std::string capture_selector(const config_t &config, const std::string &legacy_selector);
+    /** @brief Run actual encoder selection/cache logic with an inert validator and no OS enumeration. */
+    int probe_encoders(const config_t &config, const std::function<bool(encoder_t &, bool, const config_t &)> &validate);
+    /** @brief Reset only the selection/cache state between inert probe cases. */
+    void reset_encoder_selection();
+  }  // namespace test_support
+#endif
 
   // Several NTSC standard refresh rates are hardcoded here, because their
   // true rate requires a denominator of 1001. ffmpeg's av_d2q() would assume it could

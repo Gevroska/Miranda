@@ -13,6 +13,7 @@
 #include <format>
 #include <fstream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -471,8 +472,7 @@ namespace nvhttp {
   template<class Handler>
   auto permitted(permissions::mask_t required, Handler handler) {
     return authenticated([required, handler = std::move(handler)](auto response, auto request, const auto &identity) {
-      if (!rtsp_stream::authorize_operation(identity.uuid, identity.cert, required, [&]() {
-            handler(response, request, identity);
+      if (!rtsp_stream::authorize_operation(identity.uuid, identity.cert, required, []() {
           })) {
         pt::ptree tree;
         tree.put("root.<xmlattr>.status_code", 403);
@@ -481,6 +481,8 @@ namespace nvhttp {
         pt::write_xml(data, tree);
         response->write(data.str());
         response->close_connection_after_response = true;
+      } else {
+        handler(std::move(response), std::move(request), identity);
       }
     });
   }
@@ -1490,9 +1492,9 @@ namespace nvhttp {
     tree.put("root.Permission", grant);
     std::pair<int, std::string> current_application {0, ""};
     if (permissions::allows(grant, permissions::view)) {
-      rtsp_stream::catalog_operation([&]() {
-        current_application = proc::proc.active_identity();
-      });
+      const auto snapshot = proc::proc.published_snapshot();
+      current_application = {snapshot->lifetime.appid, snapshot->lifetime.app_uuid};
+      rtsp_stream::refresh_process_liveness();
     }
     const auto current_appid = current_application.first;
     tree.put("root.PairStatus", pair_status);
@@ -1532,7 +1534,26 @@ namespace nvhttp {
    */
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
-    proc::refresh(config::stream.file_apps);
+    const auto identity = request_client_identity(request);
+    if (!identity) {
+      unauthorized(std::move(response), std::move(request));
+      return;
+    }
+    const auto published = proc::proc.published_snapshot();
+    auto refreshed = std::make_shared<int>(published->operation_in_progress ? 200 : 503);
+    try {
+      auto operation = rtsp_stream::process_operation([file = config::stream.file_apps, identity = *identity, refreshed]() {
+        const auto state = proc::proc.lock_state();
+        const auto current = current_client(identity.uuid, identity.cert);
+        if (!current || current->revision != identity.revision || !permissions::allows(current->permissions, permissions::list)) {
+          return;
+        }
+        *refreshed = proc::read_catalog_now(file).status;
+      });
+      if (!published->operation_in_progress) {
+        operation.get();
+      }
+    } catch (...) {}
 
     pt::ptree tree;
 
@@ -1547,9 +1568,19 @@ namespace nvhttp {
     auto &apps = tree.add_child("root", pt::ptree {});
 
     apps.put("<xmlattr>.status_code", 200);
+    if (!published->operation_in_progress && *refreshed != 200) {
+      apps.put("<xmlattr>.status_code", 503);
+      return;
+    }
 
     std::size_t index = 0;
-    for (const auto &proc : proc::proc.apps_snapshot()) {
+    const auto current = current_client(identity->uuid, identity->cert);
+    if (!current || current->revision != identity->revision || !permissions::allows(current->permissions, permissions::list)) {
+      apps.put("<xmlattr>.status_code", 403);
+      return;
+    }
+    const auto observation = published->operation_in_progress ? published : proc::proc.published_snapshot();
+    for (const auto &proc : *observation->apps) {
       pt::ptree app;
 
       app.put("IsHdrSupported"s, video::active_hevc_mode >= 3 ? 1 : 0);
@@ -1594,6 +1625,127 @@ namespace nvhttp {
     } catch (const std::exception &) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "Invalid stream parameters");
+      return;
+    }
+    if (rtsp_stream::has_source_backend()) {
+      struct application_operation_t {
+        bool execute = false;
+        std::uint64_t instance = 0;
+      };
+
+      auto application = std::make_shared<application_operation_t>();
+      const auto encryption = net::encryption_mode_for_address(request->remote_endpoint().address());
+      auto status = rtsp_stream::prepare_source_launch(session, [session, args, identity, resuming, encryption, &host_audio, application](const rtsp_stream::source_snapshot_t &active) -> std::pair<int, std::shared_ptr<const display_policy::source_request_t>> {
+        const auto client = current_client(identity.uuid, identity.cert);
+        if (!client || !permissions::allows(client->permissions, permissions::view)) {
+          return {403, {}};
+        }
+        if (args.count("appid") > 1 || args.count("appuuid") > 1) {
+          return {400, {}};
+        }
+        const auto observation = proc::proc.published_snapshot();
+        const auto current = std::pair {observation->lifetime.appid, observation->lifetime.app_uuid};
+        const auto selected_current = active.managed ? std::pair {active.appid, active.app_uuid} : current;
+        std::vector<std::pair<int, std::string>> applications;
+        const auto &apps = *observation->apps;
+        for (const auto &app : apps) {
+          applications.emplace_back(std::stoi(app.id), app.uuid);
+        }
+        std::pair<int, std::string> selected;
+        try {
+          selected = proc::catalog::resolve(args.contains("appid") ? std::optional {get_arg(args, "appid")} : std::nullopt, args.contains("appuuid") ? std::optional {get_arg(args, "appuuid")} : std::nullopt, applications, selected_current, resuming);
+        } catch (const proc::catalog::error &error) {
+          return {error.status, {}};
+        }
+        const bool same = selected == selected_current && (selected_current.first > 0 || active.managed);
+        if (!same && !permissions::allows(client->permissions, permissions::launch)) {
+          return {403, {}};
+        }
+        if (active.managed && !same) {
+          return {503, {}};
+        }
+        if (!session->rtsp_cipher && encryption == config::ENCRYPTION_MODE_MANDATORY) {
+          return {403, {}};
+        }
+        session->appid = selected.first;
+        session->app_uuid = selected.second;
+        if (!active.managed && args.contains("localAudioPlayMode")) {
+          host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+        }
+        session->host_audio = host_audio;
+        application->execute = selected.first > 0 && !same;
+        if (active.managed) {
+          return {200, active.request};
+        }
+        display_policy::fresh_source_t fresh;
+        fresh.authenticated_client_uuid = client->uuid;
+        fresh.application_uuid = selected.first > 0 ? std::optional {selected.second} : std::nullopt;
+        fresh.device = client->display;
+        fresh.device_preferences_valid = client->display_valid;
+        fresh.selected_mode = {{static_cast<std::uint32_t>(session->width), static_cast<std::uint32_t>(session->height)}, {static_cast<std::uint32_t>(session->fps), 1}, session->enable_hdr};
+        for (const auto &app : apps) {
+          if (app.uuid == selected.second) {
+            fresh.app_force_virtual = app.force_virtual_display;
+            fresh.application_has_lifetime = !app.cmd.empty();
+            break;
+          }
+        }
+        const auto parsed = display_device::parse_configuration(config::video, *session);
+        if (std::holds_alternative<display_device::failed_to_parse_tag_t>(parsed)) {
+          return {503, {}};
+        }
+        if (const auto configuration = std::get_if<display_device::SingleDisplayConfiguration>(&parsed)) {
+          if (configuration->m_resolution) {
+            fresh.selected_mode.resolution = {configuration->m_resolution->m_width, configuration->m_resolution->m_height};
+          }
+          if (configuration->m_refresh_rate) {
+            const auto rate = std::get_if<display_device::Rational>(&*configuration->m_refresh_rate);
+            if (!rate) {
+              return {503, {}};
+            }
+            fresh.selected_mode.refresh_rate = {rate->m_numerator, rate->m_denominator};
+          }
+          if (configuration->m_hdr_state) {
+            fresh.requested_hdr = *configuration->m_hdr_state == display_device::HdrState::Enabled;
+          }
+        }
+        return {200, display_policy::resolve(config::video, fresh)};
+      },
+                                                       [session, application]() {
+                                                         if (!application->execute) {
+                                                           return 200;
+                                                         }
+                                                         const auto result = proc::proc.execute(session->appid, session, &application->instance);
+                                                         return result ? result : 200;
+                                                       },
+                                                       [application]() {
+                                                         if (application->execute) {
+                                                           proc::proc.terminate_instance(application->instance);
+                                                         }
+                                                       },
+                                                       [session, file = config::stream.file_apps, identity]() {
+                                                         const auto state = proc::proc.lock_state();
+                                                         const auto current = current_client(identity.uuid, identity.cert);
+                                                         if (session->source_cancel->load() || !current || current->revision != session->authorization_revision || !permissions::allows(current->permissions, permissions::view)) {
+                                                           return;
+                                                         }
+                                                         const auto refreshed = proc::read_catalog_now(file);
+                                                         if (refreshed.status != 200) {
+                                                           throw std::runtime_error {"Application catalog refresh failed"};
+                                                         }
+                                                       });
+      const auto current = current_client(identity.uuid, identity.cert);
+      if (status == 200 && (!current || current->revision != session->authorization_revision || !permissions::allows(current->permissions, permissions::view))) {
+        rtsp_stream::launch_session_clear(session->id);
+        status = 403;
+      }
+      tree.put("root.<xmlattr>.status_code", status);
+      if (status != 200) {
+        tree.put("root.<xmlattr>.status_message", status == 403 ? "Permission denied or required encryption unavailable" : "Managed source preparation failed or another operation is pending");
+        return;
+      }
+      tree.put("root.sessionUrl0", std::format("{}{}:{}", session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
+      tree.put(result_field, 1);
       return;
     }
     bool configured = false;
@@ -1736,12 +1888,11 @@ namespace nvhttp {
     tree.put("root.cancel", 0);
     tree.put("root.<xmlattr>.status_code", 500);
 
-    rtsp_stream::stop_application([]() {
-      if (proc::proc.running() > 0) {
-        proc::proc.terminate();
-      }
-      display_device::revert_configuration();
-    });
+    const auto identity = request_client_identity(request);
+    if (!identity || !rtsp_stream::stop_process_application(rtsp_stream::process_authority_t {identity->uuid, identity->cert, identity->revision, permissions::launch})) {
+      tree.put("root.<xmlattr>.status_code", 403);
+      return;
+    }
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
   }
@@ -1756,7 +1907,15 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     auto args = request->parse_query_string();
-    auto app_image = proc::proc.get_app_image((int) util::from_view(get_arg(args, "appid")));
+    const auto selected = (int) util::from_view(get_arg(args, "appid"));
+    std::string app_image;
+    for (const auto &app : *proc::proc.published_snapshot()->apps) {
+      if (std::stoi(app.id) == selected) {
+        app_image = app.image_path;
+        break;
+      }
+    }
+    app_image = proc::validate_app_image_path(app_image);
 
     std::ifstream in(app_image, std::ios::binary);
     SimpleWeb::CaseInsensitiveMultimap headers;

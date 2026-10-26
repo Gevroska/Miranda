@@ -7,6 +7,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -34,6 +35,7 @@
 #include "httpcommon.h"
 #include "input.h"
 #include "logging.h"
+#include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
 #include "system_tray.h"
@@ -56,11 +58,31 @@ namespace proc {
 #ifdef SUNSHINE_TESTS
   namespace {
     std::function<void(const boost::process::v1::environment &)> undo_environment_hook;  ///< Fixture observer installed only when no command consumer is active.
-  }
+    std::function<lifetime_snapshot_t()> lifetime_snapshot_hook;  ///< Synthetic process lifetime for isolated owner cases.
+    std::function<void()> execute_entry_hook;
+    std::function<void()> legacy_restore_hook;
+    std::function<void()> refresh_published_hook;
+  }  // namespace
 
   namespace test_support {
     void set_undo_environment_hook(std::function<void(const boost::process::v1::environment &)> hook) {
       undo_environment_hook = std::move(hook);
+    }
+
+    void set_lifetime_snapshot_hook(std::function<lifetime_snapshot_t()> hook) {
+      lifetime_snapshot_hook = std::move(hook);
+    }
+
+    void set_execute_entry_hook(std::function<void()> hook) {
+      execute_entry_hook = std::move(hook);
+    }
+
+    void set_legacy_restore_hook(std::function<void()> hook) {
+      legacy_restore_hook = std::move(hook);
+    }
+
+    void set_refresh_published_hook(std::function<void()> hook) {
+      refresh_published_hook = std::move(hook);
     }
   }  // namespace test_support
 #endif
@@ -274,8 +296,34 @@ namespace proc {
 #endif
   }
 
-  int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+  int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session, std::uint64_t *created_instance) {
+    if (created_instance) {
+      *created_instance = 0;
+    }
+#ifdef SUNSHINE_TESTS
+    if (execute_entry_hook) {
+      execute_entry_hook();
+    }
+#endif
     const auto state = lock_state();
+    if (launch_session->source_generation) {
+      if (launch_session->source_cancel && launch_session->source_cancel->load()) {
+        return 403;
+      }
+      const auto authority = nvhttp::current_client(launch_session->client_uuid, launch_session->client_cert);
+      if (!authority || authority->revision != launch_session->authorization_revision || !permissions::allows(authority->permissions, permissions::launch)) {
+        return 403;
+      }
+      const auto selected = std::find_if(_apps.begin(), _apps.end(), [app_id, &launch_session](const auto &app) {
+        return app.id == std::to_string(app_id) && app.uuid == launch_session->app_uuid;
+      });
+      if (selected == _apps.end()) {
+        return 404;
+      }
+      // The owner already owns display mutation for this replacement's preparation.
+      _managed_source_instance = _instance;
+      _managed_source_generation = launch_session->source_generation;
+    }
     // Ensure starting from a clean slate
     terminate();
 
@@ -289,9 +337,20 @@ namespace proc {
     }
 
     _app_id = app_id;
+    static std::atomic_uint64_t next_instance {0};
+    _instance = ++next_instance;
+    _managed_source_instance = launch_session->source_generation ? _instance : 0;
+    _managed_source_generation = launch_session->source_generation;
     _app = *iter;
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
+    const auto admission_cancelled = [&]() {
+      if (!launch_session->source_generation) {
+        return false;
+      }
+      const auto current = nvhttp::current_client(launch_session->client_uuid, launch_session->client_cert);
+      return (launch_session->source_cancel && launch_session->source_cancel->load()) || !current || current->revision != launch_session->authorization_revision || !permissions::allows(current->permissions, permissions::launch);
+    };
 
     // Add Stream-specific environment variables
     (*_env)["SUNSHINE_APP_ID"] = std::to_string(_app_id);
@@ -340,6 +399,9 @@ namespace proc {
     });
 
     for (; _app_prep_it != std::end(_app.prep_cmds); ++_app_prep_it) {
+      if (admission_cancelled()) {
+        return 403;
+      }
       auto &cmd = *_app_prep_it;
 
       // Skip empty commands
@@ -376,7 +438,13 @@ namespace proc {
       }
     }
 
+    if (admission_cancelled()) {
+      return 403;
+    }
     for (auto &cmd : _app.detached) {
+      if (admission_cancelled()) {
+        return 403;
+      }
       const auto command = prepare_command(cmd);
       boost::filesystem::path working_dir = _app.working_dir.empty() ?
                                               find_working_directory(command, *_env) :
@@ -390,6 +458,9 @@ namespace proc {
       }
     }
 
+    if (admission_cancelled()) {
+      return 403;
+    }
     if (_app.cmd.empty()) {
       BOOST_LOG(info) << "Executing [Desktop]"sv;
       placebo = true;
@@ -410,11 +481,30 @@ namespace proc {
 
     fg.disable();
 
+    if (created_instance) {
+      *created_instance = _instance;
+    }
+    refresh_published();
+
     return 0;
   }
 
   int proc_t::running() {
     const auto state = lock_state();
+    return observe_lifetime(true).appid;
+  }
+
+  lifetime_snapshot_t proc_t::observe_lifetime(bool cleanup) {
+#ifdef SUNSHINE_TESTS
+    if (lifetime_snapshot_hook) {
+      auto observation = lifetime_snapshot_hook();
+      if (!observation.tracked && !observation.placeholder) {
+        observation.appid = 0;
+        observation.app_uuid.clear();
+      }
+      return observation;
+    }
+#endif
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -425,32 +515,102 @@ namespace proc {
     });
 #endif
 
+    if (_app_id <= 0) {
+      return {0, {}, _instance, false, false};
+    }
     if (placebo) {
-      return _app_id;
-    } else if (_app.wait_all && _process_group && platf::process_group_running((std::uintptr_t) _process_group.native_handle())) {
-      // The app is still running if any process in the group is still running
-      return _app_id;
-    } else if (_process.running()) {
-      // The app is still running only if the initial process launched is still running
-      return _app_id;
-    } else if (_app.auto_detach && _process.native_exit_code() == 0 && std::chrono::steady_clock::now() - _app_launch_time < 5s) {
+      return {_app_id, _app.uuid, _instance, false, true};
+    }
+    // The same observation decides logical identity and genuine lifetime. Never reread the
+    // child after running() and turn a successful launcher into a false terminal publication.
+    const bool tracked = (_app.wait_all && _process_group && platf::process_group_running((std::uintptr_t) _process_group.native_handle())) || _process.running();
+    if (tracked) {
+      return {_app_id, _app.uuid, _instance, true, false};
+    }
+    if (_app.auto_detach && _process && _process.native_exit_code() == 0 && std::chrono::steady_clock::now() - _app_launch_time < 5s) {
       BOOST_LOG(info) << "App exited gracefully within 5 seconds of launch. Treating the app as a detached command."sv;
       BOOST_LOG(info) << "Adjust this behavior in the Applications tab or apps.json if this is not what you want."sv;
       placebo = true;
-      return _app_id;
+      return {_app_id, _app.uuid, _instance, false, true};
     }
 
     // Perform cleanup actions now if needed
-    if (_process) {
+    if (cleanup && _process) {
       BOOST_LOG(info) << "App exited with code ["sv << _process.native_exit_code() << ']';
       terminate();
     }
 
-    return 0;
+    return {0, {}, _instance, false, false};
+  }
+
+  lifetime_snapshot_t proc_t::lifetime_snapshot() {
+    const auto state = lock_state();
+    return observe_lifetime(false);
+  }
+
+  std::shared_ptr<const published_snapshot_t> proc_t::published_snapshot() const {
+    return _publication->snapshot.load();
+  }
+
+  void proc_t::publish_snapshot(std::shared_ptr<const published_snapshot_t> snapshot) noexcept {
+    _publication->snapshot.store(std::move(snapshot));
+  }
+
+  void proc_t::publish_operation(bool busy) {
+    auto previous = _publication->snapshot.load();
+    for (;;) {
+      auto next = std::make_shared<published_snapshot_t>(*previous);
+      next->operation_in_progress = busy;
+      std::shared_ptr<const published_snapshot_t> immutable = std::move(next);
+      if (_publication->snapshot.compare_exchange_weak(previous, immutable)) {
+        return;
+      }
+    }
+  }
+
+  void proc_t::refresh_published() {
+    const auto state = lock_state();
+#ifdef SUNSHINE_TESTS
+    if (_app_id > 0 && refresh_published_hook) {
+      refresh_published_hook();
+    }
+#endif
+    auto next = std::make_shared<published_snapshot_t>();
+    next->lifetime = observe_lifetime(false);
+    next->operation_in_progress = published_snapshot()->operation_in_progress;
+    next->app_name = _app.name;
+    next->apps = std::make_shared<const std::vector<ctx_t>>(_apps);
+    next->catalog_path = _catalog_path;
+    next->catalog_revision = _catalog_revision;
+    publish_snapshot(std::move(next));
+  }
+
+  std::optional<source_claim_t> proc_t::claim_source(std::uint64_t instance, std::uint64_t generation) {
+    const auto state = lock_state();
+    if (!instance || !generation || _instance != instance || _app_id <= 0) {
+      return std::nullopt;
+    }
+    const source_claim_t claim {instance, generation, _managed_source_instance, _managed_source_generation};
+    _managed_source_instance = instance;
+    _managed_source_generation = generation;
+    return claim;
+  }
+
+  bool proc_t::restore_source_claim(const source_claim_t &claim) {
+    const auto state = lock_state();
+    if (_instance != claim.instance || _managed_source_instance != claim.instance || _managed_source_generation != claim.generation) {
+      return false;
+    }
+    _managed_source_instance = claim.previous_instance;
+    _managed_source_generation = claim.previous_generation;
+    return true;
   }
 
   void proc_t::terminate() {
     const auto state = lock_state();
+    const auto managed_instance = _managed_source_instance;
+    _managed_source_instance = 0;
+    _managed_source_generation = 0;
     input::terminate_gamepads();
     std::error_code ec;
     placebo = false;
@@ -501,10 +661,43 @@ namespace proc {
       system_tray::update_tray_stopped(proc::proc.get_last_run_app_name());
 #endif
 
-      display_device::revert_configuration();
+      if (!managed_instance) {
+#ifdef SUNSHINE_TESTS
+        if (legacy_restore_hook) {
+          legacy_restore_hook();
+        } else
+#endif
+          display_device::revert_configuration();
+      }
     }
 
     _app_id = -1;
+    refresh_published();
+    if (managed_instance) {
+      try {
+        rtsp_stream::application_exited(managed_instance);
+      } catch (...) {
+        // The owner's retained-app timer also observes exit if event allocation fails.
+      }
+    }
+  }
+
+  bool proc_t::terminate_instance(std::uint64_t instance) {
+    const auto state = lock_state();
+    if (!instance || _instance != instance || _app_id <= 0) {
+      return false;
+    }
+    terminate();
+    return true;
+  }
+
+  bool proc_t::terminate_source(std::uint64_t instance, std::uint64_t generation) {
+    const auto state = lock_state();
+    if (_app_id <= 0 || !((instance && _instance == instance) || (generation && _managed_source_generation == generation))) {
+      return false;
+    }
+    terminate();
+    return true;
   }
 
   state_guard_t proc_t::lock_state() const {
@@ -1057,90 +1250,121 @@ namespace proc {
     }
 
     /**
-     * @brief Execute owner -> process state -> state-file preparation, replace, then nonthrowing publication.
+     * @brief Execute process lane -> process state -> state-file preparation, replacement and nonthrowing publication.
      */
-    catalog_response transact_catalog(const std::string &file, const std::optional<std::string> &expected, const std::function<void(catalog::json &)> &mutation) {
+    catalog_response transact_catalog_now(const std::string &file, const std::optional<std::string> &expected, const std::function<void(catalog::json &)> &mutation) {
       catalog_response response;
-      rtsp_stream::catalog_operation([&]() {
-        try {
-          // Owner -> process state -> state-file. Never acquire this guard before owner dispatch.
-          const auto state = proc.lock_state();
-          auto path = std::filesystem::absolute(file).lexically_normal().string();
-          std::string revision;
-          std::optional<proc_t> prepared;
-          bool ready = false;
-          const auto active = proc.active_identity();
-          const auto success = http::update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
-            try {
-              const auto current_revision = util::hex(crypto::hash(original)).to_string();
-              if (expected && *expected != current_revision) {
-                throw catalog::error {"Application catalog changed; reload before saving", 409};
-              }
-              auto tree = catalog::parse(original);
-              catalog::validate(tree);
-              const auto before = tree;
+      try {
+        // The owner orders this lane; only the worker acquires process state and the state-file guard.
+        const auto state = proc.lock_state();
+        auto path = std::filesystem::absolute(file).lexically_normal().string();
+        std::string revision;
+        std::optional<proc_t> prepared;
+        std::shared_ptr<const published_snapshot_t> publication;
+        bool ready = false;
+        const auto active = proc.active_identity();
+        const auto success = http::update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
+          try {
+            const auto current_revision = util::hex(crypto::hash(original)).to_string();
+            if (expected && *expected != current_revision) {
+              throw catalog::error {"Application catalog changed; reload before saving", 409};
+            }
+            auto tree = catalog::parse(original);
+            catalog::validate(tree);
+            const auto before = tree;
+            catalog::normalize(tree, allocation_inputs(tree, active));
+            if (mutation) {
+              mutation(tree);
               catalog::normalize(tree, allocation_inputs(tree, active));
-              if (mutation) {
-                mutation(tree);
-                catalog::normalize(tree, allocation_inputs(tree, active));
+            }
+            const auto changed = tree != before;
+            auto bytes = changed ? tree.dump(4) + "\n" : original;
+            revision = util::hex(crypto::hash(bytes)).to_string();
+            if (!proc.catalog_matches(path, revision)) {
+              prepared = parse_text(bytes);
+              if (!prepared) {
+                throw catalog::error {"Application runtime settings could not be prepared"};
               }
-              const auto changed = tree != before;
-              auto bytes = changed ? tree.dump(4) + "\n" : original;
-              revision = util::hex(crypto::hash(bytes)).to_string();
-              if (!proc.catalog_matches(path, revision)) {
-                prepared = parse_text(bytes);
-                if (!prepared) {
-                  throw catalog::error {"Application runtime settings could not be prepared"};
+              proc.prepare_apps_and_env(*prepared);
+            }
+            // Response and every fallible runtime/environment allocation precede replacement.
+            tree["revision"] = revision;
+            tree["status"] = true;
+            // Legacy scalar conversion is response-only; persisted typed/foreign values survive.
+            for (auto &app : tree["apps"]) {
+              for (const auto *key : {"elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all"}) {
+                if (app.contains(key) && app[key].is_string()) {
+                  app[key] = app[key] == "true";
                 }
-                proc.prepare_apps_and_env(*prepared);
               }
-              // Response and every fallible runtime/environment allocation precede replacement.
-              tree["revision"] = revision;
-              tree["status"] = true;
-              // Legacy scalar conversion is response-only; persisted typed/foreign values survive.
-              for (auto &app : tree["apps"]) {
-                for (const auto *key : {"elevated", "exclude-global-prep-cmd", "auto-detach", "wait-all"}) {
-                  if (app.contains(key) && app[key].is_string()) {
-                    app[key] = app[key] == "true";
-                  }
-                }
-                if (app.contains("exit-timeout") && app["exit-timeout"].is_string()) {
-                  app["exit-timeout"] = std::stoi(app["exit-timeout"].get<std::string>());
-                }
-                if (app.contains("prep-cmd")) {
-                  for (auto &cmd : app["prep-cmd"]) {
-                    if (cmd.contains("elevated") && cmd["elevated"].is_string()) {
-                      cmd["elevated"] = cmd["elevated"] == "true";
-                    }
+              if (app.contains("exit-timeout") && app["exit-timeout"].is_string()) {
+                app["exit-timeout"] = std::stoi(app["exit-timeout"].get<std::string>());
+              }
+              if (app.contains("prep-cmd")) {
+                for (auto &cmd : app["prep-cmd"]) {
+                  if (cmd.contains("elevated") && cmd["elevated"].is_string()) {
+                    cmd["elevated"] = cmd["elevated"] == "true";
                   }
                 }
               }
-              response = {200, tree.dump()};
-              ready = true;
-              return changed ? std::optional {std::move(bytes)} : std::nullopt;
-            } catch (const catalog::error &error) {
-              response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
-              return std::nullopt;
             }
-          });
-          if (!success || !ready) {
-            // The core consumes exceptions to preserve existing permission-writer behavior.
-            if (response.status == 200 || response.body.empty()) {
-              response = {500, R"({"status":false,"error":"Application catalog could not be saved; previous runtime retained"})"};
-            }
-            return;
+            response = {200, tree.dump()};
+            auto observation = std::make_shared<published_snapshot_t>(*proc.published_snapshot());
+            observation->lifetime = proc.lifetime_snapshot();
+            observation->app_name = proc.get_last_run_app_name();
+            observation->apps = std::make_shared<const std::vector<ctx_t>>(prepared ? prepared->apps_snapshot() : proc.apps_snapshot());
+            observation->catalog_path = path;
+            observation->catalog_revision = revision;
+            publication = std::move(observation);
+            ready = true;
+            return changed ? std::optional {std::move(bytes)} : std::nullopt;
+          } catch (const catalog::error &error) {
+            response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
+            return std::nullopt;
           }
-          if (prepared) {
-            proc.publish_apps_and_env(*prepared, state);
+        });
+        if (!success || !ready) {
+          // The core consumes exceptions to preserve existing permission-writer behavior.
+          if (response.status == 200 || response.body.empty()) {
+            response = {500, R"({"status":false,"error":"Application catalog could not be saved; previous runtime retained"})"};
           }
-          proc.publish_catalog_revision(path, revision, state);
-        } catch (const catalog::error &error) {
-          response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
-        } catch (const std::exception &) {
-          response = {500, R"({"status":false,"error":"Application catalog unavailable; previous runtime retained"})"};
+          return response;
         }
-      });
+        if (prepared) {
+          proc.publish_apps_and_env(*prepared, state);
+        }
+        proc.publish_catalog_revision(path, revision, state);
+        proc.publish_snapshot(std::move(publication));
+      } catch (const catalog::error &error) {
+        response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
+      } catch (const std::exception &) {
+        response = {500, R"({"status":false,"error":"Application catalog unavailable; previous runtime retained"})"};
+      }
       return response;
+    }
+
+    catalog_response transact_catalog(std::string file, std::optional<std::string> expected, std::function<void(catalog::json &)> mutation) {
+      if (rtsp_stream::on_process_worker()) {
+        return transact_catalog_now(file, expected, mutation);
+      }
+      auto task = std::make_shared<std::packaged_task<catalog_response()>>([file = std::move(file), expected = std::move(expected), mutation = std::move(mutation)]() {
+        return transact_catalog_now(file, expected, mutation);
+      });
+      auto result = task->get_future();
+      rtsp_stream::catalog_operation([task]() {
+        (*task)();
+      });
+      return result.get();
+    }
+
+    template<class Function>
+    std::future<catalog_response> queue_catalog(Function function) {
+      auto task = std::make_shared<std::packaged_task<catalog_response()>>(std::move(function));
+      auto result = task->get_future();
+      rtsp_stream::process_operation([task]() {
+        (*task)();
+      });
+      return result;
     }
   }  // namespace
 
@@ -1148,11 +1372,33 @@ namespace proc {
     return transact_catalog(file, std::nullopt, {});
   }
 
+  catalog_response read_catalog_now(const std::string &file) {
+    return transact_catalog_now(file, std::nullopt, {});
+  }
+
+  std::future<catalog_response> read_catalog_async(std::string file) {
+    return queue_catalog([file = std::move(file)]() {
+      return read_catalog_now(file);
+    });
+  }
+
+  std::future<catalog_response> save_catalog_app_async(std::string file, std::string revision, std::string edit) {
+    return queue_catalog([file = std::move(file), revision = std::move(revision), edit = std::move(edit)]() {
+      return save_catalog_app(file, revision, edit);
+    });
+  }
+
+  std::future<catalog_response> delete_catalog_app_async(std::string file, std::string revision, std::string uuid) {
+    return queue_catalog([file = std::move(file), revision = std::move(revision), uuid = std::move(uuid)]() {
+      return delete_catalog_app(file, revision, uuid);
+    });
+  }
+
   catalog_response save_catalog_app(const std::string &file, const std::string &revision, const std::string &edit) {
     if (revision.empty()) {
       return {428, R"({"status":false,"error":"Application catalog revision is required"})"};
     }
-    return transact_catalog(file, revision, [&](auto &tree) {
+    return transact_catalog(file, revision, [edit](auto &tree) {
       auto input = catalog::parse(edit);
       if (!input.is_object()) {
         throw catalog::error {"application: expected an object"};
@@ -1192,7 +1438,7 @@ namespace proc {
     if (revision.empty()) {
       return {428, R"({"status":false,"error":"Application catalog revision is required"})"};
     }
-    return transact_catalog(file, revision, [&](auto &tree) {
+    return transact_catalog(file, revision, [uuid](auto &tree) {
       const auto target = catalog::canonical_uuid(uuid);
       if (!target) {
         throw catalog::error {"apps.uuid: invalid UUID"};

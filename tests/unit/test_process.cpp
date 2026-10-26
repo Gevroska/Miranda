@@ -23,6 +23,7 @@
 #include <src/httpcommon.h>
 #include <src/logging.h>
 #include <src/process.h>
+#include <src/stream.h>
 #include <src/utility.h>
 
 namespace fs = std::filesystem;
@@ -393,6 +394,107 @@ protected:
   fs::path test_dir;
 };
 
+/** @brief Real successful launcher exits observed at deterministic publication boundaries, without a source backend. */
+class ProcessPublicationTest: public ProcessRefreshTest {
+protected:
+  void SetUp() override {
+    ProcessRefreshTest::SetUp();
+    saved_proc = std::move(proc::proc);
+    proc::proc = proc::proc_t {};
+    proc::test_support::set_legacy_restore_hook([this]() {
+      ++legacy_restores;
+    });
+    gate = test_dir / "publication.release";
+    ASSERT_FALSE(rtsp_stream::has_source_backend());
+  }
+
+  void TearDown() override {
+    proc::test_support::set_refresh_published_hook({});
+    std::ofstream {gate} << "release";
+    proc::proc.terminate();
+    proc::test_support::set_legacy_restore_hook({});
+    proc::proc = std::move(saved_proc);
+    ProcessRefreshTest::TearDown();
+  }
+
+  void configure_launcher(bool gated) {
+    boost::process::v1::environment env = boost::this_process::environment();
+    env["P3C_PUBLICATION_GATE"] = gate.string();
+    proc::ctx_t app {};
+    app.id = "43";
+    app.uuid = "33333333-3333-4333-8333-333333333333";
+    app.name = "Short launcher";
+    app.auto_detach = true;
+    app.wait_all = false;
+#ifdef _WIN32
+    app.cmd = "cmd.exe /D /C exit 0";
+    const auto script = test_dir / "publication.cmd";
+    if (gated) {
+      std::ofstream {script} << "@echo off\r\n:wait\r\nif exist \"%P3C_PUBLICATION_GATE%\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n";
+      app.cmd = "cmd.exe /D /C \"" + script.string() + "\"";
+    }
+#else
+    app.cmd = "/bin/true";
+    const auto script = test_dir / "publication.sh";
+    if (gated) {
+      std::ofstream {script} << "while [ ! -e \"$P3C_PUBLICATION_GATE\" ]; do sleep 0.01; done\nexit 0\n";
+      app.cmd = "/bin/sh \"" + script.string() + "\"";
+    }
+#endif
+    std::vector<proc::ctx_t> apps;
+    apps.emplace_back(std::move(app));
+    proc::proc = proc::proc_t {std::move(env), std::move(apps)};
+  }
+
+  void expect_placeholder_before_another_refresh() {
+    const auto published = proc::proc.published_snapshot();
+    ASSERT_EQ(published->lifetime.appid, 43);
+    EXPECT_EQ(published->lifetime.app_uuid, "33333333-3333-4333-8333-333333333333");
+    EXPECT_TRUE(published->lifetime.placeholder);
+    EXPECT_FALSE(published->lifetime.tracked);
+    EXPECT_FALSE(stream::test_support::control_would_terminate(false));
+    EXPECT_FALSE(stream::test_support::control_would_terminate(true));
+    EXPECT_FALSE(stream::test_support::last_session_would_revert(false));
+    EXPECT_TRUE(stream::test_support::last_session_would_revert(true));
+    EXPECT_EQ(proc::proc.published_snapshot(), published);
+    EXPECT_EQ(legacy_restores, 0);
+  }
+
+  proc::proc_t saved_proc;
+  fs::path gate;
+  int legacy_restores = 0;
+};
+
+TEST_F(ProcessPublicationTest, SuccessfulExitBeforeInitialPublicationPreservesLogicalLauncher) {
+  configure_launcher(false);
+  int observations = 0;
+  proc::test_support::set_refresh_published_hook([&]() {
+    ++observations;
+    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+  });
+  ASSERT_EQ(proc::proc.execute(43, std::make_shared<rtsp_stream::launch_session_t>()), 0);
+  ASSERT_EQ(observations, 1);
+  expect_placeholder_before_another_refresh();
+  EXPECT_EQ(observations, 1);
+}
+
+TEST_F(ProcessPublicationTest, SuccessfulExitAfterLiveObservationBeforePublicationPreservesLogicalLauncher) {
+  configure_launcher(true);
+  ASSERT_EQ(proc::proc.execute(43, std::make_shared<rtsp_stream::launch_session_t>()), 0);
+  ASSERT_EQ(proc::proc.running(), 43);
+  ASSERT_TRUE(proc::proc.published_snapshot()->lifetime.tracked);
+  int observations = 0;
+  proc::test_support::set_refresh_published_hook([&]() {
+    ++observations;
+    std::ofstream {gate} << "release";
+    ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+  });
+  proc::proc.refresh_published();
+  ASSERT_EQ(observations, 1);
+  expect_placeholder_before_another_refresh();
+  EXPECT_EQ(observations, 1);
+}
+
 /**
  * @brief Test fixture for testing updates to process apps and environment.
  */
@@ -492,6 +594,47 @@ TEST_F(ProcessUpdateTest, UpdateAppsAndEnv_PreservesRunningState) {
   ASSERT_EQ(proc::proc.get_apps().size(), 1u);
   EXPECT_EQ(proc::proc.get_apps()[0].name, "NewApp");
   EXPECT_EQ(proc::proc.running(), 42) << "update_apps_and_env must not reset _app_id or placebo";
+}
+
+TEST_F(ProcessUpdateTest, LifetimeSnapshotExcludesPlaceboAndDistinguishesApplicationInstances) {
+  const auto first = proc::proc.lifetime_snapshot();
+  EXPECT_EQ(first.appid, 42);
+  EXPECT_NE(first.instance, 0U);
+  EXPECT_TRUE(first.placeholder);
+  EXPECT_FALSE(first.tracked);
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(proc::proc.execute(42, launch), 0);
+  const auto second = proc::proc.lifetime_snapshot();
+  EXPECT_GT(second.instance, first.instance);
+  EXPECT_TRUE(second.placeholder);
+  EXPECT_FALSE(second.tracked);
+}
+
+TEST_F(ProcessUpdateTest, AttemptOutputAndExactRollbackDoNotOwnAnEarlierIncarnation) {
+  const auto original = proc::proc.lifetime_snapshot().instance;
+  auto rejected = std::make_shared<rtsp_stream::launch_session_t>();
+  rejected->source_generation = 100;
+  rejected->source_cancel = std::make_shared<std::atomic_bool>(true);
+  std::uint64_t created = 123;
+  EXPECT_EQ(proc::proc.execute(99, rejected, &created), 403);
+  EXPECT_EQ(created, 0U);
+  EXPECT_EQ(proc::proc.lifetime_snapshot().instance, original);
+  EXPECT_FALSE(proc::proc.terminate_instance(original + 1));
+  EXPECT_EQ(proc::proc.running(), 42);
+}
+
+TEST_F(ProcessUpdateTest, OldManagementClaimCannotUnmarkReplacementOrLaterClaimant) {
+  const auto original = proc::proc.lifetime_snapshot().instance;
+  const auto old = proc::proc.claim_source(original, 100);
+  ASSERT_TRUE(old);
+  const auto newer = proc::proc.claim_source(original, 101);
+  ASSERT_TRUE(newer);
+  EXPECT_FALSE(proc::proc.restore_source_claim(*old));
+  EXPECT_TRUE(proc::proc.restore_source_claim(*newer));
+  EXPECT_TRUE(proc::proc.restore_source_claim(*old));
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(proc::proc.execute(42, launch), 0);
+  EXPECT_FALSE(proc::proc.restore_source_claim(*old));
 }
 
 TEST_F(ProcessUpdateTest, UpdateAppsAndEnv_PreservesSessionEnvironment) {
@@ -1174,7 +1317,7 @@ TEST_F(AppCatalogTransactionTest, OrderedDependentEnvironmentSurvivesNormalizati
   EXPECT_FALSE(native_variable_scope::read("AA_P1C_ALIAS"));
 }
 
-TEST_F(AppCatalogTransactionTest, RealExitedChildCleanupSerializesWithOwnerPublicationAndRunsUndoOnce) {
+TEST_F(AppCatalogTransactionTest, RealExitedChildCleanupSerializesWithProcessLanePublicationAndRunsUndoOnce) {
   // No settings manager is installed: real process cleanup must not configure host displays.
   display_device::test_reset_display_device();
   native_variable_scope parent_marker {"P1C_UNDO_ENVIRONMENT", "parent"};
@@ -1215,7 +1358,8 @@ TEST_F(AppCatalogTransactionTest, RealExitedChildCleanupSerializesWithOwnerPubli
     EXPECT_EQ(environment.at("P1C_UNDO_ENVIRONMENT").to_string(), "captured");
   });
   rtsp_stream::test_support::set_owner_hook([&](std::string_view event) {
-    if (event == "operation_posted" && !observed_post.exchange(true)) {
+    if (event == "process_operation_queued" && !observed_post.exchange(true)) {
+      EXPECT_TRUE(rtsp_stream::on_owner_thread());
       posted.set_value();
     }
   });

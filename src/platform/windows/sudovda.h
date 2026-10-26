@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -17,7 +18,11 @@
 #include <vector>
 
 // platform includes
-#include <windows.h>
+// WinSock2.h must be included before Windows.h.
+// clang-format off
+#include <WinSock2.h>
+#include <Windows.h>
+// clang-format on
 #include <winioctl.h>
 
 namespace platf::sudovda {
@@ -41,7 +46,9 @@ namespace platf::sudovda {
     enumeration_timeout,
     heartbeat_failed,
     remove_failed,
-    close_failed
+    close_failed,
+    journal_failed,
+    ownership_unverified
   };
 
   /** @brief The operation that failed, including cleanup independent of acquisition. */
@@ -54,7 +61,8 @@ namespace platf::sudovda {
     add,
     heartbeat,
     remove,
-    close
+    close,
+    journal
   };
 
   /** @brief Structured diagnostic without device paths or other operational state. */
@@ -119,7 +127,11 @@ namespace platf::sudovda {
     wire::target_t target {};  ///< LUID and target ID must both match the add response.
     GUID identity {};  ///< Monitor container GUID, when enumerated.
     std::wstring monitor_path;  ///< Windows monitor interface path, not a libdisplaydevice ID.
-    std::wstring gdi_name;  ///< Capture source name; no fallback source is selected.
+    std::wstring gdi_name;  ///< Enumeration metadata; capture uses the library's verified active selector.
+    LUID source_adapter {};  ///< Source adapter for normalizing QDC_ALL_PATHS alternatives.
+    UINT source {};  ///< Source ID local to that adapter.
+    bool active {};  ///< Whether this path is active; inactive GDI names are not capture selectors.
+    bool source_metadata_valid {};  ///< False only for older injected boundaries without source metadata.
   };
 
   /** @brief Present monitor identities and queryable Windows display targets. */
@@ -180,6 +192,116 @@ namespace platf::sudovda {
   };
 
   struct acquisition_t;
+  class ownership_journal_t;
+
+  /** @brief Generation-bound proof that exact-owned removal and handle close both completed. */
+  class cleanup_receipt_t {
+  public:
+    /** @brief Whether cleanup removed an armed output or closed an attempt that never armed add. */
+    enum class kind_e {
+      removed,
+      unarmed
+    };
+    cleanup_receipt_t(const cleanup_receipt_t &) = default;
+    cleanup_receipt_t &operator=(const cleanup_receipt_t &) = default;
+    /** @brief Return the distinct proof carried by this adapter-issued receipt. */
+    kind_e kind() const;
+
+  private:
+    friend class lease_t;
+    friend class ownership_journal_t;
+    explicit cleanup_receipt_t(std::shared_ptr<ownership_journal_t> journal, GUID identity, std::uint64_t generation, kind_e kind);
+    std::shared_ptr<ownership_journal_t> journal_;
+    GUID identity_ {};
+    std::uint64_t generation_ {};
+    kind_e kind_ {kind_e::removed};
+  };
+
+  /** @brief Evidence supplied by the owner, independently of journal contents or process discovery. */
+  struct recovery_authority_t {
+    std::string deployment;  ///< Expected stable deployment identity, from trusted host configuration.
+    bool trusted_storage {};  ///< Caller verified the journal path and its write authority.
+    bool exclusive_driver_control {};  ///< Actual exclusive deployment; a Miranda mutex alone is insufficient.
+  };
+
+  /** @brief Immutable intent written before hotplug, together with the library's current recovery state. */
+  struct ownership_record_t {
+    GUID identity {};  ///< Only this exact monitor GUID may be acquired or recovered.
+    std::uint64_t generation {};  ///< Nonzero source generation, never a viewer index.
+    std::string deployment;  ///< Stable owner deployment identity.
+    bool initially_headless {};  ///< Explicit empty baseline, never an invalid library topology.
+    std::string baseline;  ///< Serialized pre-add SingleDisplayConfigState; empty only for headless.
+  };
+
+  /** @brief Durable Windows-validated identity evidence for one immutable source generation. */
+  struct ownership_mapping_t {
+    wire::target_t target {};  ///< Exact target whose monitor path was mapped.
+    std::wstring monitor_path;  ///< Validated monitor interface path, independent of GDI names.
+    std::string device_id;  ///< Library ID obtained from that exact Windows path.
+  };
+
+  /**
+   * @brief Atomic ownership and topology journal at a caller-owned secured path.
+   * Creation refuses any outstanding or unreadable record. Recovery requires independent trusted
+   * storage and exclusive-deployment evidence. This is not a trust decision based on JSON alone.
+   */
+  class ownership_journal_t {
+  public:
+    /**
+     * @brief Persist complete cleanup intent before any add; an existing intent blocks acquisition.
+     * observed_devices must come from actual Windows enumeration, never imported settings references.
+     */
+    static std::expected<std::shared_ptr<ownership_journal_t>, failure_t> create(const std::filesystem::path &path, const ownership_record_t &record, const recovery_authority_t &authority, const std::vector<std::string> &observed_devices = {});
+    /** @brief Read and validate one outstanding intent against independently supplied authority. */
+    static std::expected<std::shared_ptr<ownership_journal_t>, failure_t> load(const std::filesystem::path &path, const recovery_authority_t &authority);
+    /** @brief Return the immutable source identity and pre-add baseline. */
+    const ownership_record_t &record() const;
+    /** @brief Revalidate unchanged journal bytes and independent authority before driver access. */
+    bool validate(const recovery_authority_t &authority) const;
+    /** @brief Read the persisted library recovery state; nullopt means a failed or changed journal. */
+    std::optional<std::vector<std::uint8_t>> settings() const;
+    /** @brief Read the last nonempty library episode state, retained atomically when settings clear. */
+    std::optional<std::vector<std::uint8_t>> restoration_state() const;
+    /** @brief Read validated episode reference IDs; absence means the journal changed or failed. */
+    std::optional<std::vector<std::string>> recovery_devices() const;
+    /**
+     * @brief Append actual Windows-observed device IDs before allowing the library to persist them.
+     * At most 256 bounded IDs are retained; capacity failure preserves all earlier recovery evidence.
+     */
+    bool observe_devices(const std::vector<std::string> &device_ids);
+    /** @brief Atomically bind exact GUID/generation/target/path to its Windows-mapped library ID. */
+    bool bind_mapping(const display_t &display, const std::string &device_id);
+    /** @brief Read durable per-generation mapping evidence; absent or stale evidence grants nothing. */
+    std::optional<ownership_mapping_t> mapping() const;
+    /**
+     * @brief Atomically replace library recovery state while retaining cleanup intent and baseline.
+     * Only the active persistence adapter may write while its manager exists; fixture/import callers
+     * must fence and reconstruct that manager so no stale PersistentState cache survives the write.
+     */
+    bool store_settings(const std::vector<std::uint8_t> &settings);
+    /** @brief Persist source retirement only with an exact generation's remove-and-close receipt. */
+    bool retire(const cleanup_receipt_t &receipt);
+    /** @brief Revalidate a receipt against this exact immutable source capability and current bytes. */
+    bool accepts_receipt(const cleanup_receipt_t &receipt) const;
+    /** @brief True when the source is durably retired and only library recovery remains. */
+    bool source_retired() const;
+    /** @brief True only when an absence-checked add intent was durably armed and remains unchanged. */
+    bool add_was_armed() const;
+    /** @brief Atomically rotate a retired source, preserving nonempty library recovery bytes verbatim. */
+    std::expected<std::shared_ptr<ownership_journal_t>, failure_t> begin_next(const ownership_record_t &record, const recovery_authority_t &authority, const std::vector<std::string> &observed_devices = {});
+    /** @brief Clear completed intent only after exact-owned removal and handle close succeeded. */
+    bool complete();
+
+  private:
+    friend class lease_t;
+    struct state_t;
+    explicit ownership_journal_t(std::shared_ptr<state_t> state);
+    void confirm_removal();
+    bool confirm_unarmed();
+    bool arm_add();
+    bool add_armed() const;
+    std::shared_ptr<state_t> state_;
+  };
 
   /**
    * @brief One owned virtual display and its source-lifetime heartbeat; never a viewer lease.
@@ -187,7 +309,8 @@ namespace platf::sudovda {
    * Acquisition requires exclusive driver use. Preflight rejects a present matching container and
    * an in-process guard permits one lease. The protocol cannot atomically prove that add created a
    * new monitor: another process can race or return an existing GUID without applying its mode.
-   * This API does not claim cross-process ownership, idempotent re-add, mode updates or crash recovery.
+   * This API does not claim cross-process ownership, idempotent re-add or mode updates.
+   * Recovery is available only through independently trusted, journal-validated ownership.
    * The global watchdog can disconnect ALL SudoVDA outputs, and handle close does not remove monitors.
    * A one-second watchdog is rejected: the pinned driver's next tick expires even after a ping.
    * Zero disables the watchdog; supported enabled timeouts start at two seconds.
@@ -195,6 +318,8 @@ namespace platf::sudovda {
    * Call cleanup explicitly and retain the lease on failure to retry. Destruction is best effort and
    * logs failures; it cannot guarantee removal when the driver fails. Topology/HDR/power/restoration
    * belong to modern Sunshine display management, before the source owner releases this lease.
+   * A still-owned journal lease never removes implicitly at destruction: it stops callbacks, closes
+   * transport best effort and retains intent. Abandonment cannot guarantee driver-global watchdog liveness.
    */
   class lease_t {
   public:
@@ -206,18 +331,37 @@ namespace platf::sudovda {
 
     /** @brief Acquire a display, returning a recoverable lease even if rollback fails. */
     static acquisition_t acquire(std::unique_ptr<system_t> system, const request_t &request);
+    /** @brief Acquire after durable intent; every armed failure retains a lease for ordered restoration. */
+    static acquisition_t acquire_owned(std::unique_ptr<system_t> system, const request_t &request, const std::shared_ptr<ownership_journal_t> &journal, const recovery_authority_t &authority);
+    /**
+     * @brief Adopt only a journal-validated exact GUID without adding, changing mode or selecting an adapter.
+     * Keep the returned lease alive while the display manager restores topology. A recovery failure
+     * after adoption retains the lease and intent; it never removes an output before restoration.
+     */
+    static acquisition_t recover(std::unique_ptr<system_t> system, const std::shared_ptr<ownership_journal_t> &journal, const recovery_authority_t &authority);
     /** @brief Stop/join heartbeat, remove only the owned GUID, then close; failed removal is retryable. */
     std::expected<void, failure_t> cleanup();
     /** @brief Return checked protocol metadata, including TestBuild. */
     wire::version_t protocol() const;
     /** @brief Return the resolved output only after successful enumeration. */
     const std::optional<display_t> &display() const;
+    /** @brief Return the exact owned GUID, including when restart recovery finds it already absent. */
+    GUID identity() const;
+    /** @brief True only after checked recovery enumeration or exact-owned removal proved absence. */
+    bool identity_absent() const;
+    /** @brief Check exact source-capability membership and unchanged armed journal evidence. */
+    bool belongs_to(const std::shared_ptr<ownership_journal_t> &journal) const;
+    /** @brief Return a receipt only after journal-bound exact removal and handle close both succeeded. */
+    std::optional<cleanup_receipt_t> cleanup_receipt() const;
+    /** @brief Bounded checked re-enumeration after an owned add/recovery failure; never adds or removes. */
+    std::expected<void, failure_t> refresh_display(unsigned int attempts = 20, std::chrono::milliseconds interval = std::chrono::milliseconds {50});
     /** @brief Return the first asynchronous ping failure, retained even if later pings recover. */
     std::optional<failure_t> heartbeat_failure() const;
 
   private:
     struct state_t;
     explicit lease_t(std::unique_ptr<state_t> state);
+    static acquisition_t acquire_impl(std::unique_ptr<system_t> system, const request_t &request, const std::shared_ptr<ownership_journal_t> &journal);
     std::unique_ptr<state_t> state_;
   };
 
@@ -226,5 +370,8 @@ namespace platf::sudovda {
     std::unique_ptr<lease_t> lease;  ///< Successful lease, or failed acquisition with resources still owned.
     std::optional<failure_t> failure;  ///< Primary acquisition failure; never hidden by rollback.
     std::optional<failure_t> cleanup_failure;  ///< Separate rollback failure; retain lease and retry cleanup.
+    std::optional<cleanup_receipt_t> cleanup_receipt {};  ///< No-add or rollback cleanup proof when failure returns no lease.
+    std::optional<failure_t> liveness_failure {};  ///< Separate failure to keep an armed retained source's heartbeat viable.
+    bool output_uncertain {};  ///< An armed failed operation needs checked enumeration; absence is not assumed.
   };
 }  // namespace platf::sudovda

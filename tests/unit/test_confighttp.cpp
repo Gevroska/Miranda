@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <thread>
@@ -34,6 +35,7 @@
 #include <src/network.h>
 #include <src/nvhttp.h>
 #include <src/process.h>
+#include <src/rtsp.h>
 #include <src/utility.h>
 
 #ifdef SUNSHINE_BUILD_PORTAL
@@ -43,6 +45,7 @@
 namespace confighttp {
   void getApps(const resp_https_t &response, const req_https_t &request);
   void saveApp(const resp_https_t &response, const req_https_t &request);
+  void closeApp(const resp_https_t &response, const req_https_t &request);
   void deleteApp(const resp_https_t &response, const req_https_t &request);
   /**
    * @brief Production device-administration route exercised by the existing HTTPS fixture.
@@ -204,6 +207,7 @@ protected:
     server->resource["^/client-update-test$"]["POST"] = confighttp::updateClient;
     server->resource["^/api/apps$"]["GET"] = confighttp::getApps;
     server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
+    server->resource["^/api/apps/close$"]["POST"] = confighttp::closeApp;
     server->resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = confighttp::deleteApp;
 
     // Add a route to test authentication directly
@@ -2263,4 +2267,45 @@ TEST_F(AppCatalogApiTest, AuthenticationAndCsrfStillDenyMutations) {
   auto request_headers = headers(false);
   request_headers.emplace("Origin", "https://example.invalid");
   EXPECT_TRUE(client->request("POST", "/api/apps", R"({"name":"new","index":-1})", request_headers)->status_code.starts_with("400"));
+  EXPECT_TRUE(client->request("POST", "/api/apps/close", "", {{"Content-Type", "application/json"}})->status_code.starts_with("401"));
+  EXPECT_TRUE(client->request("POST", "/api/apps/close", "", request_headers)->status_code.starts_with("400"));
+}
+
+TEST_F(AppCatalogApiTest, AuthorizedStopQueuesProcessCleanupWhileOwnerContinuesDispatching) {
+  const auto fetched = client->request("GET", "/api/apps", "", headers(false));
+  ASSERT_EQ(fetched->status_code, "200 OK");
+  const auto app = nlohmann::json::parse(fetched->content.string())["apps"][0];
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(proc::proc.execute(std::stoi(app["id"].get<std::string>()), launch), 0);
+  auto owner = rtsp_stream::test_support::start_owner();
+  auto reached = std::make_shared<std::promise<void>>();
+  auto release = std::make_shared<std::promise<void>>();
+  const auto gate = release->get_future().share();
+  auto blocking = rtsp_stream::process_operation([reached, gate]() {
+    const auto state = proc::proc.lock_state();
+    reached->set_value();
+    gate.wait_for(2s);
+  });
+  ASSERT_EQ(reached->get_future().wait_for(1s), std::future_status::ready);
+  const auto request_headers = headers();
+  auto queued = std::make_shared<std::promise<void>>();
+  rtsp_stream::test_support::set_owner_hook([queued](std::string_view event) {
+    if (event == "application_stop_queued") {
+      queued->set_value();
+    }
+  });
+  auto stopped = std::async(std::launch::async, [this, request_headers]() {
+    return client->request("POST", "/api/apps/close", "", request_headers);
+  });
+  ASSERT_EQ(queued->get_future().wait_for(1s), std::future_status::ready);
+  auto snapshot = std::async(std::launch::async, []() {
+    return rtsp_stream::source_snapshot();
+  });
+  EXPECT_EQ(snapshot.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(stopped.wait_for(0ms), std::future_status::timeout);
+  release->set_value();
+  blocking.get();
+  EXPECT_EQ(stopped.get()->status_code, "200 OK");
+  EXPECT_EQ(proc::proc.running(), 0);
+  rtsp_stream::test_support::set_owner_hook({});
 }

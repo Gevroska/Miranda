@@ -13,6 +13,8 @@
 #endif
 
 // standard includes
+#include <atomic>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -100,6 +102,33 @@ namespace proc {
     std::chrono::seconds exit_timeout;  ///< Exit timeout.
   };
 
+  /** @brief Logical application identity with independent genuine process lifetime for source retention. */
+  struct lifetime_snapshot_t {
+    int appid {};  ///< Logical active application selection, or zero when stopped.
+    std::string app_uuid;  ///< Stable application identity.
+    std::uint64_t instance {};  ///< Process incarnation; app UUID reuse cannot match another execution.
+    bool tracked = false;  ///< Main process or selected process group is genuinely live.
+    bool placeholder = false;  ///< Placebo/auto-detached state never retains a source.
+  };
+
+  /** @brief Exact management transition that can be restored only while its incarnation and generation still match. */
+  struct source_claim_t {
+    std::uint64_t instance {};  ///< Exact current process incarnation.
+    std::uint64_t generation {};  ///< Source generation issuing the claim.
+    std::uint64_t previous_instance {};  ///< Previous cleanup owner, or zero for legacy cleanup.
+    std::uint64_t previous_generation {};  ///< Previous source generation, retained for exact rollback.
+  };
+
+  /** @brief Immutable observation readable without the process mutex, including while a configured command waits. */
+  struct published_snapshot_t {
+    lifetime_snapshot_t lifetime;  ///< Last confirmed process/group observation.
+    bool operation_in_progress = false;  ///< A configured command may currently hold process state.
+    std::string app_name;  ///< Copied application name for platform notifications.
+    std::shared_ptr<const std::vector<ctx_t>> apps = std::make_shared<const std::vector<ctx_t>>();  ///< Immutable published catalog.
+    std::string catalog_path;  ///< Path of the successfully published catalog.
+    std::string catalog_revision;  ///< Exact-content catalog precondition.
+  };
+
   /**
    * @brief Tracks launched child processes and terminates them during shutdown.
    * @note Move process managers only while their consumers are quiescent; retained guards keep mutex storage alive.
@@ -121,6 +150,7 @@ namespace proc {
         _app_id(0),
         _env(std::make_unique<boost::process::v1::environment>(std::move(env))),
         _apps(std::move(apps)) {
+      refresh_published();
     }
 
     /**
@@ -128,14 +158,29 @@ namespace proc {
      *
      * @param app_id App ID.
      * @param launch_session Launch session.
+     * @param created_instance Optional exact incarnation successfully created by this attempt; zero on rejection/failure.
      * @return Process exit code or launch error status.
      */
-    int execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session);
+    int execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session, std::uint64_t *created_instance = nullptr);
 
     /**
      * @return `_app_id` if a process is running, otherwise returns `0`
      */
     int running();
+    /** @brief Observe logical running state and genuine tracking together, resolving auto-detach without cleanup or owner dispatch. */
+    lifetime_snapshot_t lifetime_snapshot();
+    /** @brief Copy the published pointer; never takes process state or waits for configured commands. */
+    std::shared_ptr<const published_snapshot_t> published_snapshot() const;
+    /** @brief Process-worker observation after transitions; caller may already hold the recursive process guard. */
+    void refresh_published();
+    /** @brief Publish only the lane-busy marker without taking process state. */
+    void publish_operation(bool busy);
+    /** @brief Publish a preallocated complete observation after a catalog commit without allocation. */
+    void publish_snapshot(std::shared_ptr<const published_snapshot_t> snapshot) noexcept;
+    /** @brief Claim only an exact current incarnation after backend reservation succeeds. */
+    std::optional<source_claim_t> claim_source(std::uint64_t instance, std::uint64_t generation);
+    /** @brief Restore a claim's previous state only if no replacement or later claimant has superseded it. */
+    bool restore_source_claim(const source_claim_t &claim);
 
     /**
      * @brief Acquire process state locally; never hold this guard while dispatching to the RTSP owner or joining a stream worker.
@@ -143,7 +188,7 @@ namespace proc {
     state_guard_t lock_state() const;
 
     /**
-     * @brief Return the copied active identity after checking process liveness; call only on the owner.
+     * @brief Copy active identity under process state; call on the process lane or quiescent legacy owner only.
      */
     std::pair<int, std::string> active_identity();
 
@@ -181,6 +226,10 @@ namespace proc {
      * @brief Terminate the launched application process.
      */
     void terminate();
+    /** @brief Match and terminate one exact incarnation under the same process-state guard. */
+    bool terminate_instance(std::uint64_t instance);
+    /** @brief Stop the captured incarnation or the pending incarnation owned by the captured source generation. */
+    bool terminate_source(std::uint64_t instance, std::uint64_t generation);
 
     /**
      * @brief Update the cached app list and environment without disturbing running process state.
@@ -226,7 +275,19 @@ namespace proc {
 #endif
 
   private:
+    /** @brief Resolve one guarded liveness observation; cleanup is permitted only on the process worker or quiescent legacy caller. */
+    lifetime_snapshot_t observe_lifetime(bool cleanup);
+
     int _app_id = 0;
+    std::uint64_t _instance = 0;  ///< New value for every actual execution attempt.
+    std::uint64_t _managed_source_instance = 0;  ///< Matching cleanup skips legacy direct display restoration.
+    std::uint64_t _managed_source_generation = 0;  ///< A failed older admission cannot unmark a later claimant.
+
+    struct publication_t {
+      std::atomic<std::shared_ptr<const published_snapshot_t>> snapshot {std::make_shared<const published_snapshot_t>()};
+    };
+
+    std::shared_ptr<publication_t> _publication = std::make_shared<publication_t>();
 
     std::shared_ptr<std::recursive_mutex> _state_mutex = std::make_shared<std::recursive_mutex>();  ///< Process consumers and catalog publication share this guard; never used to wait for the owner.
 
@@ -300,6 +361,14 @@ namespace proc {
    * @brief Normalize, commit and return the typed application catalog on the owner.
    */
   catalog_response read_catalog(const std::string &file);
+  /** @brief Queue an owned catalog read/normalization; callers await outside the owner. */
+  std::future<catalog_response> read_catalog_async(std::string file);
+  /** @brief Worker-only normalization core used by the admission refresh continuation. */
+  catalog_response read_catalog_now(const std::string &file);
+  /** @brief Queue an owned catalog mutation preserving its exact-content precondition and environment publication. */
+  std::future<catalog_response> save_catalog_app_async(std::string file, std::string revision, std::string edit);
+  /** @brief Queue an owned UUID deletion preserving its exact-content precondition. */
+  std::future<catalog_response> delete_catalog_app_async(std::string file, std::string revision, std::string uuid);
   /**
    * @brief Create or edit an application using immutable UUID identity and an exact-content precondition.
    */
@@ -316,6 +385,14 @@ namespace proc {
      * @param hook Fixture observer; empty restores production behavior. Install/reset only with no active consumer.
      */
     void set_undo_environment_hook(std::function<void(const boost::process::v1::environment &)> hook);
+    /** @brief Supply synthetic liveness for owner component cases; install/reset only with consumers quiescent. */
+    void set_lifetime_snapshot_hook(std::function<lifetime_snapshot_t()> hook);
+    /** @brief Observe the actual execute boundary before acquiring process state; install only while quiescent. */
+    void set_execute_entry_hook(std::function<void()> hook);
+    /** @brief Observe an actual unmanaged termination's restoration responsibility without configuring a display. */
+    void set_legacy_restore_hook(std::function<void()> hook);
+    /** @brief Pause an active application's publication before its authoritative observation; install/reset only while quiescent. */
+    void set_refresh_published_hook(std::function<void()> hook);
   }  // namespace test_support
 #endif
 

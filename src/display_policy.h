@@ -227,6 +227,7 @@ namespace display_policy {
     device_preferences_t device;  ///< Current administrator-owned device settings.
     bool device_preferences_valid = true;  ///< Invalid persisted settings require repair before fresh preparation.
     mode_t selected_mode;  ///< Modern Sunshine selection after manual/automatic/remapping processing.
+    std::optional<bool> requested_hdr;  ///< Actual parsed display HDR mutation, absent when display/HDR configuration is disabled.
   };
 
   /** @brief Immutable preparation specification; the later source owner supplies observed device mapping. */
@@ -236,6 +237,7 @@ namespace display_policy {
     std::string edid_name;  ///< Stable ASCII display name bounded to SudoVDA's 13-byte field.
     std::string edid_serial;  ///< Stable ASCII serial bounded to SudoVDA's 13-byte field.
     mode_t mode;  ///< Requested source mode, not an assertion of observed state.
+    std::optional<bool> requested_hdr;  ///< Explicit parsed display setting, separate from stream hint and observed HDR.
     config::video_t::dd_t::config_option_e topology;  ///< Existing Sunshine topology policy.
     std::string adapter_name;  ///< Configured render adapter, to be resolved before acquisition.
     std::string native_output;  ///< Configured native selector; no virtual-acquisition fallback is implied.
@@ -275,6 +277,7 @@ namespace display_policy {
     std::erase(serial, '-');
     result.edid_serial = serial.substr(0, 13);
     result.mode = fresh.selected_mode;
+    result.requested_hdr = fresh.requested_hdr;
     if (fresh.device.resolution) {
       result.mode.resolution = *fresh.device.resolution;
     }

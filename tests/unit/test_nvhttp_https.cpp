@@ -8,6 +8,7 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -654,6 +655,18 @@ namespace {
   }
 
   TEST_F(HttpsClientIdentityTest, ZeroGrantProductionRoutesDenyActionsAndHideRestrictedMetadata) {
+    const auto original_apps_file = config::stream.file_apps;
+    const auto apps_file = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "https_zero_grant_apps.json";
+    auto original_proc = std::move(proc::proc);
+    proc::proc = proc::proc_t {};
+    config::stream.file_apps = apps_file.string();
+    std::ofstream {apps_file} << R"({"env":{},"apps":[]})";
+    auto restore_catalog = util::fail_guard([&]() {
+      proc::proc = std::move(original_proc);
+      config::stream.file_apps = original_apps_file;
+      std::error_code error;
+      std::filesystem::remove(apps_file, error);
+    });
     start_server(true, true);
     const auto exchange = [&](const std::string &path) {
       auto client = connect_client(&credentials_a);
@@ -676,7 +689,8 @@ namespace {
     EXPECT_TRUE(exchange("/resume?" + stream_args).contains("status_code=\"403\""));
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::list));
     const auto listed = exchange("/applist");
-    EXPECT_TRUE(listed.contains("status_code=\"200\""));
+    EXPECT_TRUE(listed.contains("status_code=\"200\"")) << listed;
+    EXPECT_FALSE(listed.contains("AppTitle"));
     EXPECT_TRUE(exchange("/resume?" + stream_args).contains("status_code=\"403\""));
     EXPECT_TRUE(exchange("/cancel").contains("status_code=\"403\""));
   }
@@ -915,6 +929,399 @@ namespace {
     EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
     EXPECT_EQ(source_preparations, 0);
     EXPECT_EQ(proc::proc.active_identity(), selected);
+  }
+
+  /** @brief Inert transaction backend used with the actual managed HTTPS callbacks and process registry. */
+  class managed_http_backend_t: public rtsp_stream::source_backend_t {
+  public:
+    std::shared_future<void> gate;
+    std::promise<void> began;
+    std::atomic_int begins {0};
+
+    bool begin(const display_policy::source_request_t &request, std::uint64_t generation, std::uint64_t epoch) override {
+      if (++begins == 1) {
+        began.set_value();
+      }
+      if (gate.valid()) {
+        gate.wait_for(5s);
+      }
+      auto source = std::make_shared<rtsp_stream::capture_source_t>();
+      source->kind = request.virtual_display ? rtsp_stream::capture_source_t::kind_e::owned_virtual : rtsp_stream::capture_source_t::kind_e::native;
+      source->generation = generation;
+      source->epoch = epoch;
+      source->selector = "managed-http-selector";
+      source->device_id = "managed-http-device";
+      source->monitor_uuid = request.virtual_display ? request.monitor_uuid : "";
+      source->windows_output = rtsp_stream::windows_output_t {{1, 0}, 9, "managed-http-monitor-path"};
+      source->width = request.mode.resolution.width;
+      source->height = request.mode.resolution.height;
+      source->rate_numerator = request.mode.refresh_rate.numerator;
+      source->rate_denominator = request.mode.refresh_rate.denominator;
+      source->observed_hdr = request.requested_hdr;
+      std::lock_guard lock {mutex};
+      state = {generation, rtsp_stream::source_backend_status_t::phase_e::ready, false, false, false, source};
+      return true;
+    }
+
+    bool validate_retained(const rtsp_stream::capture_source_t &source, std::uint64_t epoch) override {
+      std::lock_guard lock {mutex};
+      if (!state.source || *state.source != source) {
+        return false;
+      }
+      auto next = std::make_shared<rtsp_stream::capture_source_t>(source);
+      next->epoch = epoch;
+      state.source = next;
+      return true;
+    }
+
+    rtsp_stream::source_backend_status_t status() const override {
+      std::lock_guard lock {mutex};
+      return state;
+    }
+
+    int probe(const rtsp_stream::capture_source_t &, std::shared_ptr<rtsp_stream::capture_pin_t>) override {
+      return 200;
+    }
+
+    bool restore(std::uint64_t, std::chrono::milliseconds) override {
+      std::lock_guard lock {mutex};
+      state.phase = rtsp_stream::source_backend_status_t::phase_e::removal_ready;
+      return true;
+    }
+
+    bool cleanup_and_retire(std::uint64_t) override {
+      std::lock_guard lock {mutex};
+      state.source_released = true;
+      state.phase = rtsp_stream::source_backend_status_t::phase_e::restored;
+      return true;
+    }
+
+    bool complete(std::uint64_t) override {
+      return true;
+    }
+
+  private:
+    mutable std::mutex mutex;
+    rtsp_stream::source_backend_status_t state;
+  };
+
+  /** @brief Real TLS routes, real process state and file-gated commands; no display or capture hardware. */
+  class ManagedHttpsProcessTest: public HttpsClientIdentityTest {
+  protected:
+    void SetUp() override {
+      HttpsClientIdentityTest::SetUp();
+      previous_proc = std::move(proc::proc);
+      proc::proc = proc::proc_t {};
+      previous_file = config::stream.file_apps;
+      directory = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "p3c_managed_https";
+      previous_timeout = config::stream.ping_timeout;
+      std::filesystem::create_directories(directory);
+      gate = directory / "release";
+      entered = directory / "entered";
+      std::error_code error;
+      std::filesystem::remove(gate, error);
+      std::filesystem::remove(entered, error);
+      config::stream.file_apps = (directory / "apps.json").string();
+      auto tree = proc::catalog::parse(R"({"env":{"P3C_CATALOG_ENV":"captured"},"apps":[{"name":"A","auto-detach":false,"wait-all":false,"exit-timeout":0},{"name":"B","auto-detach":false,"wait-all":false,"exit-timeout":0}]})");
+#ifdef _WIN32
+      command = "cmd.exe /D /C ping -n 60 127.0.0.1";
+      undo_command = "cmd.exe /D /C exit 0";
+      script = directory / "wait.cmd";
+      std::ofstream {script} << "@echo off\r\n> \"%P3C_ENTERED%\" echo entered\r\n:wait\r\nif exist \"%P3C_GATE%\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n";
+      wait_command = "cmd.exe /D /C \"" + script.string() + "\"";
+#else
+      command = "/bin/sleep 60";
+      undo_command = "/bin/true";
+      script = directory / "wait.sh";
+      std::ofstream {script} << "printf entered > \"$P3C_ENTERED\"\nwhile [ ! -e \"$P3C_GATE\" ]; do sleep 0.01; done\n";
+      wait_command = "/bin/sh \"" + script.string() + "\"";
+#endif
+      tree["env"]["P3C_ENTERED"] = entered.string();
+      tree["env"]["P3C_GATE"] = gate.string();
+      for (auto &app : tree["apps"]) {
+        app["cmd"] = command;
+        app["output"] = "null";
+      }
+      tree["apps"][0]["prep-cmd"] = proc::catalog::json::array({{{"do", ""}, {"undo", undo_command}}});
+      std::ofstream {config::stream.file_apps} << tree.dump();
+      const auto loaded = proc::read_catalog(config::stream.file_apps);
+      ASSERT_EQ(loaded.status, 200);
+      initial = proc::catalog::parse(loaded.body);
+      app_a = {std::stoi(initial["apps"][0]["id"].get<std::string>()), initial["apps"][0]["uuid"].get<std::string>()};
+      app_b = {std::stoi(initial["apps"][1]["id"].get<std::string>()), initial["apps"][1]["uuid"].get<std::string>()};
+      auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+      launch->surround_info = 2;
+      ASSERT_EQ(proc::proc.execute(app_a.first, launch, &a_instance), 0);
+      ASSERT_TRUE(proc::proc.lifetime_snapshot().tracked);
+      proc::test_support::set_undo_environment_hook([count = undo_count, records = undo_records, mutex = undo_mutex](const auto &environment) {
+        ++*count;
+        std::lock_guard lock {*mutex};
+        records->emplace_back(environment.at("SUNSHINE_APP_ID").to_string(), environment.at("P3C_CATALOG_ENV").to_string());
+      });
+      backend = std::make_shared<managed_http_backend_t>();
+      ASSERT_TRUE(rtsp_stream::set_source_backend([backend = backend]() {
+        return backend;
+      }));
+      owner = rtsp_stream::test_support::start_owner();
+      ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view | permissions::launch | permissions::list));
+      ASSERT_TRUE(nvhttp::update_client(uuid_b, std::nullopt, permissions::view | permissions::launch | permissions::list));
+      start_server(true, true);
+      for (int i = 0; i < 4; ++i) {
+        extra_servers.emplace_back([io = server->io_service]() {
+          io->run();
+        });
+      }
+    }
+
+    void TearDown() override {
+      std::ofstream {gate} << "release";
+      rtsp_stream::stop_process_application();
+      owner.reset();
+      EXPECT_TRUE(rtsp_stream::set_source_backend({}));
+      proc::test_support::set_execute_entry_hook({});
+      proc::test_support::set_undo_environment_hook({});
+      proc::test_support::set_legacy_restore_hook({});
+      server->io_service->stop();
+      for (auto &thread : extra_servers) {
+        thread.join();
+      }
+      extra_servers.clear();
+      proc::proc.terminate();
+      proc::proc = std::move(previous_proc);
+      std::error_code error;
+      for (const auto &file : {gate, entered, script, std::filesystem::path {config::stream.file_apps}}) {
+        std::filesystem::remove(file, error);
+      }
+      config::stream.file_apps = previous_file;
+      config::stream.ping_timeout = previous_timeout;
+      HttpsClientIdentityTest::TearDown();
+    }
+
+    std::shared_ptr<client_t> begin_request(const std::string &path, bool second = false) {
+      auto client = connect_client(second ? &credentials_b : &credentials_a);
+      send(*client, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+      return client;
+    }
+
+    std::string launch_path(const std::string &uuid) const {
+      return "/launch?rikey=00112233445566778899aabbccddeeff&rikeyid=1&corever=1&localAudioPlayMode=0&mode=1920x1080x60&appid=-1&appuuid=" + uuid;
+    }
+
+    bool drain_source() {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      while (std::chrono::steady_clock::now() < deadline) {
+        rtsp_stream::test_support::poll_source();
+        if (!rtsp_stream::source_snapshot().managed) {
+          return true;
+        }
+        std::this_thread::yield();
+      }
+      return false;
+    }
+
+    bool wait_for_file(const std::filesystem::path &file) {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (std::filesystem::exists(file)) {
+          return true;
+        }
+        std::this_thread::yield();
+      }
+      return false;
+    }
+
+    proc::proc_t previous_proc;
+    std::string previous_file, command, undo_command, wait_command;
+    decltype(config::stream.ping_timeout) previous_timeout;
+    std::filesystem::path directory, gate, entered, script;
+    proc::catalog::json initial;
+    std::pair<int, std::string> app_a, app_b;
+    std::uint64_t a_instance {};
+    std::shared_ptr<std::atomic_int> undo_count = std::make_shared<std::atomic_int>(0);
+    std::shared_ptr<std::mutex> undo_mutex = std::make_shared<std::mutex>();
+    std::shared_ptr<std::vector<std::pair<std::string, std::string>>> undo_records = std::make_shared<std::vector<std::pair<std::string, std::string>>>();
+    std::shared_ptr<managed_http_backend_t> backend;
+    std::unique_ptr<platf::deinit_t> owner;
+    std::vector<std::jthread> extra_servers;
+  };
+
+  TEST_F(ManagedHttpsProcessTest, RemovedSelectedAppBeforeExecutePreservesOriginalIncarnationAndUndo) {
+    std::promise<void> release;
+    backend->gate = release.get_future().share();
+    auto launching = begin_request(launch_path(app_b.second));
+    ASSERT_EQ(backend->began.get_future().wait_for(2s), std::future_status::ready);
+    ASSERT_EQ(proc::delete_catalog_app(config::stream.file_apps, initial["revision"], app_b.second).status, 200);
+    release.set_value();
+    EXPECT_TRUE(read_response(*launching).contains("status_code=\"404\""));
+    ASSERT_TRUE(drain_source());
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_TRUE(proc::proc.lifetime_snapshot().tracked);
+    EXPECT_EQ(undo_count->load(), 0);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, LaunchRightRetainsItsViewingInclusionDuringDeferredExecution) {
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    auto launching = begin_request(launch_path(app_b.second));
+    EXPECT_TRUE(read_response(*launching).contains("status_code=\"200\""));
+    const auto current = proc::proc.lifetime_snapshot();
+    EXPECT_TRUE(current.tracked);
+    EXPECT_EQ(current.app_uuid, app_b.second);
+    EXPECT_NE(current.instance, a_instance);
+    EXPECT_EQ(undo_count->load(), 1);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, CancellationAtActualProcessLockBoundaryCannotClaimOriginalApplication) {
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
+    const auto proceed = release->get_future().share();
+    proc::test_support::set_execute_entry_hook([reached, proceed]() {
+      reached->set_value();
+      proceed.wait_for(3s);
+    });
+    auto launching = begin_request(launch_path(app_b.second));
+    ASSERT_EQ(reached->get_future().wait_for(2s), std::future_status::ready);
+    {
+      const auto state = proc::proc.lock_state();
+      release->set_value();
+      ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, 0U));
+      EXPECT_TRUE(read_response(*launching).contains("status_code=\"403\""));
+    }
+    ASSERT_TRUE(drain_source());
+    proc::test_support::set_execute_entry_hook({});
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_TRUE(proc::proc.lifetime_snapshot().tracked);
+    EXPECT_EQ(undo_count->load(), 0);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, NullOrThrowingBackendFactoryDoesNotStealLegacyRestoration) {
+    auto restores = std::make_shared<std::atomic_int>(0);
+    proc::test_support::set_legacy_restore_hook([restores]() {
+      ++*restores;
+    });
+    for (const bool throwing : {false, true}) {
+      ASSERT_TRUE(rtsp_stream::set_source_backend([throwing]() -> std::shared_ptr<rtsp_stream::source_backend_t> {
+        if (throwing) {
+          throw std::runtime_error {"allocation failed"};
+        }
+        return {};
+      }));
+      auto launching = begin_request(launch_path(app_a.second));
+      EXPECT_TRUE(read_response(*launching).contains("status_code=\"503\""));
+      EXPECT_FALSE(rtsp_stream::source_snapshot().managed);
+      EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+      EXPECT_TRUE(proc::proc.lifetime_snapshot().tracked);
+    }
+    rtsp_stream::process_operation([]() {
+      proc::proc.terminate();
+    }).get();
+    EXPECT_EQ(restores->load(), 1);
+    EXPECT_EQ(undo_count->load(), 1);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, SkippedBeginRestoresExactExistingProcessClaimAndLegacyCleanup) {
+    auto reached = std::make_shared<std::promise<void>>();
+    auto release = std::make_shared<std::promise<void>>();
+    const auto proceed = release->get_future().share();
+    auto restores = std::make_shared<std::atomic_int>(0);
+    proc::test_support::set_legacy_restore_hook([restores]() {
+      ++*restores;
+    });
+    rtsp_stream::test_support::set_owner_hook([reached, proceed](std::string_view event) {
+      if (event == "source_before_entry") {
+        reached->set_value();
+        proceed.wait_for(3s);
+      }
+    });
+    auto launching = begin_request(launch_path(app_a.second));
+    ASSERT_EQ(reached->get_future().wait_for(2s), std::future_status::ready);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, 0U));
+    EXPECT_TRUE(read_response(*launching).contains("status_code=\"403\""));
+    release->set_value();
+    ASSERT_TRUE(drain_source());
+    rtsp_stream::test_support::set_owner_hook({});
+    EXPECT_EQ(backend->begins, 0);
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_TRUE(proc::proc.lifetime_snapshot().tracked);
+    rtsp_stream::process_operation([]() {
+      proc::proc.terminate();
+    }).get();
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, RealConfiguredCommandCannotBlockSnapshotsCatalogQueueRevocationOrShutdownDispatch) {
+    auto edit = initial["apps"][1];
+    edit["prep-cmd"] = proc::catalog::json::array({{{"do", wait_command}, {"undo", undo_command}}});
+    const auto changed = proc::save_catalog_app(config::stream.file_apps, initial["revision"], edit.dump());
+    ASSERT_EQ(changed.status, 200);
+    const auto revision = proc::catalog::parse(changed.body)["revision"].get<std::string>();
+    config::stream.ping_timeout = 1500ms;
+    auto expired = std::make_shared<std::promise<void>>();
+    rtsp_stream::test_support::set_owner_hook([expired](std::string_view event) {
+      if (event == "launch_expired") {
+        expired->set_value();
+      }
+    });
+    auto launching = begin_request(launch_path(app_b.second));
+    ASSERT_TRUE(wait_for_file(entered));
+    EXPECT_TRUE(proc::proc.published_snapshot()->operation_in_progress);
+    auto info = begin_request("/serverinfo", true);
+    EXPECT_TRUE(read_response(*info).contains("status_code=\"200\""));
+    auto apps = begin_request("/applist", true);
+    EXPECT_TRUE(read_response(*apps).contains("<UUID>" + app_b.second + "</UUID>"));
+    edit["name"] = "B changed while executing";
+    edit["cmd"] = "nonexistent_catalog_command_must_not_replace_captured_execution";
+    auto mutation = proc::save_catalog_app_async(config::stream.file_apps, revision, edit.dump());
+    auto catalog_read = proc::read_catalog_async(config::stream.file_apps);
+    EXPECT_EQ(mutation.wait_for(0ms), std::future_status::timeout);
+    auto marker = std::make_shared<std::promise<void>>();
+    rtsp_stream::authorize_operation(uuid_b, credentials_b.x509, permissions::view, [marker]() {
+      marker->set_value();
+    });
+    EXPECT_EQ(marker->get_future().wait_for(1s), std::future_status::ready);
+    ASSERT_EQ(expired->get_future().wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(read_response(*launching).contains("status_code=\"503\""));
+    auto stop_queued = std::make_shared<std::promise<void>>();
+    auto shutdown_entered = std::make_shared<std::promise<void>>();
+    auto observed_stop = std::make_shared<std::atomic_bool>(false);
+    rtsp_stream::test_support::set_owner_hook([stop_queued, shutdown_entered, observed_stop](std::string_view event) {
+      if (event == "application_stop_queued" && !observed_stop->exchange(true)) {
+        stop_queued->set_value();
+      }
+      if (event == "stop_begin") {
+        shutdown_entered->set_value();
+      }
+    });
+    auto stopping_client = begin_request("/cancel", true);
+    ASSERT_EQ(stop_queued->get_future().wait_for(1s), std::future_status::ready);
+    auto revoked = std::async(std::launch::async, [uuid = uuid_a]() {
+      return nvhttp::update_client(uuid, std::nullopt, 0U);
+    });
+    ASSERT_EQ(revoked.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(revoked.get());
+    auto shutdown = std::async(std::launch::async, []() {
+      rtsp_stream::test_support::stop_owner();
+    });
+    ASSERT_EQ(shutdown_entered->get_future().wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(std::filesystem::exists(gate));
+    EXPECT_EQ(shutdown.wait_for(0ms), std::future_status::timeout);
+    std::ofstream {gate} << "release";
+    ASSERT_EQ(mutation.wait_for(3s), std::future_status::ready);
+    EXPECT_EQ(mutation.get().status, 200);
+    ASSERT_EQ(catalog_read.wait_for(3s), std::future_status::ready);
+    const auto final_catalog = catalog_read.get();
+    EXPECT_EQ(final_catalog.status, 200);
+    EXPECT_TRUE(final_catalog.body.contains("nonexistent_catalog_command_must_not_replace_captured_execution"));
+    EXPECT_TRUE(read_response(*stopping_client).contains("status_code=\"200\""));
+    ASSERT_EQ(shutdown.wait_for(3s), std::future_status::ready);
+    shutdown.get();
+    EXPECT_EQ(undo_count->load(), 2);
+    EXPECT_EQ(proc::proc.get_env().at("P3C_CATALOG_ENV").to_string(), "captured");
+    {
+      std::lock_guard lock {*undo_mutex};
+      EXPECT_NE(std::find(undo_records->begin(), undo_records->end(), std::pair {std::to_string(app_b.first), std::string {"captured"}}), undo_records->end());
+    }
+    EXPECT_EQ(proc::proc.running(), 0);
+    EXPECT_FALSE(rtsp_stream::source_snapshot().managed);
   }
 
 }  // namespace

@@ -6,12 +6,19 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+
+#ifdef _WIN32
+  #include "platform/windows/sudovda.h"
+#endif
 
 // lib includes
 #include <display_device/display_power_interface.h>
+#include <display_device/settings_manager_interface.h>
 #include <display_device/types.h>
 
 // forward declarations
@@ -179,6 +186,121 @@ namespace display_device {
    * @examples_end
    */
   [[nodiscard]] std::variant<failed_to_parse_tag_t, configuration_disabled_tag_t, SingleDisplayConfiguration> parse_configuration(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
+
+#ifdef _WIN32
+  class WinApiLayerInterface;
+  class WinDisplayDeviceInterface;
+  class SettingsManagerInterface;
+  class AudioContextInterface;
+
+  /** @brief Observable state of one generation's owned display operation. */
+  enum class owned_display_phase_e {
+    reserved,
+    preparing,
+    ready,
+    reverting,
+    removal_ready,
+    recovering,
+    cleanup_pending,
+    restored,
+    failed,
+    cancelled
+  };
+
+  /** @brief Wrapper validation failure, separate from the library's apply and rollback results. */
+  enum class owned_display_error_e {
+    observed_source_mismatch,
+    headless_unowned_outputs,
+    headless_ownership_unproven,
+    recovery_state_unproven,
+    journal_unavailable,
+    operation_exception
+  };
+
+  /** @brief A copyable status snapshot; reading it never enters the scheduler or owner. */
+  struct owned_display_status_t {
+    std::uint64_t generation {};  ///< Generation to compare before acting on this snapshot.
+    owned_display_phase_e phase {owned_display_phase_e::reserved};  ///< Current operation state.
+    unsigned int attempts {};  ///< Apply or revert attempts in the current operation.
+    std::optional<SettingsManagerInterface::ApplyResult> apply_result {};  ///< Last apply result, retained across rollback.
+    std::optional<SettingsManagerInterface::RevertResult> revert_result {};  ///< Separate rollback result; never overwrites apply failure.
+    std::optional<owned_display_error_e> apply_error {};  ///< Primary wrapper failure, retained across rollback.
+    std::optional<owned_display_error_e> restore_error {};  ///< Separate restoration validation failure.
+    std::string device_id {};  ///< Exact library identity, never the monitor-container GUID or a fallback.
+    std::string display_name {};  ///< Active capture selector, populated only after successful validation.
+    std::optional<EnumeratedDevice::Info> observed {};  ///< Observed source properties, separate from requested mode.
+    bool unavailable_settings_pending {};  ///< Library recovery survives exact-owned monitor removal.
+    bool initially_headless {};  ///< Explicit exception for removing a sole owned output.
+    bool source_released {};  ///< Exact removal/close and durable retirement completed; recovery may remain.
+    bool removal_permitted {};  ///< Latest readback authorized exact-owned removal; retained for retirement retries.
+  };
+
+  /**
+   * @brief One owned source's existing-library settings manager, journal and observable retry work.
+   * Begin before SudoVDA add. This reserves display mutation and blocks legacy configure/revert/reset
+   * until this object is released. The caller owns the lease and must release every capture/admission/
+   * media pin before cleanup. Keep the lease's heartbeat alive through delayed revert and failures.
+   * No callback calls the owner; poll status and compare its generation. Never destroy or cancel this
+   * object from its scheduler callback. Native driver cancellation is not guaranteed to finish promptly.
+   */
+  class owned_display_configuration_t {
+  public:
+    ~owned_display_configuration_t();
+    owned_display_configuration_t(const owned_display_configuration_t &) = delete;
+    owned_display_configuration_t &operator=(const owned_display_configuration_t &) = delete;
+
+    /** @brief Snapshot topology/primary and persist intent atomically before any hotplug. */
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> begin(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority);
+    /** @brief Reopen existing intent and library recovery state; failed or ambiguous reads block recovery. */
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority);
+    /** @brief Return durable capability for acquire_owned/recover; it conveys no exclusive-deployment proof. */
+    std::shared_ptr<platf::sudovda::ownership_journal_t> journal() const;
+    /** @brief Resolve exact target/LUID/path to the library identity; ambiguous/missing mappings fail. */
+    bool bind(const platf::sudovda::display_t &display, std::uint64_t generation);
+    /** @brief Bind a recovery lease whose checked enumeration proved the exact journal GUID absent. */
+    bool bind_absent(const platf::sudovda::lease_t &lease, std::uint64_t generation);
+    /** @brief Bind absence proved by this source's exact removal-and-close receipt. */
+    bool bind_absent(const platf::sudovda::cleanup_receipt_t &receipt, std::uint64_t generation);
+    /** @brief Apply with at most max_attempts; API-unavailable retries use the existing scheduler. */
+    bool prepare(const SingleDisplayConfiguration &configuration, std::uint64_t generation, unsigned int max_attempts = 3);
+    /** @brief Schedule existing-library restoration, retaining unavailable-device recovery independently. */
+    bool restore(std::uint64_t generation, std::chrono::milliseconds delay = std::chrono::milliseconds::zero());
+    /** @brief Cancel retry work for this generation without erasing recovery or authorizing removal. */
+    bool cancel(std::uint64_t generation);
+    /** @brief Retire a safely restored source using its exact generation's removal-and-close receipt. */
+    bool retire_source(const platf::sudovda::cleanup_receipt_t &receipt, std::uint64_t generation);
+    /**
+     * @brief Reuse this recovery episode for a newer source after durable retirement.
+     * Fences idle restoration, snapshots before add and rotates intent atomically while retaining
+     * existing library settings verbatim. The reconstructed manager has one coherent cache.
+     */
+    bool begin_next(const GUID &identity, std::uint64_t generation);
+    /** @brief Poll operation status without taking scheduler or global display-manager locks. */
+    owned_display_status_t status() const;
+    /** @brief Finish a retired recovery episode only after library persistence is empty. */
+    bool complete(std::uint64_t generation);
+
+  #ifdef SUNSHINE_TESTS
+    /** @brief Begin through injected Windows primitives without driver or physical-display access. */
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> test_begin(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager = nullptr, std::shared_ptr<AudioContextInterface> audio = nullptr);
+    /** @brief Recover through injected Windows primitives and the real library settings manager. */
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices);
+    /** @brief Replace retry sleep durations for deterministic component fixtures. */
+    void test_set_retry_interval(std::chrono::milliseconds interval);
+    /**
+     * @brief Fence in-flight scheduler work before copying status, without executing or cancelling a retry.
+     * Native persistence already in progress may delay this test-only barrier. Never call it from a callback.
+     */
+    owned_display_status_t test_status_after_scheduled_work() const;
+  #endif
+
+  private:
+    struct state_t;
+    explicit owned_display_configuration_t(std::unique_ptr<state_t> state);
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> make(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, bool recovery, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio);
+    std::unique_ptr<state_t> state_;
+  };
+#endif
 
 #ifdef SUNSHINE_TESTS
   class SettingsManagerInterface;

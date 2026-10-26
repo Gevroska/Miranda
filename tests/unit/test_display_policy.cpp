@@ -11,7 +11,9 @@
 #include <set>
 
 // local includes
+#include <src/display_device.h>
 #include <src/display_policy.h>
+#include <src/rtsp.h>
 
 namespace {
   constexpr auto client_uuid = "11111111-2222-4333-8444-555555555555";
@@ -39,6 +41,41 @@ TEST(DisplayPolicyTest, ForcePreferencesAreAdditiveAndHeadlessRequestsRequireVir
     fresh.physical_source_available = !(mask & 16);
     const auto request = display_policy::resolve(video, fresh);
     EXPECT_EQ(request->virtual_display, mask != 0) << mask;
+  }
+}
+
+TEST(DisplayPolicyTest, ExplicitHdrComesFromActualParserAndRemainsSeparateFromStreamHint) {
+  using dd_t = config::video_t::dd_t;
+  for (const bool display_enabled : {false, true}) {
+    for (const bool hdr_enabled : {false, true}) {
+      for (const bool stream_hdr : {false, true}) {
+        auto video = config::video;
+        video.dd.configuration_option = display_enabled ? dd_t::config_option_e::verify_only : dd_t::config_option_e::disabled;
+        video.dd.hdr_option = hdr_enabled ? dd_t::hdr_option_e::automatic : dd_t::hdr_option_e::disabled;
+        video.dd.resolution_option = dd_t::resolution_option_e::disabled;
+        video.dd.refresh_rate_option = dd_t::refresh_rate_option_e::disabled;
+        rtsp_stream::launch_session_t launch {};
+        launch.enable_hdr = stream_hdr;
+        auto fresh = fresh_source();
+        fresh.selected_mode.hdr = stream_hdr;
+        const auto parsed = display_device::parse_configuration(video, launch);
+        if (const auto configuration = std::get_if<display_device::SingleDisplayConfiguration>(&parsed); configuration && configuration->m_hdr_state) {
+          fresh.requested_hdr = *configuration->m_hdr_state == display_device::HdrState::Enabled;
+        }
+        const auto request = display_policy::resolve(video, fresh);
+        EXPECT_EQ(request->mode.hdr, stream_hdr);
+#ifdef __APPLE__
+        EXPECT_FALSE(request->requested_hdr);
+#else
+        EXPECT_EQ(request->requested_hdr, display_enabled && hdr_enabled ? std::optional {stream_hdr} : std::nullopt);
+#endif
+        auto joining = fresh;
+        joining.requested_hdr = !stream_hdr;
+        joining.selected_mode.hdr = !stream_hdr;
+        EXPECT_EQ(display_policy::resolve(video, joining, request), request);
+        EXPECT_EQ(request->mode.hdr, stream_hdr);
+      }
+    }
   }
 }
 

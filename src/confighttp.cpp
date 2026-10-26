@@ -1147,10 +1147,7 @@ namespace confighttp {
 
     print_req(request);
 
-    rtsp_stream::stop_application([]() {
-      proc::proc.terminate();
-      display_device::revert_configuration();
-    });
+    rtsp_stream::stop_process_application();
 
     nlohmann::json output_tree;
     output_tree["status"] = true;
