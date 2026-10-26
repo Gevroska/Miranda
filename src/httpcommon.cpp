@@ -471,12 +471,64 @@ namespace http {
       return CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     }
 
-    /** @brief Check an existing path against the identity/policy/bytes of a known object. */
-    bool state_path_matches(const fs::path &path, const state_snapshot_t &expected) {
+    /** @brief Describe a rejected committed snapshot without exposing file identity, contents or descriptors. */
+    void state_log_commit_mismatch(const state_snapshot_t &expected, const state_snapshot_t &current) {
+      BOOST_LOG(error) << "State committed comparison: identity="sv << state_same_id(expected.identity, current.identity)
+                       << "; volume="sv << (expected.identity.dwVolumeSerialNumber == current.identity.dwVolumeSerialNumber)
+                       << "; file_id="sv << (expected.identity.nFileIndexHigh == current.identity.nFileIndexHigh && expected.identity.nFileIndexLow == current.identity.nFileIndexLow)
+                       << "; bytes="sv << (expected.bytes == current.bytes)
+                       << "; creation_time="sv << (expected.basic.CreationTime.QuadPart == current.basic.CreationTime.QuadPart)
+                       << "; creation_expected/current="sv << expected.basic.CreationTime.QuadPart << '/' << current.basic.CreationTime.QuadPart
+                       << "; attributes_expected/current="sv << expected.basic.FileAttributes << '/' << current.basic.FileAttributes;
+      const auto describe_policy = [](const char *component, auto left, auto right, bool matches) {
+        SECURITY_DESCRIPTOR_CONTROL left_control {}, right_control {};
+        DWORD left_revision = 0, right_revision = 0;
+        const bool left_read = !left.empty() && GetSecurityDescriptorControl(left.data(), &left_control, &left_revision);
+        const bool right_read = !right.empty() && GetSecurityDescriptorControl(right.data(), &right_control, &right_revision);
+        BOOST_LOG(error) << "State committed "sv << component << " comparison: matches="sv << matches
+                         << "; controls_read="sv << left_read << '/' << right_read
+                         << "; control_expected/current="sv << left_control << '/' << right_control
+                         << "; revision_expected/current="sv << left_revision << '/' << right_revision;
+      };
+      describe_policy("owner/group/DACL", expected.security, current.security, same_file_security(expected.security, current.security));
+      constexpr std::array<const char *, 3> components {"label", "resource attributes", "central policy"};
+      for (std::size_t index = 0; index < state_selectors.size(); ++index) {
+        describe_policy(components[index], expected.selected[index], current.selected[index], same_selected_security(expected.selected[index], current.selected[index], index == 2));
+      }
+    }
+
+    /**
+     * @brief Check an existing path against the identity/policy/bytes of a known object.
+     * @param path Path under inspection.
+     * @param expected Captured identity, policy and bytes.
+     * @param diagnose_commit Whether a failed final comparison emits bounded component diagnostics.
+     * @return Whether the complete snapshot matches; inspection failures also reject it.
+     */
+    bool state_path_matches(const fs::path &path, const state_snapshot_t &expected, bool diagnose_commit = false) {
       try {
         state_handle_t handle {state_open(path)};
-        return handle.value != INVALID_HANDLE_VALUE && state_same(expected, state_capture(handle.value, path));
+        if (handle.value == INVALID_HANDLE_VALUE) {
+          if (diagnose_commit) {
+            state_log_failure({"State committed path could not be opened", GetLastError()});
+          }
+          return false;
+        }
+        const auto current = state_capture(handle.value, path);
+        const bool matches = state_same(expected, current);
+        if (!matches && diagnose_commit) {
+          state_log_commit_mismatch(expected, current);
+        }
+        return matches;
+      } catch (const state_file_error_t &failure) {
+        if (diagnose_commit) {
+          BOOST_LOG(error) << "State committed snapshot capture failed"sv;
+          state_log_failure(failure);
+        }
+        return false;
       } catch (...) {
+        if (diagnose_commit) {
+          BOOST_LOG(error) << "State committed snapshot could not be inspected"sv;
+        }
         return false;
       }
     }
@@ -784,7 +836,7 @@ namespace http {
         state_rename(temporary, destination, backup, *prepared, original.has_value(), [&]() {
           return original ? state_path_matches(destination, *original) && state_path_matches(backup, *original) && state_same(*original, state_capture(original_handle.value, destination)) : state_missing(destination);
         });
-        state_require(state_stage(state_stage_e::verify, destination, temporary, backup) && state_path_matches(destination, *prepared), "State committed identity, bytes or policy failed verification");
+        state_require(state_stage(state_stage_e::verify, destination, temporary, backup) && state_path_matches(destination, *prepared, true), "State committed identity, bytes or policy failed verification");
         verified_commit = true;
         return true;
       } catch (const state_file_error_t &failure) {
