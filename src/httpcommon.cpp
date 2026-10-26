@@ -453,9 +453,21 @@ namespace http {
       return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber && left.nFileIndexHigh == right.nFileIndexHigh && left.nFileIndexLow == right.nFileIndexLow;
     }
 
-    /** @brief Compare every supported security field and preserved basic metadata. */
-    bool state_same(const state_snapshot_t &left, const state_snapshot_t &right) {
-      if (!state_same_id(left.identity, right.identity) || left.basic.CreationTime.QuadPart != right.basic.CreationTime.QuadPart || left.basic.FileAttributes != right.basic.FileAttributes || left.bytes != right.bytes || !same_file_security(left.security, right.security)) {
+    /** @brief Restrict native creation-time tolerance to a final rename into genuine initial absence. */
+    enum class state_creation_time_e {
+      exact,  ///< All precommit, existing-original and recovery snapshots require equality.
+      initial_commit  ///< A final first-save name may acquire the removed name's tunneled creation time.
+    };
+
+    /**
+     * @brief Compare every supported security field and the metadata promised at this boundary.
+     * @param left Expected immutable snapshot.
+     * @param right Independently captured snapshot.
+     * @param creation_time Exact unless verifying the final initial-absence commit.
+     * @return Whether identity, payload, authority and required metadata match.
+     */
+    bool state_same(const state_snapshot_t &left, const state_snapshot_t &right, state_creation_time_e creation_time = state_creation_time_e::exact) {
+      if (!state_same_id(left.identity, right.identity) || (creation_time != state_creation_time_e::initial_commit && left.basic.CreationTime.QuadPart != right.basic.CreationTime.QuadPart) || left.basic.FileAttributes != right.basic.FileAttributes || left.bytes != right.bytes || !same_file_security(left.security, right.security)) {
         return false;
       }
       for (std::size_t index = 0; index < state_selectors.size(); ++index) {
@@ -472,12 +484,13 @@ namespace http {
     }
 
     /** @brief Describe a rejected committed snapshot without exposing file identity, contents or descriptors. */
-    void state_log_commit_mismatch(const state_snapshot_t &expected, const state_snapshot_t &current) {
+    void state_log_commit_mismatch(const state_snapshot_t &expected, const state_snapshot_t &current, state_creation_time_e creation_time) {
       BOOST_LOG(error) << "State committed comparison: identity="sv << state_same_id(expected.identity, current.identity)
                        << "; volume="sv << (expected.identity.dwVolumeSerialNumber == current.identity.dwVolumeSerialNumber)
                        << "; file_id="sv << (expected.identity.nFileIndexHigh == current.identity.nFileIndexHigh && expected.identity.nFileIndexLow == current.identity.nFileIndexLow)
                        << "; bytes="sv << (expected.bytes == current.bytes)
                        << "; creation_time="sv << (expected.basic.CreationTime.QuadPart == current.basic.CreationTime.QuadPart)
+                       << "; creation_time_required="sv << (creation_time != state_creation_time_e::initial_commit)
                        << "; creation_expected/current="sv << expected.basic.CreationTime.QuadPart << '/' << current.basic.CreationTime.QuadPart
                        << "; attributes_expected/current="sv << expected.basic.FileAttributes << '/' << current.basic.FileAttributes;
       const auto describe_policy = [](const char *component, auto left, auto right, bool matches) {
@@ -502,9 +515,10 @@ namespace http {
      * @param path Path under inspection.
      * @param expected Captured identity, policy and bytes.
      * @param diagnose_commit Whether a failed final comparison emits bounded component diagnostics.
+     * @param creation_time Exact unless verifying the final initial-absence commit.
      * @return Whether the complete snapshot matches; inspection failures also reject it.
      */
-    bool state_path_matches(const fs::path &path, const state_snapshot_t &expected, bool diagnose_commit = false) {
+    bool state_path_matches(const fs::path &path, const state_snapshot_t &expected, bool diagnose_commit = false, state_creation_time_e creation_time = state_creation_time_e::exact) {
       try {
         state_handle_t handle {state_open(path)};
         if (handle.value == INVALID_HANDLE_VALUE) {
@@ -514,9 +528,9 @@ namespace http {
           return false;
         }
         const auto current = state_capture(handle.value, path);
-        const bool matches = state_same(expected, current);
+        const bool matches = state_same(expected, current, creation_time);
         if (!matches && diagnose_commit) {
-          state_log_commit_mismatch(expected, current);
+          state_log_commit_mismatch(expected, current, creation_time);
         }
         return matches;
       } catch (const state_file_error_t &failure) {
@@ -836,7 +850,9 @@ namespace http {
         state_rename(temporary, destination, backup, *prepared, original.has_value(), [&]() {
           return original ? state_path_matches(destination, *original) && state_path_matches(backup, *original) && state_same(*original, state_capture(original_handle.value, destination)) : state_missing(destination);
         });
-        state_require(state_stage(state_stage_e::verify, destination, temporary, backup) && state_path_matches(destination, *prepared, true), "State committed identity, bytes or policy failed verification");
+        // Only this post-rename initial-absence boundary permits native filename tunneling of creation time.
+        const auto committed_creation_time = original ? state_creation_time_e::exact : state_creation_time_e::initial_commit;
+        state_require(state_stage(state_stage_e::verify, destination, temporary, backup) && state_path_matches(destination, *prepared, true, committed_creation_time), "State committed identity, bytes or policy failed verification");
         verified_commit = true;
         return true;
       } catch (const state_file_error_t &failure) {

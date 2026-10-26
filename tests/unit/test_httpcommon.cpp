@@ -1027,6 +1027,417 @@ TEST_F(StateFileTransactionTest, InitialAbsenceFailuresRestoreAbsenceOrPreserveU
   EXPECT_TRUE(same_security(original_security, security_snapshot(file)));
 }
 
+/** @brief Observe real first-save rename metadata in an exclusively owned system-temp fixture. */
+class StateFileCreationTimeTunnelingTest: public StateFileTransactionTest {
+protected:
+  /** @brief Independently observed components of one plain fixture file. */
+  struct snapshot_t {
+    BY_HANDLE_FILE_INFORMATION identity {};  ///< Volume and file identity used for ownership checks.
+    FILE_BASIC_INFO basic {};  ///< Exact creation time and ordinary attributes.
+    std::string bytes;  ///< Synthetic unnamed payload, never printed in diagnostics.
+    std::vector<std::uint8_t> security;  ///< Complete owner/group/DACL snapshot.
+    std::array<std::vector<std::uint8_t>, 3> selected;  ///< Label, resource attributes and central policy.
+  };
+
+  /** @brief Read-only observations surrounding a real production rename. */
+  struct attempt_t {
+    std::optional<snapshot_t> prepared, committed;  ///< Closed temporary and renamed candidate.
+    bool saved = false;  ///< Unmodified production result.
+    bool closed = false;  ///< Real source-handle close was reached.
+    bool verified = false;  ///< Final production verification was reached.
+  };
+
+  /** @brief Actual final metadata mismatches, applied only through a verified fixture handle. */
+  enum class verification_fault_e {
+    none,  ///< Observe without changing the committed candidate.
+    attributes,  ///< Change one supported ordinary attribute.
+    creation_time  ///< Change an existing-original candidate's creation time.
+  };
+
+  HANDLE directory_handle = INVALID_HANDLE_VALUE;  ///< Guard against replacing the owned fixture directory.
+  BY_HANDLE_FILE_INFORMATION directory_identity {};  ///< Exact created directory identity.
+  std::vector<std::pair<std::filesystem::path, BY_HANDLE_FILE_INFORMATION>> owned;  ///< Exact entries eligible for nonrecursive cleanup.
+  std::filesystem::path sentinel, retry;  ///< Fixed leaves; no external fixture paths are accepted.
+  std::optional<snapshot_t> sentinel_original;  ///< Untouched sibling, including exact creation time.
+  static constexpr std::array<DWORD, 3> selectors {LABEL_SECURITY_INFORMATION, ATTRIBUTE_SECURITY_INFORMATION, SCOPE_SECURITY_INFORMATION};  ///< Existing production selector coverage.
+
+  /** @brief Compare only the native identity fields used by production and cleanup ownership. */
+  bool same_identity(const BY_HANDLE_FILE_INFORMATION &left, const BY_HANDLE_FILE_INFORMATION &right) {
+    return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber && left.nFileIndexHigh == right.nFileIndexHigh && left.nFileIndexLow == right.nFileIndexLow;
+  }
+
+  /** @brief Refuse missing, non-directory or reparse ancestors before touching an external fixture. */
+  bool plain_ancestors(std::filesystem::path path) {
+    for (;;) {
+      const auto attributes = GetFileAttributesW(path.c_str());
+      if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return false;
+      }
+      if (path == path.root_path()) {
+        return true;
+      }
+      path = path.parent_path();
+    }
+  }
+
+  /** @brief Admit only fixed fixture leaves and production temporary names in the guarded directory. */
+  bool fixture_path(const std::filesystem::path &path) {
+    const auto leaf = path.filename().string();
+    return path.parent_path() == directory && (path == file || path == retry || path == sentinel || leaf.starts_with(file.filename().string() + ".tmp-") || leaf.starts_with(retry.filename().string() + ".tmp-"));
+  }
+
+  /** @brief Remember a newly observed owned entry without allowing links or reparse objects. */
+  void remember(const std::filesystem::path &path, const BY_HANDLE_FILE_INFORMATION &identity) {
+    ASSERT_TRUE(fixture_path(path));
+    ASSERT_EQ(identity.dwVolumeSerialNumber, directory_identity.dwVolumeSerialNumber);
+    ASSERT_EQ(identity.nNumberOfLinks, 1U);
+    ASSERT_EQ(identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT), 0U);
+    const auto found = std::find_if(owned.begin(), owned.end(), [&](const auto &entry) {
+      return entry.first == path;
+    });
+    if (found == owned.end()) {
+      owned.emplace_back(path, identity);
+    } else {
+      found->second = identity;
+    }
+  }
+
+  /** @brief Capture fixture components without mutating timestamps, attributes or authority. */
+  std::optional<snapshot_t> capture(const std::filesystem::path &path) {
+    if (!fixture_path(path)) {
+      ADD_FAILURE() << "Snapshot refused a path outside the owned fixture";
+      return std::nullopt;
+    }
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+      ADD_FAILURE() << "Fixture snapshot could not open: " << GetLastError();
+      return std::nullopt;
+    }
+    auto close = util::fail_guard([&]() {
+      EXPECT_TRUE(CloseHandle(handle));
+    });
+    snapshot_t result;
+    if (!GetFileInformationByHandle(handle, &result.identity) || !GetFileInformationByHandleEx(handle, FileBasicInfo, &result.basic, sizeof(result.basic)) || result.identity.nNumberOfLinks != 1 || (result.basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+      ADD_FAILURE() << "Fixture snapshot requires one plain owned file";
+      return std::nullopt;
+    }
+    result.bytes = read_fixture_handle(handle);
+    result.security = security_snapshot(path);
+    if (!same_security(result.security, result.security)) {
+      ADD_FAILURE() << "Fixture owner/group/DACL snapshot is unavailable";
+      return std::nullopt;
+    }
+    for (std::size_t index = 0; index < selectors.size(); ++index) {
+      result.selected[index] = security_snapshot(path, selectors[index]);
+      if (!http::test_support::state_selected_security_matches(result.selected[index], result.selected[index], index == 2)) {
+        ADD_FAILURE() << "Fixture selected-policy snapshot is unavailable: " << index;
+        return std::nullopt;
+      }
+    }
+    return result;
+  }
+
+  /** @brief Create synthetic JSON with an optional known creation time using CREATE_NEW only. */
+  void create_fixture(const std::filesystem::path &path, std::uint64_t creation = 0) {
+    ASSERT_TRUE(fixture_path(path));
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_NE(handle, INVALID_HANDLE_VALUE);
+    auto close = util::fail_guard([&]() {
+      EXPECT_TRUE(CloseHandle(handle));
+    });
+    BY_HANDLE_FILE_INFORMATION identity {};
+    ASSERT_TRUE(GetFileInformationByHandle(handle, &identity));
+    remember(path, identity);
+    constexpr char bytes[] = "{\"fixture\":\"untouched synthetic state\"}\n";
+    DWORD written = 0;
+    ASSERT_TRUE(WriteFile(handle, bytes, sizeof(bytes) - 1, &written, nullptr));
+    ASSERT_EQ(written, sizeof(bytes) - 1);
+    ASSERT_TRUE(FlushFileBuffers(handle));
+    if (creation) {
+      const FILETIME time {static_cast<DWORD>(creation), static_cast<DWORD>(creation >> 32)};
+      ASSERT_TRUE(SetFileTime(handle, &time, nullptr, nullptr));
+    }
+  }
+
+  /** @brief Delete only the opened, identity-checked known fixture object; never recurse or follow links. */
+  void remove_owned(const std::filesystem::path &path, const BY_HANDLE_FILE_INFORMATION &expected) {
+    ASSERT_TRUE(fixture_path(path));
+    ASSERT_TRUE(plain_ancestors(directory));
+    HANDLE handle = CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    ASSERT_NE(handle, INVALID_HANDLE_VALUE);
+    auto close = util::fail_guard([&]() {
+      EXPECT_TRUE(CloseHandle(handle));
+    });
+    BY_HANDLE_FILE_INFORMATION current {};
+    ASSERT_TRUE(GetFileInformationByHandle(handle, &current));
+    ASSERT_TRUE(same_identity(expected, current));
+    ASSERT_EQ(current.nNumberOfLinks, 1U);
+    ASSERT_EQ(current.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT), 0U);
+    FILE_DISPOSITION_INFO disposition {TRUE};
+    ASSERT_TRUE(SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition)));
+  }
+
+  /** @brief Distinguish genuine absence from an inaccessible or delete-pending entry. */
+  bool missing(const std::filesystem::path &path) {
+    return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
+  }
+
+  void SetUp() override {
+    BaseTest::SetUp();
+    const auto parent = std::filesystem::absolute(std::filesystem::temp_directory_path()).lexically_normal();
+    ASSERT_TRUE(plain_ancestors(parent));
+    static std::size_t next_fixture = 0;
+    directory = parent / ("miranda-state-tunneling-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + "-" + std::to_string(++next_fixture));
+    ASSERT_TRUE(CreateDirectoryW(directory.c_str(), nullptr));
+    directory_handle = CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    ASSERT_NE(directory_handle, INVALID_HANDLE_VALUE);
+    ASSERT_TRUE(GetFileInformationByHandle(directory_handle, &directory_identity));
+    ASSERT_TRUE(directory_identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    ASSERT_FALSE(directory_identity.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+    file = directory / "initial-state-long-name.json";
+    retry = directory / "close-retry-state-long-name.json";
+    sentinel = directory / "untouched-sentinel.json";
+    create_fixture(sentinel);
+    ASSERT_FALSE(HasFatalFailure());
+    sentinel_original = capture(sentinel);
+    ASSERT_TRUE(sentinel_original.has_value());
+    std::array<wchar_t, 64> filesystem {};
+    DWORD flags = 0;
+    ASSERT_TRUE(GetVolumeInformationByHandleW(directory_handle, nullptr, 0, nullptr, nullptr, &flags, filesystem.data(), static_cast<DWORD>(filesystem.size())));
+    const std::wstring provider {filesystem.data()};
+    RecordProperty("filesystem", std::string(provider.begin(), provider.end()));
+    RecordProperty("hard_links_supported", (flags & FILE_SUPPORTS_HARD_LINKS) ? "true" : "false");
+    if (provider != L"NTFS" || !(flags & FILE_SUPPORTS_HARD_LINKS)) {
+      GTEST_SKIP() << "Actual-writer tunneling is unexercised: system temporary provider is outside the production NTFS contract";
+    }
+  }
+
+  void TearDown() override {
+    http::test_support::set_state_file_hook({});
+    for (const auto &[path, identity] : owned) {
+      if (!missing(path)) {
+        remove_owned(path, identity);
+      }
+    }
+    if (directory_handle != INVALID_HANDLE_VALUE) {
+      BY_HANDLE_FILE_INFORMATION current {};
+      std::error_code error;
+      if (plain_ancestors(directory) && GetFileInformationByHandle(directory_handle, &current) && same_identity(directory_identity, current) && std::filesystem::is_empty(directory, error) && !error) {
+        FILE_DISPOSITION_INFO disposition {TRUE};
+        EXPECT_TRUE(SetFileInformationByHandle(directory_handle, FileDispositionInfo, &disposition, sizeof(disposition)));
+      } else {
+        ADD_FAILURE() << "Fixture cleanup retained an unverified or nonempty directory";
+      }
+      EXPECT_TRUE(CloseHandle(directory_handle));
+    }
+    BaseTest::TearDown();
+  }
+
+  /** @brief Assert exact identity, payload and complete authority using the production policy gates. */
+  void expect_authority_and_payload(const snapshot_t &expected, const snapshot_t &current) {
+    EXPECT_TRUE(same_identity(expected.identity, current.identity));
+    EXPECT_TRUE(expected.bytes == current.bytes);
+    EXPECT_TRUE(same_security(expected.security, current.security)) << security_difference(expected.security, current.security);
+    for (std::size_t index = 0; index < selectors.size(); ++index) {
+      SCOPED_TRACE(index);
+      EXPECT_TRUE(http::test_support::state_selected_security_matches(expected.selected[index], current.selected[index], index == 2));
+    }
+  }
+
+  /** @brief Assert every non-time production component separately; no snapshot acceptance predicate is relaxed. */
+  void expect_components(const snapshot_t &expected, const snapshot_t &current) {
+    expect_authority_and_payload(expected, current);
+    EXPECT_EQ(expected.basic.FileAttributes, current.basic.FileAttributes);
+  }
+
+  /** @brief Require the untouched sibling's exact identity, bytes, attributes, authority and creation time. */
+  void expect_sentinel_unchanged() {
+    const auto current = capture(sentinel);
+    ASSERT_TRUE(sentinel_original.has_value() && current.has_value());
+    expect_components(*sentinel_original, *current);
+    EXPECT_EQ(sentinel_original->basic.CreationTime.QuadPart, current->basic.CreationTime.QuadPart);
+  }
+
+  /** @brief Record short-alias presence without changing volume settings or printing fixture paths. */
+  void record_alias(const std::filesystem::path &path, const std::string &property) {
+    std::array<wchar_t, 32768> name {};
+    const auto length = GetShortPathNameW(path.c_str(), name.data(), static_cast<DWORD>(name.size()));
+    ASSERT_TRUE(length && length < name.size());
+    RecordProperty(property, std::filesystem::path {name.data()}.filename() != path.filename() ? "true" : "false");
+  }
+
+  /** @brief Alter only known candidate metadata to prove that final verification still rejects real mismatches. */
+  void alter_committed_metadata(const std::filesystem::path &path, const snapshot_t &expected, verification_fault_e fault) {
+    ASSERT_TRUE(fixture_path(path));
+    ASSERT_TRUE(plain_ancestors(directory));
+    HANDLE handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    ASSERT_NE(handle, INVALID_HANDLE_VALUE);
+    auto close = util::fail_guard([&]() {
+      EXPECT_TRUE(CloseHandle(handle));
+    });
+    BY_HANDLE_FILE_INFORMATION identity {};
+    ASSERT_TRUE(GetFileInformationByHandle(handle, &identity));
+    ASSERT_TRUE(same_identity(expected.identity, identity));
+    ASSERT_EQ(identity.nNumberOfLinks, 1U);
+    ASSERT_EQ(identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT), 0U);
+    FILE_BASIC_INFO apply {};
+    if (fault == verification_fault_e::attributes) {
+      apply.FileAttributes = (expected.basic.FileAttributes ^ FILE_ATTRIBUTE_HIDDEN) & ~FILE_ATTRIBUTE_NORMAL;
+      if (!apply.FileAttributes) {
+        apply.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+      }
+    } else {
+      ASSERT_EQ(fault, verification_fault_e::creation_time);
+      apply.CreationTime.QuadPart = 132223104010000000LL;
+      ASSERT_NE(apply.CreationTime.QuadPart, expected.basic.CreationTime.QuadPart);
+    }
+    ASSERT_TRUE(SetFileInformationByHandle(handle, FileBasicInfo, &apply, sizeof(apply)));
+  }
+
+  /** @brief Observe real rename stages, with explicit close or verified final-metadata faults for negative cases. */
+  attempt_t save(const std::filesystem::path &target, bool fault_close = false, verification_fault_e verification_fault = verification_fault_e::none) {
+    using stage_t = http::test_support::state_file_stage_e;
+    attempt_t attempt;
+    auto clear = util::fail_guard([]() {
+      http::test_support::set_state_file_hook({});
+    });
+    http::test_support::set_state_file_hook([&](auto stage, const auto &destination, const auto &temporary, const auto &) -> std::optional<std::uint32_t> {
+      if (stage == stage_t::rename) {
+        EXPECT_TRUE(destination == target);
+        attempt.prepared = capture(temporary);
+        if (attempt.prepared) {
+          remember(temporary, attempt.prepared->identity);
+        }
+      }
+      if (stage == stage_t::rename_close) {
+        attempt.closed = true;
+      }
+      if (stage == stage_t::verify || (fault_close && stage == stage_t::rename_close)) {
+        attempt.verified = stage == stage_t::verify;
+        if (stage == stage_t::verify && attempt.prepared && verification_fault != verification_fault_e::none) {
+          alter_committed_metadata(destination, *attempt.prepared, verification_fault);
+        }
+        attempt.committed = capture(destination);
+        if (attempt.prepared && attempt.committed && same_identity(attempt.prepared->identity, attempt.committed->identity)) {
+          remember(destination, attempt.committed->identity);
+          record_alias(destination, fault_close ? "faulted_name_short_alias" : "committed_name_short_alias");
+        }
+      }
+      return fault_close && stage == stage_t::rename_close ? std::optional<std::uint32_t> {ERROR_WRITE_FAULT} : std::nullopt;
+    });
+    attempt.saved = http::update_state_file(target.string(), [](auto &tree) {
+      tree.put("fixture", "actual writer candidate");
+    });
+    return attempt;
+  }
+
+  /** @brief Require successful first-save publication while recording any native creation-time tunneling. */
+  void expect_clean_attempt(const std::filesystem::path &target, const attempt_t &attempt, LONGLONG removed_creation) {
+    ASSERT_TRUE(attempt.prepared.has_value() && attempt.committed.has_value());
+    ASSERT_TRUE(attempt.closed && attempt.verified);
+    expect_components(*attempt.prepared, *attempt.committed);
+    EXPECT_TRUE(attempt.prepared->bytes.contains("actual writer candidate"));
+    RecordProperty("removed_creation", std::to_string(removed_creation));
+    RecordProperty("prepared_creation", std::to_string(attempt.prepared->basic.CreationTime.QuadPart));
+    RecordProperty("committed_creation", std::to_string(attempt.committed->basic.CreationTime.QuadPart));
+    RecordProperty("save_accepted", attempt.saved ? "true" : "false");
+    const bool tunneled = attempt.committed->basic.CreationTime.QuadPart == removed_creation && attempt.prepared->basic.CreationTime.QuadPart != removed_creation;
+    RecordProperty("tunneled_removed_creation", tunneled ? "true" : "false");
+    if (!tunneled) {
+      EXPECT_EQ(attempt.prepared->basic.CreationTime.QuadPart, attempt.committed->basic.CreationTime.QuadPart);
+    }
+    ASSERT_TRUE(attempt.saved);
+    const auto published = capture(target);
+    ASSERT_TRUE(published.has_value());
+    expect_components(*attempt.committed, *published);
+    EXPECT_EQ(attempt.committed->basic.CreationTime.QuadPart, published->basic.CreationTime.QuadPart);
+    expect_sentinel_unchanged();
+  }
+};
+
+TEST_F(StateFileCreationTimeTunnelingTest, SeededRemovedCreationTimeAllowsActualFirstSaveWithExactAuthorityAndPayload) {
+  constexpr std::uint64_t old_creation = 132223104000000000ULL;
+  create_fixture(file, old_creation);
+  ASSERT_FALSE(HasFatalFailure());
+  const auto original = capture(file);
+  ASSERT_TRUE(original.has_value());
+  ASSERT_EQ(original->basic.CreationTime.QuadPart, static_cast<LONGLONG>(old_creation));
+  record_alias(file, "removed_name_short_alias");
+  remove_owned(file, original->identity);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_TRUE(missing(file));
+  const auto attempt = save(file);
+  expect_clean_attempt(file, attempt, static_cast<LONGLONG>(old_creation));
+  ASSERT_FALSE(HasFailure());
+  if (attempt.prepared->basic.CreationTime.QuadPart == attempt.committed->basic.CreationTime.QuadPart) {
+    GTEST_SKIP() << "Actual-writer creation-time tunneling is unexercised: the removed name did not replace the prepared creation time";
+  }
+}
+
+TEST_F(StateFileCreationTimeTunnelingTest, RenameCloseFaultRestoresAbsenceThenCleanRetryPublishesExactAuthorityAndPayload) {
+  ASSERT_TRUE(missing(retry));
+  const auto faulted = save(retry, true);
+  ASSERT_TRUE(faulted.prepared.has_value() && faulted.committed.has_value());
+  ASSERT_TRUE(faulted.closed);
+  EXPECT_FALSE(faulted.verified);
+  EXPECT_FALSE(faulted.saved);
+  expect_components(*faulted.prepared, *faulted.committed);
+  EXPECT_EQ(faulted.prepared->basic.CreationTime.QuadPart, faulted.committed->basic.CreationTime.QuadPart);
+  RecordProperty("faulted_prepared_creation", std::to_string(faulted.prepared->basic.CreationTime.QuadPart));
+  RecordProperty("faulted_committed_creation", std::to_string(faulted.committed->basic.CreationTime.QuadPart));
+  ASSERT_TRUE(missing(retry));
+  expect_sentinel_unchanged();
+  const auto clean = save(retry);
+  expect_clean_attempt(retry, clean, faulted.committed->basic.CreationTime.QuadPart);
+  ASSERT_FALSE(HasFailure());
+  if (clean.prepared->basic.CreationTime.QuadPart == clean.committed->basic.CreationTime.QuadPart) {
+    GTEST_SKIP() << "Actual-writer close-fault/retry tunneling is unexercised: the retry retained its prepared creation time";
+  }
+}
+
+TEST_F(StateFileCreationTimeTunnelingTest, InitialAbsenceOrdinaryAttributeMismatchStillRejectsAndRestoresAbsence) {
+  constexpr std::uint64_t old_creation = 132223104000000000ULL;
+  create_fixture(file, old_creation);
+  ASSERT_FALSE(HasFatalFailure());
+  const auto original = capture(file);
+  ASSERT_TRUE(original.has_value());
+  ASSERT_EQ(original->basic.CreationTime.QuadPart, static_cast<LONGLONG>(old_creation));
+  remove_owned(file, original->identity);
+  ASSERT_FALSE(HasFatalFailure());
+  ASSERT_TRUE(missing(file));
+  const auto attempt = save(file, false, verification_fault_e::attributes);
+  ASSERT_TRUE(attempt.prepared.has_value() && attempt.committed.has_value());
+  ASSERT_TRUE(attempt.closed && attempt.verified);
+  expect_authority_and_payload(*attempt.prepared, *attempt.committed);
+  EXPECT_NE(attempt.prepared->basic.FileAttributes, attempt.committed->basic.FileAttributes);
+  EXPECT_FALSE(attempt.saved);
+  EXPECT_TRUE(missing(file));
+  expect_sentinel_unchanged();
+}
+
+TEST_F(StateFileCreationTimeTunnelingTest, ExistingOriginalCreationTimeMismatchStillRejectsAndRestoresExactOriginal) {
+  constexpr std::uint64_t old_creation = 132223104000000000ULL;
+  create_fixture(file, old_creation);
+  ASSERT_FALSE(HasFatalFailure());
+  const auto original = capture(file);
+  ASSERT_TRUE(original.has_value());
+  ASSERT_EQ(original->basic.CreationTime.QuadPart, static_cast<LONGLONG>(old_creation));
+  const auto attempt = save(file, false, verification_fault_e::creation_time);
+  ASSERT_TRUE(attempt.prepared.has_value() && attempt.committed.has_value());
+  ASSERT_TRUE(attempt.closed && attempt.verified);
+  expect_components(*attempt.prepared, *attempt.committed);
+  EXPECT_NE(attempt.prepared->basic.CreationTime.QuadPart, attempt.committed->basic.CreationTime.QuadPart);
+  EXPECT_EQ(attempt.prepared->basic.CreationTime.QuadPart, original->basic.CreationTime.QuadPart);
+  EXPECT_FALSE(attempt.saved);
+  const auto restored = capture(file);
+  ASSERT_TRUE(restored.has_value());
+  expect_components(*original, *restored);
+  EXPECT_EQ(original->basic.CreationTime.QuadPart, restored->basic.CreationTime.QuadPart);
+  ASSERT_FALSE(HasFailure());
+  remember(file, restored->identity);
+  expect_sentinel_unchanged();
+}
+
 TEST_F(StateFileTransactionTest, MandatorySelectorsFailClosedWithoutRequiringAuditPrivilege) {
   using stage_t = http::test_support::state_file_stage_e;
   HANDLE token = nullptr;
