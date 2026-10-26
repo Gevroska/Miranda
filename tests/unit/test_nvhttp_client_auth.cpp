@@ -12,8 +12,10 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // lib includes
@@ -39,6 +41,7 @@ protected:
    */
   void SetUp() override {
     BaseTest::SetUp();
+    drain_owner(rtsp_stream::test_support::start_owner());
     original_state_file = config::nvhttp.file_state;
     original_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
     state_file = fs::path {SUNSHINE_TEST_BIN_DIR} / "client_authorization_state.json";
@@ -64,6 +67,16 @@ protected:
     config::nvhttp.file_state = original_state_file;
     config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
     BaseTest::TearDown();
+  }
+
+  /**
+   * @brief Drain prior process observations before replacing fixture state or starting a fresh owner.
+   * @param owner Isolated owner whose shutdown consumes all accepted process completions.
+   */
+  static void drain_owner(std::unique_ptr<platf::deinit_t> owner) {
+    rtsp_stream::test_support::owner_operation([]() {
+    });
+    owner.reset();
   }
 
 private:
@@ -682,6 +695,79 @@ TEST_F(ClientAuthorizationTest, ARevokeDoesNotInvalidateAnotherPrincipalsPending
   EXPECT_TRUE(rtsp_stream::test_support::token_authorized(other));
   rtsp_stream::stop_application({});
   EXPECT_FALSE(rtsp_stream::test_support::token_authorized(other));
+}
+
+TEST_F(ClientAuthorizationTest, FixtureDrainConsumesDeferredLivenessAndPreservesInflightProcessBusyRejection) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  rtsp_stream::refresh_process_liveness();
+  auto owner = rtsp_stream::test_support::start_owner();
+  std::promise<void> work_entered;
+  std::promise<void> release_work;
+  const auto released = release_work.get_future().share();
+  auto blocking = rtsp_stream::process_operation([&]() {
+    work_entered.set_value();
+    released.wait();
+  });
+  bool work_released = false;
+  const auto release = [&]() {
+    if (!work_released) {
+      release_work.set_value();
+      work_released = true;
+    }
+  };
+  auto release_on_failure = util::fail_guard([&]() {
+    release();
+    blocking.wait();
+  });
+  ASSERT_EQ(work_entered.get_future().wait_for(std::chrono::seconds {5}), std::future_status::ready);
+  const auto blocked = permission_launch(uuid, credentials.x509);
+  int prepared = 0;
+  int rolled_back = 0;
+  EXPECT_EQ(rtsp_stream::prepare_launch(blocked, [&]() {
+              ++prepared;
+              return 200;
+            },
+                                        [&]() {
+                                          ++rolled_back;
+                                        }),
+            503);
+  EXPECT_EQ(prepared, 0);
+  EXPECT_EQ(rolled_back, 0);
+  std::promise<void> process_drain_blocked;
+  std::atomic_bool drain_observed {false};
+  rtsp_stream::test_support::set_owner_hook([&](std::string_view event) {
+    if (event == "stop_process_work_pending" && !drain_observed.exchange(true)) {
+      process_drain_blocked.set_value();
+    }
+  });
+  auto clear_hook = util::fail_guard([]() {
+    rtsp_stream::test_support::set_owner_hook({});
+  });
+  auto drained = std::async(std::launch::async, [owner = std::move(owner)]() mutable {
+    drain_owner(std::move(owner));
+  });
+  auto release_before_join = util::fail_guard(release);
+  ASSERT_EQ(process_drain_blocked.get_future().wait_for(std::chrono::seconds {5}), std::future_status::ready);
+  EXPECT_EQ(drained.wait_for(std::chrono::seconds {0}), std::future_status::timeout);
+  release();
+  ASSERT_EQ(drained.wait_for(std::chrono::seconds {5}), std::future_status::ready);
+  drained.get();
+  release_before_join.disable();
+  release_on_failure.disable();
+  clear_hook.disable();
+  blocking.get();
+  auto fresh_owner = rtsp_stream::test_support::start_owner();
+  const auto admitted = permission_launch(uuid, credentials.x509);
+  EXPECT_EQ(rtsp_stream::prepare_launch(admitted, [&]() {
+              ++prepared;
+              return 200;
+            }),
+            200);
+  EXPECT_EQ(prepared, 1);
+  EXPECT_EQ(rolled_back, 0);
+  rtsp_stream::launch_session_clear(admitted->id);
 }
 
 TEST_F(ClientAuthorizationTest, RevocationDuringPreparationRollsBackBeforeAcknowledgingUpdate) {

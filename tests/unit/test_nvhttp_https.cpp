@@ -281,7 +281,7 @@ namespace {
       BaseTest::TearDown();
     }
 
-    /** @brief Quiesce callbacks before restoring any fixture-owned catalog or process state. */
+    /** @brief Close client peers and quiesce every server worker before restoring fixture-owned state. */
     void stop_server() {
       if (server_cleanup_complete) {
         return;
@@ -296,10 +296,16 @@ namespace {
         if (server_io) {
           server_io->stop();
         }
-        if (server_thread.joinable()) {
-          if (before_server_join) {
-            before_server_join();
+        if (before_server_join && (server_thread.joinable() || !extra_servers.empty())) {
+          before_server_join();
+        }
+        for (auto &thread : extra_servers) {
+          if (thread.joinable()) {
+            thread.join();
           }
+        }
+        extra_servers.clear();
+        if (server_thread.joinable()) {
           server_thread.join();
         }
         handler_scope->stop();
@@ -583,6 +589,7 @@ namespace {
 
     boost::asio::io_context client_io;  ///< Client event loop driven with bounded completion events.
     std::jthread server_thread;  ///< Independent server loop, including production synchronous TLS shutdown.
+    std::vector<std::jthread> extra_servers;  ///< Additional workers share the same peer-close and join boundary.
     std::function<void()> before_server_join;  ///< Nonblocking event observer for deterministic shutdown coverage.
     std::function<void()> restore_isolated_catalog;  ///< Owns original catalog/process state through server quiescence.
     bool server_cleanup_complete = false;  ///< Prevents explicit regression shutdown from restoring state twice.
@@ -819,6 +826,65 @@ namespace {
     EXPECT_EQ(config::stream.file_apps, original_apps_file);
     EXPECT_EQ(proc::proc.published_snapshot(), original_snapshot);
     EXPECT_FALSE(std::filesystem::exists(isolated_file));
+  }
+
+  TEST_F(HttpsClientIdentityTest, UnreadClientClosesBeforeAdditionalServerWorkersJoin) {
+    start_server();
+    for (int i = 0; i < 2; ++i) {
+      extra_servers.emplace_back([io = server->io_service]() {
+        io->run();
+      });
+    }
+    auto client = connect_client(&credentials_a);
+    send(*client, request("close"));
+
+    auto entered = std::make_shared<std::promise<void>>();
+    auto entered_event = entered->get_future();
+    auto release = std::make_shared<std::promise<void>>();
+    const auto released = release->get_future().share();
+    auto returned = std::make_shared<std::atomic_bool>(false);
+    auto scope_acquired = std::make_shared<std::atomic_bool>(false);
+    auto release_on_exit = util::fail_guard([release]() {
+      release->set_value();
+    });
+    boost::asio::post(*server->io_service, [scope = handler_scope, entered, released, returned, scope_acquired]() {
+      auto lock = scope->continue_lock();
+      *scope_acquired = static_cast<bool>(lock);
+      entered->set_value();
+      released.wait();
+      *returned = true;
+    });
+    ASSERT_EQ(entered_event.wait_for(2s), std::future_status::ready);
+    ASSERT_TRUE(scope_acquired->load());
+
+    auto joining = std::make_shared<std::promise<void>>();
+    auto join_event = joining->get_future();
+    auto peer_closed = std::make_shared<std::atomic_bool>(false);
+    before_server_join = [client, joining, peer_closed]() {
+      *peer_closed = !client->socket.lowest_layer().is_open();
+      joining->set_value();
+    };
+    auto stopping = std::async(std::launch::async, [this]() {
+      stop_server();
+    });
+    auto release_before_join = util::fail_guard([release]() {
+      release->set_value();
+    });
+    release_on_exit.disable();
+    EXPECT_EQ(join_event.wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(peer_closed->load());
+    EXPECT_FALSE(returned->load());
+    EXPECT_EQ(stopping.wait_for(0ms), std::future_status::timeout);
+    release->set_value();
+    release_before_join.disable();
+    EXPECT_EQ(stopping.wait_for(2s), std::future_status::ready);
+    stopping.get();
+    EXPECT_TRUE(returned->load());
+    EXPECT_FALSE(client->socket.lowest_layer().is_open());
+    EXPECT_TRUE(extra_servers.empty());
+    EXPECT_FALSE(server_thread.joinable());
+    EXPECT_FALSE(handler_scope->continue_lock());
+    EXPECT_FALSE(server);
   }
 
   TEST_F(HttpsClientIdentityTest, ZeroGrantProductionRoutesDenyActionsAndHideRestrictedMetadata) {
@@ -1242,11 +1308,7 @@ namespace {
       proc::test_support::set_execute_entry_hook({});
       proc::test_support::set_undo_environment_hook({});
       proc::test_support::set_legacy_restore_hook({});
-      server->io_service->stop();
-      for (auto &thread : extra_servers) {
-        thread.join();
-      }
-      extra_servers.clear();
+      stop_server();
       proc::proc.terminate();
       proc::proc = std::move(previous_proc);
       std::error_code error;
@@ -1303,7 +1365,6 @@ namespace {
     std::shared_ptr<std::vector<std::pair<std::string, std::string>>> undo_records = std::make_shared<std::vector<std::pair<std::string, std::string>>>();
     std::shared_ptr<managed_http_backend_t> backend;
     std::unique_ptr<platf::deinit_t> owner;
-    std::vector<std::jthread> extra_servers;
   };
 
   TEST_F(ManagedHttpsProcessTest, RemovedSelectedAppBeforeExecutePreservesOriginalIncarnationAndUndo) {
@@ -1457,15 +1518,24 @@ namespace {
     auto revoked = std::async(std::launch::async, [uuid = uuid_a]() {
       return nvhttp::update_client(uuid, std::nullopt, 0U);
     });
+    // Keep release guards after their futures so failure unwinding opens the gate before joining.
+    auto release_before_revocation_join = util::fail_guard([this]() {
+      std::ofstream {gate} << "release";
+    });
     ASSERT_EQ(revoked.wait_for(1s), std::future_status::ready);
     EXPECT_TRUE(revoked.get());
     auto shutdown = std::async(std::launch::async, []() {
       rtsp_stream::test_support::stop_owner();
     });
+    auto release_before_shutdown_join = util::fail_guard([this]() {
+      std::ofstream {gate} << "release";
+    });
     ASSERT_EQ(shutdown_entered->get_future().wait_for(1s), std::future_status::ready);
     EXPECT_FALSE(std::filesystem::exists(gate));
     EXPECT_EQ(shutdown.wait_for(0ms), std::future_status::timeout);
     std::ofstream {gate} << "release";
+    release_before_shutdown_join.disable();
+    release_before_revocation_join.disable();
     ASSERT_EQ(mutation.wait_for(3s), std::future_status::ready);
     EXPECT_EQ(mutation.get().status, 200);
     ASSERT_EQ(catalog_read.wait_for(3s), std::future_status::ready);

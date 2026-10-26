@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -172,6 +173,124 @@ protected:
       EXPECT_TRUE(CloseHandle(handle));
     });
     return read_fixture_handle(handle);
+  }
+
+  /**
+   * @brief Replace the state name with a distinct fixed fixture object while its original permits delete sharing.
+   * @param source One of the two synthetic external-edit leaves created by the calling tests.
+   * @return Whether one real extended rename changed the destination to the verified source identity.
+   */
+  bool replace_external_fixture(const std::filesystem::path &source) {
+  #if defined(FILE_RENAME_FLAG_REPLACE_IF_EXISTS) && defined(FILE_RENAME_FLAG_POSIX_SEMANTICS) && NTDDI_VERSION >= 0x0A000002
+    const auto refuse = [](const char *reason, DWORD native_error = ERROR_SUCCESS) {
+      ADD_FAILURE() << reason << "; native_error=" << native_error;
+      return false;
+    };
+    if (file != directory / "state.json" || (source != directory / "external-edit.bytes" && source != directory / "same-byte-external.json")) {
+      return refuse("External replacement refused a path outside its fixed fixture leaves");
+    }
+    for (auto ancestor = std::filesystem::absolute(directory);; ancestor = ancestor.parent_path()) {
+      const auto attributes = GetFileAttributesW(ancestor.c_str());
+      if (attributes == INVALID_FILE_ATTRIBUTES) {
+        return refuse("External replacement could not inspect a fixture ancestor", GetLastError());
+      }
+      if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return refuse("External replacement requires plain fixture ancestors");
+      }
+      if (ancestor == ancestor.root_path()) {
+        break;
+      }
+    }
+    const auto same_identity = [](const auto &left, const auto &right) {
+      return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber && left.nFileIndexHigh == right.nFileIndexHigh && left.nFileIndexLow == right.nFileIndexLow;
+    };
+    const auto inspect = [&](HANDLE handle, BY_HANDLE_FILE_INFORMATION &identity, bool single_link) {
+      if (!GetFileInformationByHandle(handle, &identity)) {
+        return refuse("External replacement could not inspect an opened fixture identity", GetLastError());
+      }
+      if ((identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) || (single_link && identity.nNumberOfLinks != 1)) {
+        return refuse("External replacement requires plain fixture files and one source link");
+      }
+      return true;
+    };
+    const auto close = [](HANDLE handle) {
+      const auto closed = CloseHandle(handle);
+      const auto native_error = closed ? ERROR_SUCCESS : GetLastError();
+      EXPECT_TRUE(closed) << "External replacement fixture close failed; native_error=" << native_error;
+    };
+    const auto named_matches = [&](const std::filesystem::path &path, const auto &expected) {
+      HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+      if (handle == INVALID_HANDLE_VALUE) {
+        return refuse("External replacement could not reopen a fixture name", GetLastError());
+      }
+      auto closing = util::fail_guard([&]() {
+        close(handle);
+      });
+      BY_HANDLE_FILE_INFORMATION current {};
+      return inspect(handle, current, false) && (same_identity(expected, current) || refuse("External replacement fixture name changed identity"));
+    };
+    HANDLE moving = CreateFileW(source.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (moving == INVALID_HANDLE_VALUE) {
+      return refuse("External replacement could not open its source", GetLastError());
+    }
+    auto close_moving = util::fail_guard([&]() {
+      close(moving);
+    });
+    HANDLE original = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (original == INVALID_HANDLE_VALUE) {
+      return refuse("External replacement could not open its destination", GetLastError());
+    }
+    auto close_original = util::fail_guard([&]() {
+      close(original);
+    });
+    BY_HANDLE_FILE_INFORMATION source_identity {}, original_identity {};
+    if (!inspect(moving, source_identity, true) || !inspect(original, original_identity, false)) {
+      return false;
+    }
+    if (source_identity.dwVolumeSerialNumber != original_identity.dwVolumeSerialNumber || same_identity(source_identity, original_identity)) {
+      return refuse("External replacement requires distinct same-volume fixture identities");
+    }
+    if (!named_matches(source, source_identity) || !named_matches(file, original_identity)) {
+      return false;
+    }
+    const auto target = std::filesystem::absolute(file).wstring();
+    constexpr auto offset = offsetof(FILE_RENAME_INFO, FileName);
+    if (target.size() > (MAXDWORD - offset - sizeof(wchar_t)) / sizeof(wchar_t)) {
+      return refuse("External replacement target exceeds the native buffer limit");
+    }
+    const auto name_size = target.size() * sizeof(wchar_t);
+    const auto buffer_size = std::max(sizeof(FILE_RENAME_INFO), offset + name_size + sizeof(wchar_t));
+    static_assert(alignof(FILE_RENAME_INFO) <= alignof(std::max_align_t));
+    auto *rename = static_cast<FILE_RENAME_INFO *>(std::calloc(1, buffer_size));
+    if (!rename) {
+      return refuse("External replacement could not allocate its aligned rename buffer");
+    }
+    auto free_rename = util::fail_guard([&]() {
+      std::free(rename);
+    });
+    rename->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+    rename->FileNameLength = static_cast<DWORD>(name_size);
+    std::memcpy(rename->FileName, target.data(), name_size);
+    const auto renamed = SetFileInformationByHandle(moving, FileRenameInfoEx, rename, static_cast<DWORD>(buffer_size));
+    const auto rename_error = renamed ? ERROR_SUCCESS : GetLastError();
+    if (!renamed) {
+      return refuse("External replacement handle-bound rename was refused", rename_error);
+    }
+    BY_HANDLE_FILE_INFORMATION moved {}, retained_original {};
+    if (!inspect(moving, moved, true) || !inspect(original, retained_original, false) || !same_identity(source_identity, moved) || !same_identity(original_identity, retained_original) || !named_matches(file, source_identity)) {
+      return refuse("External replacement did not preserve its opened identities and publish the distinct source");
+    }
+    const auto attributes = GetFileAttributesW(source.c_str());
+    const auto absence_error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    if (attributes != INVALID_FILE_ATTRIBUTES || absence_error != ERROR_FILE_NOT_FOUND) {
+      return refuse("External replacement source name is not genuinely absent", absence_error);
+    }
+    return true;
+  #else
+    (void) source;
+    ADD_FAILURE() << "External replacement requires the production baseline's extended handle-based rename support";
+    return false;
+  #endif
   }
 
   /**
@@ -2224,7 +2343,7 @@ TEST_F(StateFileTransactionTest, ObservedExternalEditIsNotOverwrittenAfterPrepar
 #endif
   http::test_support::set_state_update_hook([&]() {
 #ifdef _WIN32
-    ASSERT_TRUE(MoveFileExW(external.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH));
+    ASSERT_TRUE(replace_external_fixture(external));
 #else
     std::ofstream {file} << R"({"fixture":"external"})";
 #endif
@@ -2313,7 +2432,7 @@ TEST_F(StateFileTransactionTest, ByteReadOnlyPreparationRejectsDeleteSharingRepl
     ++calls;
     EXPECT_TRUE(bytes == original);
     EXPECT_EQ(std::distance(std::filesystem::directory_iterator {directory}, std::filesystem::directory_iterator {}), 2);
-    replaced = MoveFileExW(external.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    replaced = replace_external_fixture(external);
     EXPECT_TRUE(replaced);
     return std::nullopt;
   });

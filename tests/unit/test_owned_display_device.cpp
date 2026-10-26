@@ -42,6 +42,7 @@
   #include <src/httpcommon.h>
   #include <src/nvhttp.h>
   #include <src/platform/windows/source_backend.h>
+  #include <src/platform/windows/source_startup.h>
   #include <src/process.h>
 
 namespace {
@@ -882,6 +883,41 @@ namespace {
     }
   };
 }  // namespace
+
+TEST_F(OwnedDisplayTest, StartupExclusionSurvivesFailedConstructionAndExactJournalRecovery) {
+  auto owned_path = std::filesystem::absolute(path).lexically_normal();
+  owned_path.make_preferred();
+  const auto ordinary_path = owned_path.parent_path() / (owned_path.filename().native() + L".ordinary.state");
+  platf::source_startup::coordinator_t startup {{owned_path, ordinary_path}};
+  ASSERT_EQ(startup.inspect().disposition, platf::source_startup::disposition_e::ordinary_clear);
+
+  const auto failed_begin = owned_display_configuration_t::test_begin(path, first_identity, 1, authority, nullptr, devices);
+  ASSERT_FALSE(failed_begin);
+  EXPECT_FALSE(reset_persistence());
+  ASSERT_TRUE(begin());
+  const auto journal = source->journal();
+  ASSERT_TRUE(journal);
+  EXPECT_EQ(journal->record().generation, 1u);
+  source.reset();
+  EXPECT_FALSE(reset_persistence());
+
+  const auto failed_recovery = owned_display_configuration_t::test_recover(path, authority, nullptr, devices);
+  ASSERT_FALSE(failed_recovery);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  auto recovered = owned_display_configuration_t::test_recover(path, authority, api, devices);
+  ASSERT_TRUE(recovered);
+  source = std::move(*recovered);
+  EXPECT_EQ(source->status().generation, 1u);
+  EXPECT_EQ(source->journal()->record().generation, journal->record().generation);
+  EXPECT_FALSE(startup.release_for_ordinary());
+  source.reset();
+  EXPECT_FALSE(startup.release_for_ordinary());
+  EXPECT_FALSE(init(ordinary_path, config::video_t {}));
+  EXPECT_TRUE(std::filesystem::exists(path));
+  EXPECT_EQ(model->topology_writes, 0u);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_EQ(model->pings, 0u);
+}
 
 TEST_F(OwnedDisplayTest, CapturesRealPreAddTopologyAndPrimary) {
   ASSERT_TRUE(begin());

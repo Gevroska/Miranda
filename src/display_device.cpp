@@ -52,6 +52,18 @@ namespace display_device {
   namespace {
     constexpr std::chrono::milliseconds DEFAULT_RETRY_INTERVAL {5000};
 
+#ifdef _WIN32
+    std::atomic_bool startup_excluded {false};  ///< Copied gate, independent of native manager lifetime.
+    std::atomic_bool startup_legacy_tracked {false};  ///< Preserve default behavior until startup inspection participates.
+    std::atomic_bool startup_legacy_pending {false};  ///< Updated by the ordinary persistence authority after adoption.
+
+    void publish_ordinary_persistence(bool pending) {
+      if (startup_legacy_tracked.load()) {
+        startup_legacy_pending = pending;
+      }
+    }
+#endif
+
     /**
      * @brief Persistence wrapper that remembers whether a settings record is still stored.
      *
@@ -67,9 +79,14 @@ namespace display_device {
        */
       explicit watched_settings_persistence_t(std::shared_ptr<SettingsPersistenceInterface> inner):
           inner {std::move(inner)} {
-        if (const auto loaded {this->inner->load()}; loaded && !loaded->empty()) {
+        const auto loaded = this->inner->load();
+        pending_restores = loaded && !loaded->empty();
+#ifdef _WIN32
+        if (!loaded && startup_legacy_tracked.load()) {
           pending_restores = true;
         }
+        publish_ordinary_persistence(pending_restores.load());
+#endif
       }
 
       /**
@@ -81,6 +98,9 @@ namespace display_device {
         }
 
         pending_restores = !data.empty();
+#ifdef _WIN32
+        publish_ordinary_persistence(!data.empty());
+#endif
         return true;
       }
 
@@ -100,6 +120,9 @@ namespace display_device {
         }
 
         pending_restores = false;
+#ifdef _WIN32
+        publish_ordinary_persistence(false);
+#endif
         return true;
       }
 
@@ -126,6 +149,8 @@ namespace display_device {
       std::shared_ptr<watched_settings_persistence_t> persistence_watch {};  ///< Observes whether revert left settings stored.
 #ifdef _WIN32
       std::weak_ptr<int> owned_reservation;  ///< Excludes legacy mutation while a managed source is reserved.
+      std::shared_ptr<ordinary_startup_exclusion_t> startup_exclusion;  ///< Sticky across refused/failed reconstruction and coordinator destruction.
+      std::optional<std::filesystem::path> startup_ordinary_path;  ///< Bind ordinary initialization to the inspected persistence location.
 #endif
 #ifdef SUNSHINE_TESTS
       std::optional<std::chrono::milliseconds> test_retry_interval {};  ///< Override for the revert retry delay.
@@ -874,12 +899,44 @@ namespace display_device {
       },
                                     scheduler_option);
     }
+
+    /** @brief Construct the ordinary DD lifetime guard without initializing a settings manager. */
+    std::unique_ptr<platf::deinit_t> make_deinit_guard() {
+      class deinit_t: public platf::deinit_t {
+      public:
+        ~deinit_t() override {
+          std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+          if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+            DD_DATA.sm_instance.reset();
+            return;
+          }
+#endif
+          try {
+            // This may throw if used incorrectly. At the moment this will not happen, however
+            // in case some unforeseen changes are made that could raise an exception,
+            // we definitely don't want this to happen in destructor. Especially in the
+            // deinit_t where the outcome does not really matter.
+            revert_configuration_unlocked(revert_option_e::try_once);
+          } catch (std::exception &err) {
+            BOOST_LOG(fatal) << err.what();
+          }
+
+          DD_DATA.sm_instance = nullptr;
+        }
+      };
+
+      return std::make_unique<deinit_t>();
+    }
   }  // namespace
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
     std::lock_guard lock {DD_DATA.mutex};
 #ifdef _WIN32
-    if (!DD_DATA.owned_reservation.expired()) {
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      return nullptr;
+    }
+    if (DD_DATA.startup_ordinary_path && persistence_filepath != *DD_DATA.startup_ordinary_path) {
       return nullptr;
     }
 #endif
@@ -904,31 +961,7 @@ namespace display_device {
       revert_configuration_unlocked(revert_option_e::try_indefinitely);
     }
 
-    class deinit_t: public platf::deinit_t {
-    public:
-      ~deinit_t() override {
-        std::lock_guard lock {DD_DATA.mutex};
-#ifdef _WIN32
-        if (!DD_DATA.owned_reservation.expired()) {
-          DD_DATA.sm_instance.reset();
-          return;
-        }
-#endif
-        try {
-          // This may throw if used incorrectly. At the moment this will not happen, however
-          // in case some unforeseen changes are made that could raise an exception,
-          // we definitely don't want this to happen in destructor. Especially in the
-          // deinit_t where the outcome does not really matter.
-          revert_configuration_unlocked(revert_option_e::try_once);
-        } catch (std::exception &err) {
-          BOOST_LOG(fatal) << err.what();
-        }
-
-        DD_DATA.sm_instance = nullptr;
-      }
-    };
-
-    return std::make_unique<deinit_t>();
+    return make_deinit_guard();
   }
 
   bool wake_display(const std::string &display_name, std::chrono::milliseconds timeout) {
@@ -990,8 +1023,8 @@ namespace display_device {
   void configure_display(const SingleDisplayConfiguration &config) {
     std::lock_guard lock {DD_DATA.mutex};
 #ifdef _WIN32
-    if (!DD_DATA.owned_reservation.expired()) {
-      BOOST_LOG(warning) << "Ignoring unmanaged display configuration while an owned source is reserved.";
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      BOOST_LOG(warning) << "Ignoring unmanaged display configuration while display recovery excludes ordinary mutation.";
       return;
     }
 #endif
@@ -1027,7 +1060,7 @@ namespace display_device {
   void revert_configuration() {
     std::lock_guard lock {DD_DATA.mutex};
 #ifdef _WIN32
-    if (!DD_DATA.owned_reservation.expired()) {
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
       return;
     }
 #endif
@@ -1037,7 +1070,7 @@ namespace display_device {
   bool reset_persistence() {
     std::lock_guard lock {DD_DATA.mutex};
 #ifdef _WIN32
-    if (!DD_DATA.owned_reservation.expired()) {
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
       return false;
     }
 #endif
@@ -1110,6 +1143,39 @@ namespace display_device {
   }
 
 #ifdef _WIN32
+  ordinary_startup_recovery_t ordinary_startup_recovery() {
+    return {startup_excluded.load(), startup_legacy_pending.load()};
+  }
+
+  std::shared_ptr<ordinary_startup_exclusion_t> ordinary_startup_exclusion_t::acquire() {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (DD_DATA.startup_exclusion) {
+      return nullptr;
+    }
+    auto exclusion = std::shared_ptr<ordinary_startup_exclusion_t> {new ordinary_startup_exclusion_t};
+    DD_DATA.startup_exclusion = exclusion;
+    startup_excluded = true;
+    if (DD_DATA.sm_instance) {
+      // Fence callbacks already scheduled before the gate. No further ordinary work can enter.
+      DD_DATA.sm_instance->stop();
+    }
+    return exclusion;
+  }
+
+  bool ordinary_startup_exclusion_t::release_to_ordinary(bool legacy_pending, const std::filesystem::path &ordinary_path) {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (DD_DATA.startup_exclusion.get() != this || !DD_DATA.owned_reservation.expired() || DD_DATA.sm_instance) {
+      return false;
+    }
+    // Publish the copied obligation before exposing any ordinary/native admission path.
+    DD_DATA.startup_ordinary_path = ordinary_path;
+    startup_legacy_tracked = true;
+    startup_legacy_pending = legacy_pending;
+    DD_DATA.startup_exclusion.reset();
+    startup_excluded = false;
+    return true;
+  }
+
   struct native_display_configuration_t::state_t {
     struct recovery_t {
       explicit recovery_t(bool pending):
@@ -1150,7 +1216,7 @@ namespace display_device {
       return restore(generation, delay);
     }
     std::lock_guard command {DD_DATA.mutex};
-    if (!DD_DATA.owned_reservation.expired()) {
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
       return false;
     }
     if (!configuration || !DD_DATA.sm_instance) {
@@ -1184,7 +1250,7 @@ namespace display_device {
       return false;
     }
     std::lock_guard command {DD_DATA.mutex};
-    if (!DD_DATA.owned_reservation.expired()) {
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
       return false;
     }
     if (!DD_DATA.sm_instance) {
@@ -1638,7 +1704,9 @@ namespace display_device {
         DD_DATA.sm_instance->stop();
       }
       if (DD_DATA.persistence_watch && DD_DATA.persistence_watch->has_pending_restores()) {
-        revert_configuration_unlocked(revert_option_e::try_indefinitely);
+        if (!DD_DATA.startup_exclusion) {
+          revert_configuration_unlocked(revert_option_e::try_indefinitely);
+        }
         return fail(errc_t::busy);
       }
       state->reservation = std::make_shared<int>(0);
@@ -2172,6 +2240,10 @@ namespace display_device {
     DD_DATA.sm_instance = std::make_unique<RetryScheduler<SettingsManagerInterface>>(std::move(manager));
   }
 
+  std::unique_ptr<platf::deinit_t> test_make_deinit_guard() {
+    return make_deinit_guard();
+  }
+
   void test_set_retry_interval(const std::chrono::milliseconds interval) {
     std::lock_guard lock {DD_DATA.mutex};
     DD_DATA.test_retry_interval = interval;
@@ -2190,6 +2262,13 @@ namespace display_device {
     DD_DATA.sm_instance.reset();
     DD_DATA.persistence_watch.reset();
     DD_DATA.test_retry_interval.reset();
+  #ifdef _WIN32
+    DD_DATA.startup_exclusion.reset();
+    DD_DATA.startup_ordinary_path.reset();
+    startup_excluded = false;
+    startup_legacy_tracked = false;
+    startup_legacy_pending = false;
+  #endif
   }
 #endif
 }  // namespace display_device

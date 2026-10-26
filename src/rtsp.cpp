@@ -1498,6 +1498,11 @@ namespace rtsp_stream {
     /** @brief Shutdown drains source completion events and capture releases before stopping its executor. */
     void finish_stop() {
       if (!stopping || source || preflight || process_work || !process_jobs.empty() || recovery_work || !shutdown_completion) {
+#ifdef SUNSHINE_TESTS
+        if (stopping && !source && !preflight && process_work) {
+          notify_owner("stop_process_work_pending");
+        }
+#endif
         return;
       }
       {

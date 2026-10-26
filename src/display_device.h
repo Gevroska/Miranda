@@ -24,7 +24,11 @@
 // forward declarations
 namespace platf {
   class deinit_t;
-}
+
+  namespace source_startup {
+    class coordinator_t;
+  }
+}  // namespace platf
 
 namespace config {
   struct video_t;
@@ -193,6 +197,33 @@ namespace display_device {
   class SettingsManagerInterface;
   class AudioContextInterface;
 
+  /** @brief Copied startup obligations; reading this view never enters the ordinary scheduler. */
+  struct ordinary_startup_recovery_t {
+    bool mutation_excluded {};  ///< Startup inspection or unresolved owned recovery excludes ordinary mutation.
+    bool recovery_pending {};  ///< Checked legacy state still belongs to the ordinary persistence/scheduler.
+  };
+
+  /** @brief Copy startup exclusion and legacy recovery without storage, scheduler or native access. */
+  ordinary_startup_recovery_t ordinary_startup_recovery();
+
+  /**
+   * @brief Sticky ordinary-mutation capability controlled only by the startup coordinator.
+   * @details DD_DATA retains this capability on refusal and destruction. Only a fresh checked-safe
+   * coordinator transition releases it; it is independent of B's owned reservation and receipts.
+   */
+  class ordinary_startup_exclusion_t {
+  public:
+    ~ordinary_startup_exclusion_t() = default;
+    ordinary_startup_exclusion_t(const ordinary_startup_exclusion_t &) = delete;
+    ordinary_startup_exclusion_t &operator=(const ordinary_startup_exclusion_t &) = delete;
+
+  private:
+    friend class platf::source_startup::coordinator_t;
+    ordinary_startup_exclusion_t() = default;
+    static std::shared_ptr<ordinary_startup_exclusion_t> acquire();
+    bool release_to_ordinary(bool legacy_pending, const std::filesystem::path &ordinary_path);
+  };
+
   /** @brief Copied progress for the ordinary native scheduler; no journal or virtual removal authority. */
   struct native_display_status_t {
     std::uint64_t generation {};  ///< Reject stale source operations and callback publication.
@@ -351,6 +382,9 @@ namespace display_device {
    * @param persistence Persistence object returned by `test_make_watched_persistence()`.
    */
   void test_install_settings_manager(std::unique_ptr<SettingsManagerInterface> manager, const std::shared_ptr<SettingsPersistenceInterface> &persistence);
+
+  /** @brief Construct the actual ordinary DD lifetime guard around an installed fake manager, without native initialization. */
+  [[nodiscard]] std::unique_ptr<platf::deinit_t> test_make_deinit_guard();
 
   /**
    * @brief Override how long the revert loop waits between device checks.

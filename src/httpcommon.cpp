@@ -564,9 +564,15 @@ namespace http {
       return CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     }
 
-    /** @brief Describe a rejected committed snapshot without exposing file identity, contents or descriptors. */
-    void state_log_commit_mismatch(const state_snapshot_t &expected, const state_snapshot_t &current, state_creation_time_e creation_time) {
-      BOOST_LOG(error) << "State committed comparison: identity="sv << state_same_id(expected.identity, current.identity)
+    /**
+     * @brief Describe a rejected snapshot without exposing file identity, contents or descriptors.
+     * @param phase Fixed comparison boundary label, never user data.
+     * @param expected Immutable snapshot required by the comparison.
+     * @param current Snapshot already captured for the refused comparison.
+     * @param creation_time Existing creation-time comparison policy.
+     */
+    void state_log_snapshot_mismatch(const char *phase, const state_snapshot_t &expected, const state_snapshot_t &current, state_creation_time_e creation_time) {
+      BOOST_LOG(error) << "State "sv << phase << " comparison: identity="sv << state_same_id(expected.identity, current.identity)
                        << "; volume="sv << (expected.identity.dwVolumeSerialNumber == current.identity.dwVolumeSerialNumber)
                        << "; file_id="sv << (expected.identity.nFileIndexHigh == current.identity.nFileIndexHigh && expected.identity.nFileIndexLow == current.identity.nFileIndexLow)
                        << "; bytes="sv << (expected.bytes == current.bytes)
@@ -574,12 +580,12 @@ namespace http {
                        << "; creation_time_required="sv << (creation_time != state_creation_time_e::initial_commit)
                        << "; creation_expected/current="sv << expected.basic.CreationTime.QuadPart << '/' << current.basic.CreationTime.QuadPart
                        << "; attributes_expected/current="sv << expected.basic.FileAttributes << '/' << current.basic.FileAttributes;
-      const auto describe_policy = [](const char *component, auto left, auto right, bool matches) {
+      const auto describe_policy = [phase](const char *component, auto left, auto right, bool matches) {
         SECURITY_DESCRIPTOR_CONTROL left_control {}, right_control {};
         DWORD left_revision = 0, right_revision = 0;
         const bool left_read = !left.empty() && GetSecurityDescriptorControl(left.data(), &left_control, &left_revision);
         const bool right_read = !right.empty() && GetSecurityDescriptorControl(right.data(), &right_control, &right_revision);
-        BOOST_LOG(error) << "State committed "sv << component << " comparison: matches="sv << matches
+        BOOST_LOG(error) << "State "sv << phase << ' ' << component << " comparison: matches="sv << matches
                          << "; controls_read="sv << left_read << '/' << right_read
                          << "; control_expected/current="sv << left_control << '/' << right_control
                          << "; revision_expected/current="sv << left_revision << '/' << right_revision;
@@ -612,7 +618,7 @@ namespace http {
         const auto current = state_capture(handle.value, path, inspection);
         const bool matches = state_same(expected, current, creation_time);
         if (!matches && diagnose_commit) {
-          state_log_commit_mismatch(expected, current, creation_time);
+          state_log_snapshot_mismatch("committed", expected, current, creation_time);
         }
         return matches;
       } catch (const state_file_error_t &failure) {
@@ -839,7 +845,12 @@ namespace http {
                 return state_path_matches(backup, *original);
               }) ||
               !state_recovery_guard("guarded_original_snapshot", [&]() {
-                return state_same(*original, state_capture(original_handle.value, backup));
+                const auto current = state_capture(original_handle.value, backup);
+                const bool matches = state_same(*original, current);
+                if (!matches) {
+                  state_log_snapshot_mismatch("recovery guarded original", *original, current, state_creation_time_e::exact);
+                }
+                return matches;
               }) ||
               !state_recovery_guard("restore_stage", [&]() {
                 return state_stage(state_stage_e::restore, destination, temporary, backup);

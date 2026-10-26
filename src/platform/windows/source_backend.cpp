@@ -126,6 +126,10 @@ namespace platf::source_backend {
           dependencies_ {std::move(dependencies)} {}
 
       bool admits(const display_policy::source_request_t &request) const override {
+        const auto startup = display_device::ordinary_startup_recovery();
+        if (startup.mutation_excluded || (request.virtual_display && startup.recovery_pending)) {
+          return false;
+        }
         const auto current = status();
         std::lock_guard lock {publication_mutex_};
         if (current.generation && !current.source_released) {
