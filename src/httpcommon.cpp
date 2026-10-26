@@ -509,6 +509,273 @@ namespace http {
       return CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     }
 
+  #ifdef SUNSHINE_TESTS
+    /**
+     * @brief Decompose one refused authority comparison using bounded, non-identifying fields only.
+     * @param view Fixed observation label.
+     * @param reference Fixed reference label.
+     * @param expected Immutable original or already captured authority.
+     * @param current Authority under diagnostic inspection.
+     */
+    void state_probe_security_difference(const char *view, const char *reference, const std::vector<std::uint8_t> &expected, const std::vector<std::uint8_t> &current) {
+      struct fields_t {
+        bool bounds = false, valid = false, control_read = false;  ///< Descriptor decoding gates.
+        SECURITY_DESCRIPTOR_CONTROL control {};  ///< Decoded controls, reported only as equality.
+        DWORD revision = 0;  ///< Decoded descriptor revision, reported only as equality.
+        PSID owner = nullptr, group = nullptr;  ///< Borrowed, bounded descriptor components.
+        BOOL owner_defaulted = FALSE, group_defaulted = FALSE;  ///< Decoded SID defaults.
+        bool owner_read = false, group_read = false;  ///< Independent SID getter results.
+        PACL acl = nullptr;  ///< Borrowed, bounded DACL.
+        BOOL present = FALSE, defaulted = FALSE;  ///< Decoded DACL state.
+        bool acl_read = false, acl_valid = false;  ///< DACL decoding gates.
+      };
+
+      const auto fields = [](const auto &bytes) {
+        fields_t result;
+        if (bytes.size() < sizeof(SECURITY_DESCRIPTOR_RELATIVE)) {
+          return result;
+        }
+        SECURITY_DESCRIPTOR_RELATIVE header {};
+        std::memcpy(&header, bytes.data(), sizeof(header));
+        const auto sid_bounds = [&](DWORD offset) {
+          if (!offset) {
+            return true;
+          }
+          constexpr auto prefix = offsetof(SID, SubAuthority);
+          return offset >= sizeof(header) && offset % alignof(DWORD) == 0 && offset <= bytes.size() && bytes.size() - offset >= prefix &&
+                 bytes[offset + offsetof(SID, SubAuthorityCount)] <= SID_MAX_SUB_AUTHORITIES &&
+                 bytes[offset + offsetof(SID, SubAuthorityCount)] * sizeof(DWORD) <= bytes.size() - offset - prefix;
+        };
+        const auto acl_bounds = [&](DWORD offset) {
+          if (!offset) {
+            return true;
+          }
+          if (offset < sizeof(header) || offset % alignof(DWORD) != 0 || offset > bytes.size() || bytes.size() - offset < sizeof(ACL)) {
+            return false;
+          }
+          ACL acl {};
+          std::memcpy(&acl, bytes.data() + offset, sizeof(acl));
+          return acl.AclSize >= sizeof(ACL) && acl.AclSize <= bytes.size() - offset;
+        };
+        result.bounds = (header.Control & SE_SELF_RELATIVE) && sid_bounds(header.Owner) && sid_bounds(header.Group) && acl_bounds(header.Dacl) && acl_bounds(header.Sacl);
+        auto *descriptor = const_cast<std::uint8_t *>(bytes.data());
+        result.valid = result.bounds && IsValidSecurityDescriptor(descriptor) && GetSecurityDescriptorLength(descriptor) <= bytes.size();
+        if (result.valid) {
+          result.control_read = GetSecurityDescriptorControl(descriptor, &result.control, &result.revision);
+          result.owner_read = GetSecurityDescriptorOwner(descriptor, &result.owner, &result.owner_defaulted);
+          result.group_read = GetSecurityDescriptorGroup(descriptor, &result.group, &result.group_defaulted);
+          result.acl_read = GetSecurityDescriptorDacl(descriptor, &result.present, &result.acl, &result.defaulted);
+          result.acl_valid = result.acl_read && result.acl && IsValidAcl(result.acl);
+        }
+        return result;
+      };
+      const auto left = fields(expected), right = fields(current);
+      BOOST_LOG(error) << "State test retained authority fields: view="sv << view << "; reference="sv << reference
+                       << "; descriptor_bounds="sv << left.bounds << '/' << right.bounds
+                       << "; descriptor_valid="sv << left.valid << '/' << right.valid
+                       << "; controls_read="sv << left.control_read << '/' << right.control_read
+                       << "; control_equal="sv << (left.control_read && right.control_read && left.control == right.control)
+                       << "; revision_equal="sv << (left.control_read && right.control_read && left.revision == right.revision);
+      const auto describe_sid = [&](const char *component, PSID first, PSID second, bool first_read, bool second_read, BOOL first_defaulted, BOOL second_defaulted) {
+        const bool first_valid = first_read && first && IsValidSid(first);
+        const bool second_valid = second_read && second && IsValidSid(second);
+        BOOST_LOG(error) << "State test retained authority SID fields: view="sv << view << "; reference="sv << reference << "; component="sv << component
+                         << "; read="sv << first_read << '/' << second_read
+                         << "; null="sv << (first == nullptr) << '/' << (second == nullptr)
+                         << "; defaulted="sv << (first_defaulted != FALSE) << '/' << (second_defaulted != FALSE)
+                         << "; valid="sv << first_valid << '/' << second_valid
+                         << "; equal="sv << (first_read && second_read && ((!first && !second) || (first_valid && second_valid && EqualSid(first, second))));
+      };
+      describe_sid("owner", left.owner, right.owner, left.owner_read, right.owner_read, left.owner_defaulted, right.owner_defaulted);
+      describe_sid("group", left.group, right.group, left.group_read, right.group_read, left.group_defaulted, right.group_defaulted);
+      BOOST_LOG(error) << "State test retained authority DACL fields: view="sv << view << "; reference="sv << reference
+                       << "; read="sv << left.acl_read << '/' << right.acl_read
+                       << "; present="sv << (left.present != FALSE) << '/' << (right.present != FALSE)
+                       << "; null="sv << (left.acl == nullptr) << '/' << (right.acl == nullptr)
+                       << "; defaulted="sv << (left.defaulted != FALSE) << '/' << (right.defaulted != FALSE)
+                       << "; valid="sv << left.acl_valid << '/' << right.acl_valid
+                       << "; revision_equal="sv << (left.acl_valid && right.acl_valid && left.acl->AclRevision == right.acl->AclRevision)
+                       << "; count_equal="sv << (left.acl_valid && right.acl_valid && left.acl->AceCount == right.acl->AceCount);
+      if (!left.acl_valid || !right.acl_valid) {
+        return;
+      }
+      constexpr DWORD ace_limit = 32;
+      std::size_t left_offset = sizeof(ACL), right_offset = sizeof(ACL);
+      DWORD scanned = 0;
+      bool difference = false;
+      for (DWORD index = 0; index < ace_limit && (index < left.acl->AceCount || index < right.acl->AceCount); ++index) {
+        void *left_ace = nullptr, *right_ace = nullptr;
+        const bool left_read = index < left.acl->AceCount && GetAce(left.acl, index, &left_ace);
+        const bool right_read = index < right.acl->AceCount && GetAce(right.acl, index, &right_ace);
+        const auto ace_bounds = [](PACL acl, std::size_t offset, void *ace, bool read, ACE_HEADER &header) {
+          if (!read || offset > acl->AclSize || acl->AclSize - offset < sizeof(header) || ace != reinterpret_cast<const std::uint8_t *>(acl) + offset) {
+            return false;
+          }
+          std::memcpy(&header, ace, sizeof(header));
+          return header.AceSize >= sizeof(header) && header.AceSize <= acl->AclSize - offset;
+        };
+        ACE_HEADER left_header {}, right_header {};
+        const bool left_bounds = ace_bounds(left.acl, left_offset, left_ace, left_read, left_header);
+        const bool right_bounds = ace_bounds(right.acl, right_offset, right_ace, right_read, right_header);
+        const bool sizes_equal = left_bounds && right_bounds && left_header.AceSize == right_header.AceSize;
+        const bool bytes_equal = sizes_equal && std::memcmp(left_ace, right_ace, left_header.AceSize) == 0;
+        ++scanned;
+        if (!bytes_equal) {
+          difference = true;
+          const auto standard_layout = [](const ACE_HEADER &header, bool bounds) {
+            return bounds && (header.AceType == ACCESS_ALLOWED_ACE_TYPE || header.AceType == ACCESS_DENIED_ACE_TYPE) && header.AceSize >= offsetof(ACCESS_ALLOWED_ACE, SidStart) + offsetof(SID, SubAuthority);
+          };
+          const bool layout_supported = standard_layout(left_header, left_bounds) && standard_layout(right_header, right_bounds) && left_header.AceType == right_header.AceType;
+          bool mask_equal = false, sid_bounds = false, sid_valid = false, sid_equal = false;
+          if (layout_supported) {
+            DWORD left_mask = 0, right_mask = 0;
+            std::memcpy(&left_mask, static_cast<const std::uint8_t *>(left_ace) + offsetof(ACCESS_ALLOWED_ACE, Mask), sizeof(left_mask));
+            std::memcpy(&right_mask, static_cast<const std::uint8_t *>(right_ace) + offsetof(ACCESS_ALLOWED_ACE, Mask), sizeof(right_mask));
+            mask_equal = left_mask == right_mask;
+            const auto bounded_sid = [](void *ace, const ACE_HEADER &header) {
+              const auto *sid = static_cast<const std::uint8_t *>(ace) + offsetof(ACCESS_ALLOWED_ACE, SidStart);
+              const auto remaining = header.AceSize - offsetof(ACCESS_ALLOWED_ACE, SidStart) - offsetof(SID, SubAuthority);
+              return sid[offsetof(SID, SubAuthorityCount)] <= SID_MAX_SUB_AUTHORITIES && sid[offsetof(SID, SubAuthorityCount)] * sizeof(DWORD) <= remaining;
+            };
+            sid_bounds = bounded_sid(left_ace, left_header) && bounded_sid(right_ace, right_header);
+            if (sid_bounds) {
+              auto *first = static_cast<std::uint8_t *>(left_ace) + offsetof(ACCESS_ALLOWED_ACE, SidStart);
+              auto *second = static_cast<std::uint8_t *>(right_ace) + offsetof(ACCESS_ALLOWED_ACE, SidStart);
+              sid_valid = IsValidSid(first) && IsValidSid(second);
+              sid_equal = sid_valid && EqualSid(first, second);
+            }
+          }
+          BOOST_LOG(error) << "State test retained authority first ACE difference: view="sv << view << "; reference="sv << reference
+                           << "; index="sv << index << "; read="sv << left_read << '/' << right_read
+                           << "; bounds="sv << left_bounds << '/' << right_bounds
+                           << "; size_equal="sv << sizes_equal
+                           << "; type_equal="sv << (left_bounds && right_bounds && left_header.AceType == right_header.AceType)
+                           << "; flags_equal="sv << (left_bounds && right_bounds && left_header.AceFlags == right_header.AceFlags)
+                           << "; bytes_equal="sv << bytes_equal << "; layout_supported="sv << layout_supported
+                           << "; mask_equal="sv << mask_equal << "; sid_bounds="sv << sid_bounds
+                           << "; sid_valid="sv << sid_valid << "; sid_equal="sv << sid_equal;
+          break;
+        }
+        left_offset += left_header.AceSize;
+        right_offset += right_header.AceSize;
+      }
+      BOOST_LOG(error) << "State test retained authority ACE walk: view="sv << view << "; reference="sv << reference
+                       << "; inspected="sv << scanned << "; difference_found="sv << difference
+                       << "; truncated="sv << (!difference && (left.acl->AceCount > ace_limit || right.acl->AceCount > ace_limit));
+    }
+
+    /**
+     * @brief Observe a latched retained-authority failure without authorizing recovery or changing its outcome.
+     * @param retained Borrowed original guard; never closed or replaced by this diagnostic.
+     * @param backup Existing backup pathname used only for one matching read/delete open.
+     * @param original Immutable transaction authority and identity.
+     * @param captured Snapshot already captured by the failed recovery comparison.
+     * @note Native read/open calls may block. This test-only probe has no timers, retries, hooks or payload reads.
+     */
+    void state_probe_retained_authority(HANDLE retained, const fs::path &backup, const state_snapshot_t &original, const state_snapshot_t &captured) noexcept {
+      const auto saved_error = GetLastError();
+      HANDLE reopened = INVALID_HANDLE_VALUE, backup_handle = INVALID_HANDLE_VALUE;
+      const auto checked_close = [](HANDLE &handle, const char *view) noexcept {
+        if (handle == INVALID_HANDLE_VALUE) {
+          return;
+        }
+        const auto owned = std::exchange(handle, INVALID_HANDLE_VALUE);
+        const bool closed = CloseHandle(owned);
+        const auto native_error = closed ? ERROR_SUCCESS : GetLastError();
+        try {
+          BOOST_LOG(error) << "State test retained authority close: view="sv << view << "; success="sv << closed << "; native_error="sv << native_error;
+        } catch (...) {
+        }
+      };
+      try {
+        state_probe_security_difference("captured_retained", "original", original.security, captured.security);
+        reopened = ReOpenFile(retained, GENERIC_READ | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_FLAG_OPEN_REPARSE_POINT);
+        const auto reopen_error = reopened == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        backup_handle = state_open(backup, GENERIC_READ | DELETE);
+        const auto backup_error = backup_handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        BOOST_LOG(error) << "State test retained authority open: view=reopened; success="sv << (reopened != INVALID_HANDLE_VALUE) << "; native_error="sv << reopen_error;
+        BOOST_LOG(error) << "State test retained authority open: view=backup; success="sv << (backup_handle != INVALID_HANDLE_VALUE) << "; native_error="sv << backup_error;
+        if (reopened != INVALID_HANDLE_VALUE && backup_handle != INVALID_HANDLE_VALUE) {
+          struct identity_t {
+            bool read = false, ordinary = false, same = false;  ///< Independent identity/ordinary-file checks.
+            DWORD error = ERROR_SUCCESS;  ///< Immediate failed identity-query error only.
+          };
+
+          const auto identity = [&](HANDLE handle) {
+            identity_t result;
+            BY_HANDLE_FILE_INFORMATION value {};
+            result.read = GetFileInformationByHandle(handle, &value);
+            result.error = result.read ? ERROR_SUCCESS : GetLastError();
+            result.ordinary = result.read && !(value.dwFileAttributes & ~state_attributes);
+            result.same = result.read && state_same_id(original.identity, value);
+            return result;
+          };
+          const auto describe_identity = [](const char *phase, const char *view, const identity_t &value) {
+            BOOST_LOG(error) << "State test retained authority identity: phase="sv << phase << "; view="sv << view
+                             << "; read="sv << value.read << "; ordinary="sv << value.ordinary << "; original_equal="sv << value.same << "; native_error="sv << value.error;
+          };
+          const auto reopened_before = identity(reopened), backup_before = identity(backup_handle);
+          describe_identity("before", "reopened", reopened_before);
+          describe_identity("before", "backup", backup_before);
+          if (reopened_before.ordinary && reopened_before.same && backup_before.ordinary && backup_before.same) {
+            struct query_t {
+              PSECURITY_DESCRIPTOR descriptor = nullptr;  ///< Solely owned API result, always released locally.
+              DWORD error = ERROR_SUCCESS;  ///< Direct GetSecurityInfo return value.
+
+              ~query_t() {
+                if (descriptor) {
+                  LocalFree(descriptor);
+                }
+              }
+            };
+
+            std::array<query_t, 4> queries;
+            const std::array<HANDLE, 4> handles {reopened, backup_handle, retained, backup_handle};
+            constexpr std::array<const char *, 4> views {"reopened", "backup_first", "retained_second", "backup_second"};
+            for (std::size_t index = 0; index < queries.size(); ++index) {
+              queries[index].error = GetSecurityInfo(handles[index], SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr, nullptr, &queries[index].descriptor);
+            }
+            const auto reopened_after = identity(reopened), backup_after = identity(backup_handle);
+            describe_identity("after", "reopened", reopened_after);
+            describe_identity("after", "backup", backup_after);
+            const bool stable_identity = reopened_after.ordinary && reopened_after.same && backup_after.ordinary && backup_after.same;
+            std::array<std::vector<std::uint8_t>, 4> snapshots;
+            for (std::size_t index = 0; index < queries.size(); ++index) {
+              auto &query = queries[index];
+              const bool valid = query.error == ERROR_SUCCESS && query.descriptor && IsValidSecurityDescriptor(query.descriptor);
+              if (valid) {
+                const auto *bytes = static_cast<const std::uint8_t *>(query.descriptor);
+                snapshots[index].assign(bytes, bytes + GetSecurityDescriptorLength(query.descriptor));
+              }
+              const bool original_equal = valid && stable_identity && same_file_security(original.security, snapshots[index]);
+              const bool captured_equal = valid && stable_identity && same_file_security(captured.security, snapshots[index]);
+              BOOST_LOG(error) << "State test retained authority query: view="sv << views[index] << "; native_error="sv << query.error
+                               << "; descriptor_valid="sv << valid << "; stable_identity="sv << stable_identity
+                               << "; original_equal="sv << original_equal << "; captured_equal="sv << captured_equal;
+              if (valid && stable_identity && !original_equal) {
+                state_probe_security_difference(views[index], "original", original.security, snapshots[index]);
+              }
+              if (valid && stable_identity && !captured_equal) {
+                state_probe_security_difference(views[index], "captured_retained", captured.security, snapshots[index]);
+              }
+            }
+            BOOST_LOG(error) << "State test retained authority backup observations: stable_identity="sv << stable_identity
+                             << "; comparable="sv << (stable_identity && !snapshots[1].empty() && !snapshots[3].empty())
+                             << "; equal="sv << (stable_identity && !snapshots[1].empty() && !snapshots[3].empty() && same_file_security(snapshots[1], snapshots[3]));
+          }
+        }
+      } catch (...) {
+        try {
+          BOOST_LOG(error) << "State test retained authority diagnostic failed; the refused recovery result remains latched"sv;
+        } catch (...) {
+        }
+      }
+      checked_close(backup_handle, "backup");
+      checked_close(reopened, "reopened");
+      SetLastError(saved_error);
+    }
+  #endif
+
     /**
      * @brief Describe a rejected snapshot without exposing file identity, contents or descriptors.
      * @param phase Fixed comparison boundary label, never user data.
@@ -791,6 +1058,9 @@ namespace http {
                 const bool matches = state_same(*original, current);
                 if (!matches) {
                   state_log_snapshot_mismatch("recovery guarded original", *original, current, state_creation_time_e::exact);
+  #ifdef SUNSHINE_TESTS
+                  state_probe_retained_authority(original_handle.value, backup, *original, current);
+  #endif
                 }
                 return matches;
               }) ||
