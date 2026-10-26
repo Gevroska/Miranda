@@ -13,6 +13,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <sstream>
@@ -24,6 +25,7 @@
 #include <src/app_catalog.h>
 #include <src/config.h>
 #include <src/crypto.h>
+#include <src/httpcommon.h>
 #include <src/nvhttp.h>
 #include <src/process.h>
 #include <src/rtsp.h>
@@ -268,6 +270,22 @@ namespace {
      * @brief Cancel connections and callbacks before removing credentials and restoring client state.
      */
     void TearDown() override {
+      stop_server();
+      nvhttp::test_support::reset_client_state();
+      config::nvhttp.file_state = original_state_file;
+      config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
+      std::error_code cleanup_error;
+      std::filesystem::remove(state_file, cleanup_error);
+      std::filesystem::remove(certificate_file, cleanup_error);
+      std::filesystem::remove(private_key_file, cleanup_error);
+      BaseTest::TearDown();
+    }
+
+    /** @brief Quiesce callbacks before restoring any fixture-owned catalog or process state. */
+    void stop_server() {
+      if (server_cleanup_complete) {
+        return;
+      }
       for (const auto &client : clients) {
         boost::system::error_code close_error;
         client->socket.lowest_layer().close(close_error);
@@ -279,6 +297,9 @@ namespace {
           server_io->stop();
         }
         if (server_thread.joinable()) {
+          if (before_server_join) {
+            before_server_join();
+          }
           server_thread.join();
         }
         handler_scope->stop();
@@ -291,14 +312,66 @@ namespace {
       }
       clients.clear();
       rtsp_stream::stop_application({});
-      nvhttp::test_support::reset_client_state();
-      config::nvhttp.file_state = original_state_file;
-      config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
-      std::error_code cleanup_error;
-      std::filesystem::remove(state_file, cleanup_error);
-      std::filesystem::remove(certificate_file, cleanup_error);
-      std::filesystem::remove(private_key_file, cleanup_error);
-      BaseTest::TearDown();
+      if (observing_catalog) {
+        http::test_support::set_state_security_hook({});
+        http::test_support::set_state_update_hook({});
+        observing_catalog = false;
+      }
+      if (restore_isolated_catalog) {
+        auto restore = std::move(restore_isolated_catalog);
+        restore_isolated_catalog = {};
+        restore();
+      }
+      server_cleanup_complete = true;
+    }
+
+    /** @brief Own a valid empty catalog and process context until the server has quiesced. */
+    void isolate_catalog() {
+      const auto original_apps_file = config::stream.file_apps;
+      const auto apps_file = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "https_zero_grant_apps.json";
+      auto original_proc = std::make_shared<proc::proc_t>(std::move(proc::proc));
+      restore_isolated_catalog = [original_proc = std::move(original_proc), original_apps_file, apps_file]() {
+        proc::proc = std::move(*original_proc);
+        config::stream.file_apps = original_apps_file;
+        std::error_code error;
+        std::filesystem::remove(apps_file, error);
+      };
+      proc::proc = proc::proc_t {};
+      config::stream.file_apps = apps_file.string();
+      std::ofstream {apps_file} << R"({"env":{},"apps":[]})";
+    }
+
+    /** @brief Observe catalog progress without changing transaction inputs or waiting inside a callback. */
+    void observe_catalog_completion() {
+      applist_entered = false;
+      applist_returned = false;
+      catalog_stages = 0;
+      catalog_failure_reported = false;
+      observing_catalog = true;
+      http::test_support::set_state_security_hook([this](auto stage, const auto &) {
+        catalog_stages.fetch_or(stage == http::test_support::state_security_stage_e::restore ? 1U : 2U);
+      });
+      http::test_support::set_state_update_hook([this]() {
+        catalog_stages.fetch_or(4U);
+      });
+    }
+
+    /** @brief Return finite, credential-free stage markers only for the first observed failure. */
+    std::string catalog_failure_markers() {
+      if (!observing_catalog || catalog_failure_reported) {
+        return {};
+      }
+      catalog_failure_reported = true;
+      const auto stages = catalog_stages.load();
+      std::ostringstream markers;
+      markers << " [catalog completion: loop_returned=" << server_loop_returned.load()
+              << " io_stopped=" << server->io_service->stopped()
+              << " applist_entered=" << applist_entered.load()
+              << " applist_returned=" << applist_returned.load()
+              << " security_restore_entered=" << ((stages & 1U) != 0)
+              << " security_verify_entered=" << ((stages & 2U) != 0)
+              << " pre_write_entered=" << ((stages & 4U) != 0) << ']';
+      return markers.str();
     }
 
     /**
@@ -336,6 +409,14 @@ namespace {
       });
       if (gamestream) {
         nvhttp::test_support::set_gamestream_routes(*server, host_audio);
+        auto &applist = server->resource["^/applist$"]["GET"];
+        applist = [this, handler = std::move(applist)](auto response, auto request) {
+          applist_entered = true;
+          auto returned = util::fail_guard([this]() {
+            applist_returned = true;
+          });
+          handler(std::move(response), std::move(request));
+        };
       }
       server->start([this](unsigned short assigned_port) {
         port = assigned_port;
@@ -344,6 +425,7 @@ namespace {
       ASSERT_NE(port, 0);
       server_thread = std::jthread([this]() {
         server->io_service->run();
+        server_loop_returned = true;
       });
     }
 
@@ -389,9 +471,10 @@ namespace {
       });
       EXPECT_TRUE(run_until([&]() {
         return completion->done && ((credentials || !server->verify) ? verified_handshakes == expected_handshakes : error_callbacks > initial_errors);
-      }));
+      }))
+        << catalog_failure_markers();
       if (credentials) {
-        EXPECT_FALSE(completion->error) << completion->error.message();
+        EXPECT_FALSE(completion->error) << completion->error.message() << catalog_failure_markers();
       }
       return client;
     }
@@ -414,8 +497,9 @@ namespace {
       });
       ASSERT_TRUE(run_until([&]() {
         return completion->done;
-      }));
-      ASSERT_FALSE(completion->error) << completion->error.message();
+      }))
+        << catalog_failure_markers();
+      ASSERT_FALSE(completion->error) << completion->error.message() << catalog_failure_markers();
     }
 
     /**
@@ -433,13 +517,13 @@ namespace {
             return completion->done;
           }) ||
           completion->error) {
-        ADD_FAILURE() << "HTTP header read failed: " << completion->error.message();
+        ADD_FAILURE() << "HTTP header read failed: " << completion->error.message() << catalog_failure_markers();
         return {};
       }
       std::istream response {&client.incoming};
       std::string line;
       std::getline(response, line);
-      EXPECT_EQ(line, "HTTP/1.1 200 OK\r");
+      EXPECT_EQ(line, "HTTP/1.1 200 OK\r") << catalog_failure_markers();
       std::size_t content_length = 0;
       bool has_content_length = false;
       while (std::getline(response, line) && line != "\r") {
@@ -448,7 +532,7 @@ namespace {
           has_content_length = true;
         }
       }
-      EXPECT_TRUE(has_content_length);
+      EXPECT_TRUE(has_content_length) << catalog_failure_markers();
       if (client.incoming.size() < content_length) {
         completion = std::make_shared<completion_t>();
         boost::asio::async_read(client.socket, client.incoming, boost::asio::transfer_exactly(content_length - client.incoming.size()), [completion](const auto &error, std::size_t) {
@@ -459,7 +543,7 @@ namespace {
               return completion->done;
             }) ||
             completion->error) {
-          ADD_FAILURE() << "HTTP body read failed: " << completion->error.message();
+          ADD_FAILURE() << "HTTP body read failed: " << completion->error.message() << catalog_failure_markers();
           return {};
         }
       }
@@ -499,6 +583,15 @@ namespace {
 
     boost::asio::io_context client_io;  ///< Client event loop driven with bounded completion events.
     std::jthread server_thread;  ///< Independent server loop, including production synchronous TLS shutdown.
+    std::function<void()> before_server_join;  ///< Nonblocking event observer for deterministic shutdown coverage.
+    std::function<void()> restore_isolated_catalog;  ///< Owns original catalog/process state through server quiescence.
+    bool server_cleanup_complete = false;  ///< Prevents explicit regression shutdown from restoring state twice.
+    bool observing_catalog = false;  ///< Hooks remain installed until all server callbacks have quiesced.
+    bool catalog_failure_reported = false;  ///< Finite stage output is emitted only on the first observed failure.
+    std::atomic_bool server_loop_returned {false};  ///< Distinguishes executor exit from a blocked handler.
+    std::atomic_bool applist_entered {false};  ///< Actual protected callback entry, including authorization.
+    std::atomic_bool applist_returned {false};  ///< Actual callback exit, including exception unwinding.
+    std::atomic_uint catalog_stages {0};  ///< Read-only restore, verify and pre-write observations, bits 0-2.
     std::mutex capture_mutex;  ///< Protects metadata produced by the server thread.
     std::vector<std::shared_ptr<rtsp_stream::launch_session_t>> captured_launches;  ///< Metadata guarded by capture_mutex.
     std::vector<request_t> captured_requests;  ///< Requests guarded by capture_mutex.
@@ -654,19 +747,82 @@ namespace {
     EXPECT_TRUE(launches.empty());
   }
 
-  TEST_F(HttpsClientIdentityTest, ZeroGrantProductionRoutesDenyActionsAndHideRestrictedMetadata) {
+  TEST_F(HttpsClientIdentityTest, IsolatedCatalogRestorationWaitsForCallbackJoinAndStoppedScope) {
     const auto original_apps_file = config::stream.file_apps;
-    const auto apps_file = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "https_zero_grant_apps.json";
-    auto original_proc = std::move(proc::proc);
-    proc::proc = proc::proc_t {};
-    config::stream.file_apps = apps_file.string();
-    std::ofstream {apps_file} << R"({"env":{},"apps":[]})";
-    auto restore_catalog = util::fail_guard([&]() {
-      proc::proc = std::move(original_proc);
-      config::stream.file_apps = original_apps_file;
-      std::error_code error;
-      std::filesystem::remove(apps_file, error);
+    const auto original_snapshot = proc::proc.published_snapshot();
+    isolate_catalog();
+    const auto isolated_snapshot = proc::proc.published_snapshot();
+    const auto isolated_file = config::stream.file_apps;
+    start_server();
+
+    auto entered = std::make_shared<std::promise<void>>();
+    auto entered_event = entered->get_future();
+    auto release = std::make_shared<std::promise<void>>();
+    const auto released = release->get_future().share();
+
+    struct cleanup_observation_t {
+      std::atomic_bool scope_acquired {false};
+      std::atomic_bool callback_returned {false};
+      bool after_callback = false;
+      bool after_join = false;
+      bool after_scope_stop = false;
+      bool after_server_release = false;
+    };
+
+    auto observed = std::make_shared<cleanup_observation_t>();
+    auto release_on_exit = util::fail_guard([release]() {
+      release->set_value();
     });
+    boost::asio::post(*server->io_service, [scope = handler_scope, entered, released, observed]() {
+      auto lock = scope->continue_lock();
+      observed->scope_acquired = static_cast<bool>(lock);
+      entered->set_value();
+      released.wait();
+      observed->callback_returned = true;
+    });
+    ASSERT_EQ(entered_event.wait_for(2s), std::future_status::ready);
+    ASSERT_TRUE(observed->scope_acquired);
+
+    auto restore = std::move(restore_isolated_catalog);
+    restore_isolated_catalog = [this, restore = std::move(restore), observed]() {
+      observed->after_callback = observed->callback_returned.load();
+      observed->after_join = !server_thread.joinable();
+      observed->after_scope_stop = !handler_scope->continue_lock();
+      observed->after_server_release = !server;
+      restore();
+    };
+    auto joining = std::make_shared<std::promise<void>>();
+    auto join_event = joining->get_future();
+    before_server_join = [joining]() {
+      joining->set_value();
+    };
+    auto stopping = std::async(std::launch::async, [this]() {
+      stop_server();
+    });
+    auto release_before_join = util::fail_guard([release]() {
+      release->set_value();
+    });
+    release_on_exit.disable();
+    EXPECT_EQ(join_event.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(stopping.wait_for(0ms), std::future_status::timeout);
+    EXPECT_EQ(config::stream.file_apps, isolated_file);
+    EXPECT_EQ(proc::proc.published_snapshot(), isolated_snapshot);
+    EXPECT_TRUE(std::filesystem::exists(isolated_file));
+    release->set_value();
+    release_before_join.disable();
+    EXPECT_EQ(stopping.wait_for(2s), std::future_status::ready);
+    stopping.get();
+    EXPECT_TRUE(observed->after_callback);
+    EXPECT_TRUE(observed->after_join);
+    EXPECT_TRUE(observed->after_scope_stop);
+    EXPECT_TRUE(observed->after_server_release);
+    EXPECT_EQ(config::stream.file_apps, original_apps_file);
+    EXPECT_EQ(proc::proc.published_snapshot(), original_snapshot);
+    EXPECT_FALSE(std::filesystem::exists(isolated_file));
+  }
+
+  TEST_F(HttpsClientIdentityTest, ZeroGrantProductionRoutesDenyActionsAndHideRestrictedMetadata) {
+    isolate_catalog();
     start_server(true, true);
     const auto exchange = [&](const std::string &path) {
       auto client = connect_client(&credentials_a);
@@ -688,8 +844,9 @@ namespace {
     EXPECT_TRUE(exchange("/launch?" + stream_args).contains("status_code=\"403\""));
     EXPECT_TRUE(exchange("/resume?" + stream_args).contains("status_code=\"403\""));
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::list));
+    observe_catalog_completion();
     const auto listed = exchange("/applist");
-    EXPECT_TRUE(listed.contains("status_code=\"200\"")) << listed;
+    EXPECT_TRUE(listed.contains("status_code=\"200\"")) << listed << catalog_failure_markers();
     EXPECT_FALSE(listed.contains("AppTitle"));
     EXPECT_TRUE(exchange("/resume?" + stream_args).contains("status_code=\"403\""));
     EXPECT_TRUE(exchange("/cancel").contains("status_code=\"403\""));
@@ -1063,6 +1220,9 @@ namespace {
         return backend;
       }));
       owner = rtsp_stream::test_support::start_owner();
+      nvhttp::test_support::set_source_preparation_hooks({}, {}, {}, {}, []() {
+        return std::optional<bool> {true};
+      });
       ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view | permissions::launch | permissions::list));
       ASSERT_TRUE(nvhttp::update_client(uuid_b, std::nullopt, permissions::view | permissions::launch | permissions::list));
       start_server(true, true);
@@ -1078,6 +1238,7 @@ namespace {
       rtsp_stream::stop_process_application();
       owner.reset();
       EXPECT_TRUE(rtsp_stream::set_source_backend({}));
+      nvhttp::test_support::set_source_preparation_hooks();
       proc::test_support::set_execute_entry_hook({});
       proc::test_support::set_undo_environment_hook({});
       proc::test_support::set_legacy_restore_hook({});

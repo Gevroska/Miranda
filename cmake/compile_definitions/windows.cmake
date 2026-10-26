@@ -77,6 +77,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utf_utils.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/sudovda.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/sudovda.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/source_backend.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/source_backend.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"

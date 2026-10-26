@@ -44,6 +44,42 @@ TEST(DisplayPolicyTest, ForcePreferencesAreAdditiveAndHeadlessRequestsRequireVir
   }
 }
 
+TEST(DisplayPolicyTest, FrozenNativeActionPreservesTheFullParsedOptionalConfiguration) {
+  auto video = config::video;
+  video.dd.configuration_option = config::video_t::dd_t::config_option_e::ensure_primary;
+  video.dd.resolution_option = config::video_t::dd_t::resolution_option_e::disabled;
+  video.dd.refresh_rate_option = config::video_t::dd_t::refresh_rate_option_e::disabled;
+  video.dd.hdr_option = config::video_t::dd_t::hdr_option_e::disabled;
+  rtsp_stream::launch_session_t launch {};
+  auto fresh = fresh_source();
+  fresh.native_action = display_policy::native_action_e::configure;
+  fresh.native_configuration = std::get<display_device::SingleDisplayConfiguration>(display_device::parse_configuration(video, launch));
+  const auto source = display_policy::resolve(video, fresh);
+  ASSERT_TRUE(source->native_configuration);
+  EXPECT_EQ(source->native_action, display_policy::native_action_e::configure);
+  EXPECT_EQ(source->native_configuration, fresh.native_configuration);
+  EXPECT_FALSE(source->native_configuration->m_resolution);
+  EXPECT_FALSE(source->native_configuration->m_refresh_rate);
+  EXPECT_FALSE(source->native_configuration->m_hdr_state);
+  fresh.device.force_virtual = true;
+  fresh.native_action = display_policy::native_action_e::revert;
+  fresh.native_configuration.reset();
+  EXPECT_EQ(display_policy::resolve(video, fresh, source), source);
+  EXPECT_EQ(source->native_action, display_policy::native_action_e::configure);
+}
+
+TEST(DisplayPolicyTest, FrozenNativeDisabledAndParseFailureRemainDistinctFromStreamMode) {
+  auto fresh = fresh_source();
+  fresh.native_action = display_policy::native_action_e::revert;
+  const auto disabled = display_policy::resolve(config::video, fresh);
+  EXPECT_EQ(disabled->native_action, display_policy::native_action_e::revert);
+  EXPECT_FALSE(disabled->native_configuration);
+  fresh.native_action = display_policy::native_action_e::unchanged;
+  const auto failed = display_policy::resolve(config::video, fresh);
+  EXPECT_EQ(failed->native_action, display_policy::native_action_e::unchanged);
+  EXPECT_EQ(failed->mode, disabled->mode);
+}
+
 TEST(DisplayPolicyTest, ExplicitHdrComesFromActualParserAndRemainsSeparateFromStreamHint) {
   using dd_t = config::video_t::dd_t;
   for (const bool display_enabled : {false, true}) {

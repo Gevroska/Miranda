@@ -1110,6 +1110,127 @@ namespace display_device {
   }
 
 #ifdef _WIN32
+  struct native_display_configuration_t::state_t {
+    struct recovery_t {
+      explicit recovery_t(bool pending):
+          pending {pending} {}
+
+      std::atomic_bool pending;  ///< Ordinary persistence or scheduled work still requires restoration.
+      std::atomic_bool retry_required {false};  ///< Callback stopped on an exception and requires serialized rescheduling.
+    };
+
+    mutable std::mutex mutex;  ///< Protect copied progress only; never held during native work.
+    native_display_status_t status;  ///< Latest logical generation and tolerated apply observation.
+    std::shared_ptr<recovery_t> recovery = std::make_shared<recovery_t>(false);  ///< One scheduler episode; replacement fences old callback publication.
+  };
+
+  native_display_configuration_t::native_display_configuration_t():
+      state_ {std::make_shared<state_t>()} {}
+
+  native_display_status_t native_display_configuration_t::status() const {
+    std::lock_guard lock {state_->mutex};
+    auto result = state_->status;
+    result.recovery_retry_required = state_->recovery->retry_required.load();
+    result.recovery_pending = state_->recovery->pending.load() || result.recovery_retry_required;
+    return result;
+  }
+
+  bool native_display_configuration_t::begin(const std::optional<SingleDisplayConfiguration> &configuration, bool disabled, std::uint64_t generation, std::chrono::milliseconds delay) {
+    if (!generation) {
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->mutex};
+      if (generation <= state_->status.generation) {
+        return false;
+      }
+      state_->status = {.generation = generation};
+    }
+    if (disabled) {
+      return restore(generation, delay);
+    }
+    std::lock_guard command {DD_DATA.mutex};
+    if (!DD_DATA.owned_reservation.expired()) {
+      return false;
+    }
+    if (!configuration || !DD_DATA.sm_instance) {
+      return true;
+    }
+    DD_DATA.sm_instance->schedule([state = state_, generation, configuration = *configuration](auto &manager, auto &stop) {
+      const auto result = manager.applySettings(configuration);
+      if (result == SettingsManagerInterface::ApplyResult::Ok) {
+        BOOST_LOG(info) << "Display device configuration applied successfully.";
+      } else if (result == SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable) {
+        BOOST_LOG(warning) << "Display device configuration API is temporarily unavailable. Will retry.";
+      } else {
+        BOOST_LOG(error) << "Display device configuration failed with result: " << apply_result_name(result);
+      }
+      {
+        std::lock_guard lock {state->mutex};
+        if (state->status.generation == generation) {
+          state->status.apply_result = result;
+        }
+      }
+      if (result != SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable) {
+        stop.requestStop();
+      }
+    },
+                                  {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+    return true;
+  }
+
+  bool native_display_configuration_t::restore(std::uint64_t generation, std::chrono::milliseconds delay) {
+    if (status().generation != generation || !generation || delay < std::chrono::milliseconds::zero()) {
+      return false;
+    }
+    std::lock_guard command {DD_DATA.mutex};
+    if (!DD_DATA.owned_reservation.expired()) {
+      return false;
+    }
+    if (!DD_DATA.sm_instance) {
+      std::lock_guard lock {state_->mutex};
+      state_->status.source_released = true;
+      state_->recovery = std::make_shared<state_t::recovery_t>(false);
+      return true;
+    }
+    const auto recovery = std::make_shared<state_t::recovery_t>(true);
+    {
+      std::lock_guard lock {state_->mutex};
+      state_->recovery = recovery;
+    }
+  #ifdef SUNSHINE_TESTS
+    const auto interval = DD_DATA.test_retry_interval.value_or(DEFAULT_RETRY_INTERVAL);
+  #else
+    const auto interval = DEFAULT_RETRY_INTERVAL;
+  #endif
+    SchedulerOptions options {.m_sleep_durations = {interval}};
+    if (delay > std::chrono::milliseconds::zero()) {
+      options.m_sleep_durations = {delay, interval};
+      options.m_execution = SchedulerOptions::Execution::ScheduledOnly;
+    }
+    const auto persistence = DD_DATA.persistence_watch;
+    DD_DATA.sm_instance->schedule([recovery, persistence, tried = StringSet {}](auto &manager, auto &stop) mutable {
+      try {
+        try_revert_settings(false, tried, persistence, manager, stop);
+        recovery->pending = !stop.stopRequested() || (persistence && persistence->has_pending_restores());
+      } catch (const std::exception &failure) {
+        recovery->pending = true;
+        recovery->retry_required = true;
+        stop.requestStop();
+        BOOST_LOG(error) << "Native display restoration stopped: " << failure.what();
+      }
+    },
+                                  options);
+    std::lock_guard lock {state_->mutex};
+    state_->status.source_released = true;
+    return true;
+  }
+
+  bool native_display_configuration_t::complete(std::uint64_t generation) const {
+    const auto current = status();
+    return generation && current.generation == generation && current.source_released && !current.recovery_pending;
+  }
+
   namespace {
     StringSet recovery_references(const SingleDisplayConfigState &state) {
       StringSet result {state.m_initial.m_primary_devices};
@@ -1749,6 +1870,7 @@ namespace display_device {
       state_->status.phase = owned_display_phase_e::reverting;
       state_->status.attempts = 0;
       state_->status.display_name.clear();
+      state_->status.restore_retry_required = false;
     }
     SchedulerOptions options {.m_sleep_durations = {state_->retry_interval}};
     if (delay > std::chrono::milliseconds::zero()) {
@@ -1766,6 +1888,7 @@ namespace display_device {
           state->status.phase = owned_display_phase_e::cleanup_pending;
           state->status.removal_permitted = false;
           state->status.restore_error = owned_display_error_e::journal_unavailable;
+          state->status.restore_retry_required = true;
           stop.requestStop();
           return;
         }
@@ -1781,6 +1904,7 @@ namespace display_device {
           state->status.phase = owned_display_phase_e::cleanup_pending;
           state->status.removal_permitted = false;
           state->status.restore_error = headless ? owned_display_error_e::headless_ownership_unproven : owned_display_error_e::recovery_state_unproven;
+          state->status.restore_retry_required = true;
           stop.requestStop();
           return;
         }
@@ -1790,6 +1914,7 @@ namespace display_device {
           state->status.phase = owned_display_phase_e::cleanup_pending;
           state->status.removal_permitted = false;
           state->status.restore_error = owned_display_error_e::journal_unavailable;
+          state->status.restore_retry_required = true;
           stop.requestStop();
           return;
         }
@@ -1816,6 +1941,7 @@ namespace display_device {
         ++state->status.attempts;
         state->status.unavailable_settings_pending = settings && !settings->empty();
         state->status.removal_permitted = !retired && ready;
+        state->status.restore_retry_required = false;
         state->status.phase = ready ? (retired ? (settings->empty() ? owned_display_phase_e::restored : owned_display_phase_e::recovering) : owned_display_phase_e::removal_ready) : owned_display_phase_e::cleanup_pending;
         if (ready && settings->empty()) {
           stop.requestStop();
@@ -1826,6 +1952,7 @@ namespace display_device {
           state->status.phase = owned_display_phase_e::cleanup_pending;
           state->status.removal_permitted = false;
           state->status.restore_error = owned_display_error_e::operation_exception;
+          state->status.restore_retry_required = true;
         }
         stop.requestStop();
       }

@@ -457,7 +457,8 @@ namespace rtsp_stream {
       rollback,
       restore,
       cleanup,
-      complete
+      complete,
+      progress
     };
 
     struct admission_t {
@@ -509,6 +510,7 @@ namespace rtsp_stream {
       bool backend_unentered = false;
       bool retire_requested = false;  ///< Explicit Stop, shutdown and heartbeat failure never turn back into retention.
       std::chrono::steady_clock::time_point next_liveness {};
+      std::chrono::steady_clock::time_point next_backend_progress {};  ///< Bound native readback polling without blocking the owner.
       std::vector<std::shared_future<void>> stops;  ///< Restoration waits for deferred Stop work.
       std::shared_ptr<std::optional<proc::source_claim_t>> process_claim = std::make_shared<std::optional<proc::source_claim_t>>();  ///< Written only by the drained operation worker.
     };
@@ -530,7 +532,7 @@ namespace rtsp_stream {
     /** @brief Return copied source state at the admission ordering point. */
     source_snapshot_t snapshot() const {
       if (!source) {
-        return {};
+        return {.busy = recovery_work.has_value() || recovery_retry_requested, .recovery_pending = static_cast<bool>(recovery_backend)};
       }
       return {true, source->phase != source_phase_e::ready && source->phase != source_phase_e::retained, source->phase == source_phase_e::retained, source->appid, source->app_uuid, source->application_instance, source->request, source->metadata, source->prepared.size(), source->media.size(), source->capture.size(), source->cleanup_blocked};
     }
@@ -584,7 +586,7 @@ namespace rtsp_stream {
 
     /** @brief Ensure retained-app exit and backend progress are observed even without media workers. */
     void arm_source_timer() {
-      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty())) {
+      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty() && !recovery_work && (!recovery_backend || stopping))) {
         return;
       }
       source_timer_armed = true;
@@ -595,7 +597,8 @@ namespace rtsp_stream {
           poll_process();
           poll_preflight();
           poll_source();
-          if (source || preflight || process_work || !process_jobs.empty()) {
+          poll_retired_recovery();
+          if (source || preflight || process_work || !process_jobs.empty() || (recovery_backend && !stopping) || recovery_work) {
             arm_source_timer();
           }
         }
@@ -719,7 +722,7 @@ namespace rtsp_stream {
         result->set_value(backend_factory && !stopping ? 403 : 503);
         return;
       }
-      if (preflight || (source && snapshot().busy) || !session_raise(launch)) {
+      if (preflight || recovery_work || recovery_retry_requested || (source && snapshot().busy) || !session_raise(launch)) {
         result->set_value(503);
         return;
       }
@@ -820,16 +823,27 @@ namespace rtsp_stream {
       }
       const bool retained = source.has_value();
       if (!retained) {
+        std::shared_ptr<source_backend_t> candidate;
+        try {
+          candidate = recovery_backend ? recovery_backend : backend_factory();
+          if (!candidate || recovery_work || recovery_retry_requested || !candidate->admits(*planned.second) || next_source_generation == UINT64_MAX) {
+            candidate.reset();
+          }
+        } catch (...) {
+          candidate.reset();
+        }
+        if (!candidate) {
+          launch->cancelled = true;
+          session_clear(launch->id);
+          result->set_value(503);
+          return;
+        }
         source.emplace();
         source->generation = ++next_source_generation;
         source->appid = launch->appid;
         source->app_uuid = launch->app_uuid;
         source->request = std::move(planned.second);
-        try {
-          source->backend = recovery_backend ? recovery_backend : backend_factory();
-        } catch (...) {
-          source->backend.reset();
-        }
+        source->backend = std::move(candidate);
         if (!source->backend) {
           source.reset();
           launch->cancelled = true;
@@ -864,6 +878,16 @@ namespace rtsp_stream {
           return 200;
         });
       }
+    }
+
+    /** @brief Read the progress clock; test-only virtual time changes no admission deadline. */
+    std::chrono::steady_clock::time_point source_progress_now() const {
+#ifdef SUNSHINE_TESTS
+      if (source_progress_clock) {
+        return source_progress_clock();
+      }
+#endif
+      return std::chrono::steady_clock::now();
     }
 
     /** @brief Continue staged backend work without sleeping or waiting for apply, restore or probe. */
@@ -989,6 +1013,16 @@ namespace rtsp_stream {
         } else if (result.kind == source_work_e::restore) {
           source->phase = result.status == 200 ? source_phase_e::restoring : source_phase_e::cleanup_pending;
           source->cleanup_blocked = result.status != 200;
+        } else if (result.kind == source_work_e::progress) {
+          source->next_backend_progress = source_progress_now() + 100ms;
+          if (result.status != 200) {
+            if (source->phase == source_phase_e::applying) {
+              fail_source(503);
+            } else {
+              source->phase = source_phase_e::cleanup_pending;
+              source->cleanup_blocked = true;
+            }
+          }
         } else if (source->failed || (source->admission && source->admission->answered)) {
           source->phase = source_phase_e::draining;
         } else if (result.status != 200) {
@@ -1062,6 +1096,17 @@ namespace rtsp_stream {
           fail_source(503);
         }
       }
+      // Consume completed ready/failure/removal observations before another refresh. Its
+      // polling deadline is measured from completion, never from a potentially slow dispatch.
+      if (!source->cleanup_blocked && source_progress_now() >= source->next_backend_progress && ((source->phase == source_phase_e::applying && status.phase == source_backend_status_t::phase_e::preparing) || (source->phase == source_phase_e::restoring && status.phase == source_backend_status_t::phase_e::reverting))) {
+        const auto backend = source->backend;
+        const auto generation = source->generation;
+        dispatch_source(source_work_e::progress, [backend, generation]() {
+          backend->progress(generation);
+          return 200;
+        });
+        return;
+      }
       if (source->phase == source_phase_e::draining && source->admission) {
         const auto admission = source->admission;
         if (admission->executed && admission->rollback) {
@@ -1125,6 +1170,9 @@ namespace rtsp_stream {
         return;
       }
       recovery_backend = source->backend;
+      recovery_generation = source->generation;
+      recovery_blocked = false;
+      recovery_retry_requested = false;
       if (status.recovery_pending) {
         source.reset();
         finish_stop();
@@ -1135,6 +1183,53 @@ namespace rtsp_stream {
       dispatch_source(source_work_e::complete, [backend, generation]() {
         return backend->complete(generation) ? 200 : 503;
       });
+    }
+
+    /** @brief Continue a retired recovery episode on the operation lane, fencing admissions during completion. */
+    void poll_retired_recovery() {
+      if (recovery_work) {
+        if (recovery_work->wait_for(0ms) != std::future_status::ready) {
+          return;
+        }
+        const auto result = recovery_work->get();
+        recovery_work.reset();
+        if (result == 1) {
+          recovery_backend.reset();
+          recovery_generation = 0;
+          recovery_retry_requested = false;
+        } else if (result < 0) {
+          recovery_blocked = !recovery_retry_requested;
+        }
+        finish_stop();
+      }
+      if (source || preflight || stopping || !recovery_backend || recovery_blocked || std::chrono::steady_clock::now() < next_recovery_progress) {
+        return;
+      }
+      const auto backend = recovery_backend;
+      const auto generation = recovery_generation.load();
+      const auto retry = std::exchange(recovery_retry_requested, false);
+      next_recovery_progress = std::chrono::steady_clock::now() + 100ms;
+      recovery_work.emplace(std::async(std::launch::async, [backend, generation, retry]() {
+        try {
+          if (retry && !backend->retry_recovery(generation)) {
+            return -1;
+          }
+          backend->progress(generation);
+          const auto state = backend->status();
+          if (state.generation != generation || !state.source_released) {
+            return -1;
+          }
+          if (state.recovery_retry_required) {
+            return -1;
+          }
+          if (state.recovery_pending) {
+            return 0;
+          }
+          return backend->complete(generation) ? 1 : -1;
+        } catch (...) {
+          return -1;
+        }
+      }));
     }
 
     /** @brief Recheck authorization before publishing ready; only a tracked app may extend source lifetime. */
@@ -1194,6 +1289,14 @@ namespace rtsp_stream {
         return false;
       }
       backend_factory = std::move(factory);
+      return true;
+    }
+
+    bool seed_generation(std::uint64_t generation) {
+      if (source || preflight || recovery_work || recovery_retry_requested || session_count() || launch_event.view(0s) || generation == UINT64_MAX) {
+        return false;
+      }
+      next_source_generation = std::max(next_source_generation.load(), generation);
       return true;
     }
 
@@ -1379,16 +1482,22 @@ namespace rtsp_stream {
     /** @brief Recovery must remain postable while shutdown is draining, without waiting on its fence. */
     void post_retry_cleanup() {
       const auto generation = next_source_generation.load();
-      asio::post(io_context, [this, generation]() {
+      const auto retired_generation = recovery_generation.load();
+      asio::post(io_context, [this, generation, retired_generation]() {
         if (source && source->generation == generation) {
           retry_cleanup();
+        } else if (!source && recovery_backend && recovery_generation == retired_generation) {
+          recovery_blocked = false;
+          recovery_retry_requested = true;
+          next_recovery_progress = {};
+          arm_source_timer();
         }
       });
     }
 
     /** @brief Shutdown drains source completion events and capture releases before stopping its executor. */
     void finish_stop() {
-      if (!stopping || source || preflight || process_work || !process_jobs.empty() || !shutdown_completion) {
+      if (!stopping || source || preflight || process_work || !process_jobs.empty() || recovery_work || !shutdown_completion) {
         return;
       }
       {
@@ -1848,6 +1957,7 @@ namespace rtsp_stream {
 
 #ifdef SUNSHINE_TESTS
     std::function<void(std::string_view)> owner_hook;  ///< Deterministic lifecycle boundaries for tests.
+    std::function<std::chrono::steady_clock::time_point()> source_progress_clock;  ///< Virtual progress time; admission deadlines retain their real clock.
     std::mutex owner_hook_mutex;  ///< Protects test observer publication across the owner and posting threads.
 
     void notify_owner(std::string_view event) {
@@ -1868,6 +1978,7 @@ namespace rtsp_stream {
       shutdown_done = {};
       std::lock_guard observer {owner_hook_mutex};
       owner_hook = {};
+      source_progress_clock = {};
     }
 
     auto test_work_guard() {
@@ -1894,6 +2005,11 @@ namespace rtsp_stream {
     std::optional<std::future<void>> process_work;  ///< Sole in-flight process operation, always polled.
     std::atomic_bool liveness_queued {false};
     std::shared_ptr<source_backend_t> recovery_backend;  ///< Retired unavailable-display recovery outlives a source.
+    std::atomic_uint64_t recovery_generation {0};  ///< Retired logical generation remains fenced after the source is dropped.
+    std::optional<std::future<int>> recovery_work;  ///< Sole retired operation, never concurrent with a new source.
+    bool recovery_blocked = false;  ///< Failed completion requires an explicit retry.
+    bool recovery_retry_requested = false;  ///< A generation-fenced public request survives an in-flight observation and restarts stopped work.
+    std::chrono::steady_clock::time_point next_recovery_progress {};  ///< Bound idle polling while recovery waits for hardware.
     std::function<std::shared_ptr<source_backend_t>()> backend_factory;  ///< Empty until explicitly integrated and qualified.
     std::shared_ptr<source_emitter_t> source_emitter = std::make_shared<source_emitter_t>();
     std::atomic_uint64_t next_source_generation {0};
@@ -1913,6 +2029,12 @@ namespace rtsp_stream {
   bool set_source_backend(std::function<std::shared_ptr<source_backend_t>()> factory) {
     return server.sync([factory = std::move(factory)]() mutable {
       return server.set_backend(std::move(factory));
+    });
+  }
+
+  bool seed_source_generation(std::uint64_t recovered_generation) {
+    return server.sync([recovered_generation]() {
+      return server.seed_generation(recovered_generation);
     });
   }
 
@@ -2167,6 +2289,12 @@ namespace rtsp_stream {
       });
     }
 
+    void set_source_progress_clock(std::function<std::chrono::steady_clock::time_point()> clock) {
+      server.sync([&]() {
+        server.source_progress_clock = std::move(clock);
+      });
+    }
+
     bool token_authorized(const std::shared_ptr<launch_session_t> &launch) {
       return server.sync([&]() {
         return server.authorized(*launch);
@@ -2200,6 +2328,7 @@ namespace rtsp_stream {
     void poll_source() {
       server.sync([]() {
         server.poll_source();
+        server.poll_retired_recovery();
       });
     }
 

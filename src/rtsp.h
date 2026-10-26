@@ -7,6 +7,7 @@
 // standard includes
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -141,6 +142,7 @@ namespace rtsp_stream {
     bool source_released = false;  ///< Checked logical retirement; owned virtual additionally requires its issued cleanup receipt.
     bool recovery_pending = false;  ///< Retired library recovery must survive the source.
     std::shared_ptr<const capture_source_t> source;  ///< Verified exact mapping after apply or retained validation.
+    bool recovery_retry_required = false;  ///< Retired restoration stopped; waiting for unavailable hardware alone does not set this.
   };
 
   /**
@@ -157,6 +159,20 @@ namespace rtsp_stream {
   public:
     /** @brief Preserve owned recovery on destruction; failed cleanup is never implied to have succeeded. */
     virtual ~source_backend_t() = default;
+
+    /** @brief Inspect copied recovery state before allocation, claiming or generation mutation; never perform I/O. */
+    virtual bool admits(const display_policy::source_request_t &) const {
+      return true;
+    }
+
+    /** @brief Refresh native readback and copied progress on the serialized operation lane, never on the owner. */
+    virtual void progress(std::uint64_t) {}
+
+    /** @brief Restart stopped retired restoration on the operation lane, preserving its episode and removal receipt. */
+    virtual bool retry_recovery(std::uint64_t) {
+      return true;
+    }
+
     /** @brief Begin/acquire/bind/prepare, or begin_next on the retained recovery episode, outside the owner. */
     virtual bool begin(const display_policy::source_request_t &request, std::uint64_t generation, std::uint64_t epoch) = 0;
     /** @brief Refresh/read back the exact retained identity/mode and publish the newly assigned epoch. */
@@ -187,10 +203,13 @@ namespace rtsp_stream {
     std::size_t media_pins {};  ///< Successfully started stream slots.
     std::size_t capture_pins {};  ///< Explicit actual-resource lifetimes.
     bool cleanup_blocked = false;  ///< Failed restoration/removal/retirement requires an explicit retry.
+    bool recovery_pending = false;  ///< A retired backend still owns physical recovery independently of a source.
   };
 
   /** @brief Install an inert-by-default, allocation-only factory at a quiescent boundary; reject replacement while owned. */
   bool set_source_backend(std::function<std::shared_ptr<source_backend_t>()> factory);
+  /** @brief Internal startup seam: reserve all generations through a recovered journal at a quiescent boundary. */
+  bool seed_source_generation(std::uint64_t recovered_generation);
   /** @brief Return the owner record; never infer source ownership from connection count or process running(). */
   source_snapshot_t source_snapshot();
   /**
@@ -320,6 +339,8 @@ namespace rtsp_stream {
      * @param hook Boundary observer, or empty to remove it.
      */
     void set_owner_hook(std::function<void(std::string_view)> hook);
+    /** @brief Replace progress polling time for barrier-driven tests; admission deadlines keep the real steady clock. */
+    void set_source_progress_clock(std::function<std::chrono::steady_clock::time_point()> clock);
     /**
      * @brief Stop the isolated owner through its production shutdown fence.
      */

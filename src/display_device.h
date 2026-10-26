@@ -193,6 +193,38 @@ namespace display_device {
   class SettingsManagerInterface;
   class AudioContextInterface;
 
+  /** @brief Copied progress for the ordinary native scheduler; no journal or virtual removal authority. */
+  struct native_display_status_t {
+    std::uint64_t generation {};  ///< Reject stale source operations and callback publication.
+    bool source_released = false;  ///< A delayed ordinary revert was successfully scheduled.
+    bool recovery_pending = false;  ///< Scheduler or ordinary persistence still requires restoration.
+    std::optional<SettingsManagerInterface::ApplyResult> apply_result;  ///< Tolerated ordinary configuration result.
+    bool recovery_retry_required = false;  ///< Restoration stopped on an exception; unavailable hardware remains scheduled instead.
+  };
+
+  /**
+   * @brief Observe ordinary DD_DATA configuration without replacing its scheduler or persistence.
+   * @details Construction and status only access local copied state. Mutations run off the owner.
+   * Fresh native preparation supersedes its previous retry through the existing scheduler.
+   */
+  class native_display_configuration_t {
+  public:
+    /** @brief Allocate local progress only; never initialize native display management. */
+    native_display_configuration_t();
+    /** @brief Apply the exact parsed configuration, revert when explicitly disabled, or preserve on parse failure. */
+    bool begin(const std::optional<SingleDisplayConfiguration> &configuration, bool disabled, std::uint64_t generation, std::chrono::milliseconds delay);
+    /** @brief Schedule ordinary delayed restoration and retire the logical source without waiting for physical recovery. */
+    bool restore(std::uint64_t generation, std::chrono::milliseconds delay);
+    /** @brief Copy generation-fenced progress without entering DD_DATA, the scheduler or native APIs. */
+    native_display_status_t status() const;
+    /** @brief Check completion only; never reset or erase ordinary persistence. */
+    bool complete(std::uint64_t generation) const;
+
+  private:
+    struct state_t;
+    std::shared_ptr<state_t> state_;  ///< Retry callbacks retain copied progress independently of the logical source.
+  };
+
   /** @brief Observable state of one generation's owned display operation. */
   enum class owned_display_phase_e {
     reserved,
@@ -233,6 +265,7 @@ namespace display_device {
     bool initially_headless {};  ///< Explicit exception for removing a sole owned output.
     bool source_released {};  ///< Exact removal/close and durable retirement completed; recovery may remain.
     bool removal_permitted {};  ///< Latest readback authorized exact-owned removal; retained for retirement retries.
+    bool restore_retry_required {};  ///< Restoration stopped after a validation failure/exception; ordinary unavailable-device retries remain scheduled.
   };
 
   /**

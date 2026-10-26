@@ -3,6 +3,7 @@
  * @brief Owned display transactions with the real settings algorithm and fake Windows/driver boundaries.
  */
 // test includes
+#include "../certificate_test_utils.h"
 #include "../tests_common.h"
 
 #ifdef _WIN32
@@ -13,6 +14,7 @@
   #include <cstring>
   #include <filesystem>
   #include <fstream>
+  #include <future>
   #include <map>
   #include <mutex>
   #include <thread>
@@ -27,7 +29,10 @@
 
   // lib includes
   #include <display_device/audio_context_interface.h>
+  #include <display_device/settings_persistence_interface.h>
   #include <display_device/windows/json.h>
+  #include <display_device/windows/persistent_state.h>
+  #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer_interface.h>
   #include <display_device/windows/win_display_device_interface.h>
   #include <nlohmann/json.hpp>
@@ -35,6 +40,9 @@
   // local includes
   #include <src/display_device.h>
   #include <src/httpcommon.h>
+  #include <src/nvhttp.h>
+  #include <src/platform/windows/source_backend.h>
+  #include <src/process.h>
 
 namespace {
   using namespace display_device;
@@ -70,6 +78,9 @@ namespace {
     bool mode_failure {};
     bool remove_failure {};
     bool add_failure {};
+    bool capture_metadata {};  ///< Enable complete D readback only for the concrete-backend cases.
+    bool heartbeat_failure {};  ///< Inject a sticky asynchronous ping failure.
+    bool close_failure {};  ///< Keep a removed lease alive until its transport close succeeds.
 
     bool active_device(const std::string &id) const {
       return std::ranges::any_of(active, [&](const auto &group) {
@@ -119,6 +130,18 @@ namespace {
         path.sourceInfo.adapterId = display_adapter;
         path.sourceInfo.id = display_model_t::target(id);
         path.flags = model_->active_device(id) ? DISPLAYCONFIG_PATH_ACTIVE : 0;
+        if (model_->capture_metadata) {
+          path.targetInfo.targetAvailable = TRUE;
+          path.targetInfo.refreshRate = {model_->modes.at(id).m_refresh_rate.m_numerator, model_->modes.at(id).m_refresh_rate.m_denominator};
+          path.sourceInfo.sourceModeInfoIdx = result.m_modes.size();
+          DISPLAYCONFIG_MODE_INFO mode {};
+          mode.infoType = DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+          mode.adapterId = path.sourceInfo.adapterId;
+          mode.id = path.sourceInfo.id;
+          mode.sourceMode.width = model_->modes.at(id).m_resolution.m_width;
+          mode.sourceMode.height = model_->modes.at(id).m_resolution.m_height;
+          result.m_modes.push_back(mode);
+        }
         result.m_paths.push_back(path);
         if ((model_->ambiguous || model_->alternative) && id == "virtual1" && type == QueryType::All) {
           auto alternative {path};
@@ -187,8 +210,9 @@ namespace {
       return ERROR_NOT_SUPPORTED;
     }
 
-    std::optional<HdrState> getHdrState(const DISPLAYCONFIG_PATH_INFO &) const override {
-      return std::nullopt;
+    std::optional<HdrState> getHdrState(const DISPLAYCONFIG_PATH_INFO &path) const override {
+      std::lock_guard lock {model_->mutex};
+      return model_->capture_metadata ? std::optional {model_->hdr.at(display_model_t::id(path.targetInfo.id))} : std::nullopt;
     }
 
     bool setHdrState(const DISPLAYCONFIG_PATH_INFO &, HdrState) override {
@@ -400,6 +424,10 @@ namespace {
     }
 
     std::expected<void, failure_t> close() override {
+      std::lock_guard lock {model_->mutex};
+      if (model_->close_failure) {
+        return std::unexpected(failure_t {errc_t::close_failed, operation_t::close});
+      }
       return {};
     }
 
@@ -446,6 +474,9 @@ namespace {
         ++model_->removals;
       } else if (code == wire::ping) {
         ++model_->pings;
+        if (model_->heartbeat_failure) {
+          return std::unexpected(failure_t {errc_t::heartbeat_failed, operation_t::heartbeat});
+        }
       }
       return output.size();
     }
@@ -482,6 +513,14 @@ namespace {
     std::shared_ptr<display_model_t> model_;
   };
 
+  /** @brief Explicit fake verifier; supplies no production provisioning implementation. */
+  class fixture_authority_t final: public platf::source_backend::authority_verifier_t {
+  public:
+    std::expected<recovery_authority_t, failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
+      return recovery_authority_t {"transaction-fixture", true, true};
+    }
+  };
+
   class OwnedDisplayTest: public BaseTest {
   protected:
     std::shared_ptr<display_model_t> model {std::make_shared<display_model_t>()};
@@ -491,6 +530,70 @@ namespace {
     std::unique_ptr<lease_t> lease;
     std::filesystem::path path;
     const recovery_authority_t authority {"transaction-fixture", true, true};
+    bool owner_boundaries = false;
+    owned_display_configuration_t *concrete_transaction = nullptr;  ///< Fixture-only view while the concrete backend retains B.
+
+    std::shared_ptr<rtsp_stream::source_backend_t> concrete_backend(bool fail_readback_allocation = false) {
+      model->capture_metadata = true;
+      platf::source_backend::test_dependencies_t dependencies;
+      dependencies.make_api = [this, fail_readback_allocation]() -> std::shared_ptr<WinApiLayerInterface> {
+        if (fail_readback_allocation) {
+          throw std::runtime_error {"inert readback allocation failure"};
+        }
+        return api;
+      };
+      dependencies.capture_names = []() {
+        return std::vector<std::string> {"dock-capture"};
+      };
+      dependencies.wake_native = [this](const auto &) {
+        if (!owner_boundaries) {
+          ADD_FAILURE() << "Virtual must not wake native displays";
+        }
+      };
+      dependencies.render_adapter = [](const auto &) {
+        return std::optional {display_adapter};
+      };
+      dependencies.make_system = [this]() {
+        return std::make_unique<model_system_t>(model);
+      };
+      dependencies.begin_owned = [this](const auto &file, const auto &identity, auto generation, const auto &qualification) {
+        auto result = owned_display_configuration_t::test_begin(file, identity, generation, qualification, api, devices);
+        if (result) {
+          (*result)->test_set_retry_interval(10ms);
+          concrete_transaction = result->get();
+        }
+        return result;
+      };
+      if (owner_boundaries) {
+        dependencies.probe = [](const auto &, auto pin) {
+          EXPECT_TRUE(pin);
+          return pin ? 200 : 503;
+        };
+      }
+      return platf::source_backend::test_make_backend({path, std::make_shared<fixture_authority_t>()}, std::move(dependencies));
+    }
+
+    display_policy::source_request_t concrete_request(bool second = false) {
+      display_policy::source_request_t request {};
+      request.virtual_display = true;
+      request.monitor_uuid = second ? "22222222-1234-5678-0102-030405060708" : "11111111-1234-5678-0102-030405060708";
+      request.edid_name = "Miranda";
+      request.edid_serial = "fixture";
+      request.mode = {{1920, 1080}, {60, 1}, true};
+      request.topology = config::video_t::dd_t::config_option_e::ensure_only_display;
+      return request;
+    }
+
+    bool concrete_until(const std::shared_ptr<rtsp_stream::source_backend_t> &backend, std::uint64_t generation, const std::function<bool(const rtsp_stream::source_backend_status_t &)> &predicate) {
+      for (unsigned int attempt = 0; attempt < 200; ++attempt) {
+        backend->progress(generation);
+        if (predicate(backend->status())) {
+          return true;
+        }
+        std::this_thread::sleep_for(5ms);
+      }
+      return false;
+    }
 
     void SetUp() override {
       BaseTest::SetUp();
@@ -1609,5 +1712,560 @@ TEST_F(OwnedDisplayTest, MappingMustPersistBeforeLibraryCanReferToOwnedIdentity)
   ASSERT_TRUE(source->bind(*lease->display(), 1));
   ASSERT_TRUE(release(1));
   EXPECT_TRUE(source->complete(1));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendBindsObservedVirtualSourceAndRevalidatesRetainedEpoch) {
+  const auto backend = concrete_backend();
+  auto request = concrete_request();
+  ASSERT_TRUE(backend->begin(request, 1, 1));
+  ASSERT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+    return state.phase == rtsp_stream::source_backend_status_t::phase_e::ready;
+  }));
+  const auto original = backend->status().source;
+  ASSERT_TRUE(original);
+  EXPECT_EQ(original->device_id, "virtual1");
+  EXPECT_EQ(original->selector, "virtual1-capture");
+  EXPECT_EQ(original->width, 1920U);
+  EXPECT_EQ(original->rate_numerator, 60U);
+  EXPECT_FALSE(original->requested_hdr);
+  EXPECT_EQ(original->observed_hdr, false);
+  EXPECT_TRUE(backend->validate_retained(*original, 2));
+  EXPECT_EQ(backend->status().source->epoch, 2U);
+  EXPECT_FALSE(backend->validate_retained(*original, 3));
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_TRUE(backend->status().source_released);
+  EXPECT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+    return !state.recovery_pending;
+  }));
+  EXPECT_TRUE(backend->complete(1));
+  EXPECT_EQ(model->removals, 1U);
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendArmedFailedAddKeepsHeartbeatUntilRestorationAndIssuedReceipt) {
+  model->add_failure = true;
+  const auto backend = concrete_backend();
+  EXPECT_FALSE(backend->begin(concrete_request(), 7, 1));
+  const auto diagnostics = platf::source_backend::test_diagnostics(*backend);
+  ASSERT_TRUE(diagnostics.acquisition);
+  EXPECT_EQ(diagnostics.acquisition->operation, operation_t::add);
+  EXPECT_FALSE(backend->status().source_released);
+  std::function<void()> tick;
+  {
+    std::lock_guard lock {model->mutex};
+    tick = model->tick;
+  }
+  ASSERT_TRUE(tick);
+  tick();
+  EXPECT_GT(model->pings, 0U);
+  EXPECT_EQ(model->removals, 0U);
+  ASSERT_TRUE(backend->restore(7, 0ms));
+  EXPECT_EQ(model->removals, 0U);
+  ASSERT_TRUE(backend->cleanup_and_retire(7));
+  EXPECT_EQ(model->removals, 1U);
+  EXPECT_TRUE(backend->status().source_released);
+  EXPECT_TRUE(concrete_until(backend, 7, [](const auto &state) {
+    return !state.recovery_pending;
+  }));
+  EXPECT_TRUE(backend->complete(7));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendExceptionAfterIntentRetiresOnlyWithTheAdaptersUnarmedProof) {
+  const auto backend = concrete_backend(true);
+  EXPECT_THROW(backend->begin(concrete_request(), 9, 1), std::runtime_error);
+  EXPECT_EQ(backend->status().generation, 9U);
+  EXPECT_FALSE(backend->status().source_released);
+  EXPECT_EQ(model->removals, 0U);
+  EXPECT_FALSE(model->tick);
+  ASSERT_TRUE(backend->restore(9, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(9));
+  EXPECT_TRUE(backend->status().source_released);
+  EXPECT_EQ(model->removals, 0U);
+  EXPECT_TRUE(concrete_until(backend, 9, [](const auto &state) {
+    return !state.recovery_pending;
+  }));
+  EXPECT_TRUE(backend->complete(9));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendUnarmedAcquisitionDenialRequiresRealUnarmedReceipt) {
+  {
+    std::lock_guard lock {model->mutex};
+    model->present.insert("virtual1");
+  }
+  const auto backend = concrete_backend();
+  EXPECT_FALSE(backend->begin(concrete_request(), 1, 1));
+  ASSERT_TRUE(platf::source_backend::test_diagnostics(*backend).acquisition);
+  EXPECT_EQ(platf::source_backend::test_diagnostics(*backend).acquisition->code, errc_t::already_present);
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+    return !state.recovery_pending;
+  }));
+  EXPECT_TRUE(backend->complete(1));
+  EXPECT_EQ(model->removals, 0U);
+  EXPECT_TRUE(model->present.contains("virtual1"));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendStickyHeartbeatAndCleanupFailureRetainSeparateDiagnosticsAndOwnership) {
+  const auto backend = concrete_backend();
+  ASSERT_TRUE(backend->begin(concrete_request(), 1, 1));
+  {
+    std::lock_guard lock {model->mutex};
+    model->heartbeat_failure = true;
+  }
+  std::function<void()> tick;
+  {
+    std::lock_guard lock {model->mutex};
+    tick = model->tick;
+  }
+  ASSERT_TRUE(tick);
+  tick();
+  EXPECT_TRUE(backend->status().heartbeat_failed);
+  backend->progress(1);
+  EXPECT_TRUE(backend->status().heartbeat_failed);
+  {
+    std::lock_guard lock {model->mutex};
+    model->heartbeat_failure = false;
+    model->remove_failure = true;
+  }
+  tick();
+  backend->progress(1);
+  EXPECT_TRUE(backend->status().heartbeat_failed);
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  EXPECT_FALSE(backend->cleanup_and_retire(1));
+  EXPECT_FALSE(backend->status().source_released);
+  const auto diagnostics = platf::source_backend::test_diagnostics(*backend);
+  EXPECT_FALSE(diagnostics.acquisition);
+  ASSERT_TRUE(diagnostics.cleanup);
+  EXPECT_EQ(diagnostics.cleanup->code, errc_t::remove_failed);
+  EXPECT_TRUE(diagnostics.liveness);
+  {
+    std::lock_guard lock {model->mutex};
+    model->remove_failure = false;
+  }
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+    return !state.recovery_pending;
+  }));
+  EXPECT_TRUE(backend->complete(1));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendRejectsNativeDuringRetiredVirtualRecoveryAndRollsActualNextGuid) {
+  const auto backend = concrete_backend();
+  auto request = concrete_request();
+  // Keep a real dock obligation across both generations; topology-only recovery may finish early.
+  request.topology = config::video_t::dd_t::config_option_e::ensure_primary;
+  ASSERT_TRUE(backend->begin(request, 1, 1));
+  ASSERT_NE(concrete_transaction, nullptr);
+  const auto first_journal = concrete_transaction->journal();
+  const auto applied = first_journal->settings();
+  ASSERT_TRUE(applied);
+  SingleDisplayConfigState applied_state;
+  ASSERT_TRUE(fromJson(std::string {applied->begin(), applied->end()}, applied_state));
+  EXPECT_EQ(applied_state.m_modified.m_original_primary_device, "dock");
+  EXPECT_TRUE(applied_state.m_modified.m_original_modes.contains("dock"));
+  {
+    std::lock_guard lock {model->mutex};
+    model->present.erase("dock");
+    model->active = {{"virtual1"}};
+    model->primary = "virtual1";
+  }
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_TRUE(backend->status().source_released);
+  EXPECT_TRUE(backend->status().recovery_pending);
+  EXPECT_TRUE(first_journal->source_retired());
+  const auto pending = first_journal->settings();
+  ASSERT_TRUE(pending);
+  EXPECT_FALSE(pending->empty());
+  SingleDisplayConfigState pending_state;
+  ASSERT_TRUE(fromJson(std::string {pending->begin(), pending->end()}, pending_state));
+  EXPECT_EQ(pending_state.m_initial.m_topology, (ActiveTopology {{"dock"}, {"panel"}}));
+  EXPECT_EQ(pending_state.m_modified.m_topology, (ActiveTopology {{"dock"}}));
+  EXPECT_EQ(pending_state.m_modified.m_original_primary_device, "dock");
+  EXPECT_TRUE(pending_state.m_modified.m_original_modes.contains("dock"));
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->removals, 1U);
+    EXPECT_EQ(model->active, (ActiveTopology {{"panel"}}));
+    EXPECT_EQ(model->primary, "panel");
+    EXPECT_FALSE(model->present.contains("virtual1"));
+  }
+  auto native = concrete_request();
+  native.virtual_display = false;
+  EXPECT_FALSE(backend->admits(native));
+  EXPECT_FALSE(backend->begin(native, 2, 2));
+  EXPECT_EQ(backend->status().generation, 1U);
+  EXPECT_TRUE(backend->admits(concrete_request(true)));
+  ASSERT_TRUE(backend->begin(concrete_request(true), 3, 3));
+  ASSERT_TRUE(backend->status().source);
+  EXPECT_EQ(backend->status().source->monitor_uuid, concrete_request(true).monitor_uuid);
+  EXPECT_EQ(backend->status().source->device_id, "virtual2");
+  const auto second_journal = concrete_transaction->journal();
+  EXPECT_TRUE(IsEqualGUID(second_journal->record().identity, second_identity));
+  EXPECT_EQ(second_journal->record().generation, 3U);
+  EXPECT_FALSE(second_journal->source_retired());
+  const auto carried = second_journal->settings();
+  ASSERT_TRUE(carried);
+  SingleDisplayConfigState carried_state;
+  ASSERT_TRUE(fromJson(std::string {carried->begin(), carried->end()}, carried_state));
+  EXPECT_EQ(carried_state.m_initial.m_topology, pending_state.m_initial.m_topology);
+  EXPECT_EQ(carried_state.m_modified.m_original_primary_device, "dock");
+  EXPECT_TRUE(carried_state.m_modified.m_original_modes.contains("dock"));
+  backend->progress(1);
+  EXPECT_EQ(backend->status().generation, 3U);
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->removals, 1U);
+    EXPECT_EQ(model->active, (ActiveTopology {{"virtual2"}}));
+    model->present.insert("dock");
+  }
+  ASSERT_TRUE(backend->restore(3, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(3));
+  EXPECT_TRUE(concrete_until(backend, 3, [](const auto &state) {
+    return !state.recovery_pending;
+  }));
+  EXPECT_TRUE(second_journal->source_retired());
+  ASSERT_TRUE(second_journal->settings());
+  EXPECT_TRUE(second_journal->settings()->empty());
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->removals, 2U);
+    EXPECT_EQ(model->active, (ActiveTopology {{"dock"}, {"panel"}}));
+    EXPECT_EQ(model->primary, "dock");
+    EXPECT_EQ(model->modes.at("dock"), (DisplayMode {{3840, 2160}, {60, 1}}));
+    EXPECT_EQ(model->hdr.at("dock"), HdrState::Enabled);
+    EXPECT_FALSE(model->present.contains("virtual1"));
+    EXPECT_FALSE(model->present.contains("virtual2"));
+  }
+  EXPECT_TRUE(backend->complete(3));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendRetriesCloseAfterRemovalWithoutRepeatingRemovalOrFabricatingReceipt) {
+  for (const bool headless : {false, true}) {
+    if (headless) {
+      std::lock_guard lock {model->mutex};
+      model->active.clear();
+      model->present.clear();
+      model->primary.clear();
+    }
+    const auto prior_removals = model->removals;
+    const auto backend = concrete_backend();
+    ASSERT_TRUE(backend->begin(concrete_request(), 1, 1));
+    ASSERT_TRUE(backend->restore(1, 0ms));
+    {
+      std::lock_guard lock {model->mutex};
+      model->close_failure = true;
+    }
+    EXPECT_FALSE(backend->cleanup_and_retire(1));
+    EXPECT_EQ(model->removals, prior_removals + 1);
+    EXPECT_FALSE(backend->status().source_released);
+    ASSERT_TRUE(platf::source_backend::test_diagnostics(*backend).cleanup);
+    EXPECT_EQ(platf::source_backend::test_diagnostics(*backend).cleanup->code, errc_t::close_failed);
+    {
+      std::lock_guard lock {model->mutex};
+      model->close_failure = false;
+    }
+    ASSERT_TRUE(backend->cleanup_and_retire(1));
+    EXPECT_EQ(model->removals, prior_removals + 1);
+    EXPECT_TRUE(backend->status().source_released);
+    EXPECT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+      return !state.recovery_pending;
+    }));
+    EXPECT_TRUE(backend->complete(1));
+  }
+}
+
+namespace {
+  /** @brief Actual concrete adapters and pinned managers under the real owner, with inert Windows/codec boundaries. */
+  class ConcreteSourceRecoveryOwnerTest: public OwnedDisplayTest {
+  protected:
+    std::shared_ptr<rtsp_stream::source_backend_t> backend;
+    std::shared_ptr<SettingsPersistenceInterface> native_persistence;
+    std::unique_ptr<platf::deinit_t> owner;
+    crypto::creds_t credentials;
+    std::string client_uuid, previous_client_state;
+    bool previous_fresh_state = false;
+    std::vector<std::shared_ptr<rtsp_stream::launch_session_t>> launches;
+
+    void SetUp() override {
+      OwnedDisplayTest::SetUp();
+      owner_boundaries = true;
+      previous_client_state = config::nvhttp.file_state;
+      previous_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+      config::sunshine.flags[config::flag::FRESH_STATE] = false;
+      config::nvhttp.file_state = path.string() + ".clients.json";
+      std::error_code error;
+      std::filesystem::remove(config::nvhttp.file_state, error);
+      nvhttp::test_support::reset_client_state();
+      credentials = test_utils::certificates::generate_ca_credentials("concrete recovery");
+      client_uuid = nvhttp::test_support::add_client("concrete recovery", credentials.x509, true);
+      ASSERT_TRUE(nvhttp::update_client(client_uuid, std::nullopt, permissions::view | permissions::launch));
+      proc::test_support::set_lifetime_snapshot_hook([]() {
+        return proc::lifetime_snapshot_t {};
+      });
+      native_persistence = test_make_watched_persistence();
+      auto manager = std::make_unique<SettingsManager>(devices, std::make_shared<model_audio_t>(), std::make_unique<PersistentState>(native_persistence, true), WinWorkarounds {});
+      test_install_settings_manager(std::move(manager), native_persistence);
+      test_set_retry_interval(10ms);
+      backend = concrete_backend();
+      ASSERT_TRUE(rtsp_stream::set_source_backend([value = backend]() {
+        return value;
+      }));
+      owner = rtsp_stream::test_support::start_owner();
+    }
+
+    void TearDown() override {
+      {
+        std::lock_guard lock {model->mutex};
+        model->api_check_hook = {};
+        model->present.insert("dock");
+        model->present.insert("panel");
+        model->remove_failure = false;
+        model->close_failure = false;
+        model->api_unavailable = false;
+      }
+      for (const auto &launch : launches) {
+        rtsp_stream::launch_session_clear(launch->id);
+      }
+      EXPECT_TRUE(owner_until([]() {
+        rtsp_stream::retry_source_cleanup();
+        const auto state = rtsp_stream::source_snapshot();
+        return !state.managed && !state.recovery_pending;
+      }));
+      owner.reset();
+      EXPECT_TRUE(rtsp_stream::set_source_backend({}));
+      backend.reset();
+      proc::test_support::set_lifetime_snapshot_hook({});
+      nvhttp::test_support::reset_client_state();
+      std::error_code error;
+      std::filesystem::remove(config::nvhttp.file_state, error);
+      config::nvhttp.file_state = previous_client_state;
+      config::sunshine.flags[config::flag::FRESH_STATE] = previous_fresh_state;
+      OwnedDisplayTest::TearDown();
+    }
+
+    bool owner_until(const std::function<bool()> &predicate) {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      do {
+        rtsp_stream::test_support::poll_source();
+        if (predicate()) {
+          return true;
+        }
+        std::this_thread::yield();
+      } while (std::chrono::steady_clock::now() < deadline);
+      return false;
+    }
+
+    std::shared_ptr<rtsp_stream::launch_session_t> token() {
+      const SimpleWeb::CaseInsensitiveMultimap args {{"rikey", "00112233445566778899aabbccddeeff"}, {"rikeyid", "1"}, {"appid", "0"}};
+      auto launch = nvhttp::test_support::make_launch_session(*nvhttp::current_client(client_uuid, credentials.x509), args);
+      launch->appid = 0;
+      launch->app_uuid.clear();
+      launches.push_back(launch);
+      return launch;
+    }
+
+    int prepare(const std::shared_ptr<rtsp_stream::launch_session_t> &launch, display_policy::source_request_t request) {
+      return rtsp_stream::prepare_source_launch(launch, [request = std::make_shared<const display_policy::source_request_t>(std::move(request))](const auto &) {
+        return std::pair {200, request};
+      });
+    }
+
+    display_policy::source_request_t native_request(bool configure = false) {
+      auto request = concrete_request();
+      request.virtual_display = false;
+      if (configure) {
+        request.native_action = display_policy::native_action_e::configure;
+        request.native_configuration = SingleDisplayConfiguration {.m_device_id = "dock", .m_device_prep = SingleDisplayConfiguration::DevicePreparation::VerifyOnly, .m_resolution = Resolution {1280, 720}};
+      }
+      return request;
+    }
+  };
+}  // namespace
+
+TEST_F(ConcreteSourceRecoveryOwnerTest, PublicRetryRestartsStoppedNativeRestorationWithoutClearingPersistence) {
+  auto request = native_request(true);
+  request.restore_delay = 1ms;
+  const auto first = token();
+  ASSERT_EQ(prepare(first, request), 200);
+  const auto generation = first->source_generation;
+  ASSERT_TRUE(native_persistence->load());
+  EXPECT_FALSE(native_persistence->load()->empty());
+  std::promise<void> entered, release;
+  const auto gate = release.get_future().share();
+  auto first_attempt = std::make_shared<std::atomic_bool>(true);
+  {
+    std::lock_guard lock {model->mutex};
+    model->api_check_hook = [first_attempt, gate, &entered]() {
+      if (first_attempt->exchange(false)) {
+        entered.set_value();
+        EXPECT_EQ(gate.wait_for(2s), std::future_status::ready);
+        throw std::runtime_error {"inert native restore failure"};
+      }
+    };
+  }
+  auto unblock = util::fail_guard([&]() {
+    release.set_value();
+  });
+  rtsp_stream::launch_session_clear(first->id);
+  ASSERT_EQ(entered.get_future().wait_for(1s), std::future_status::ready);
+  ASSERT_TRUE(owner_until([]() {
+    const auto state = rtsp_stream::source_snapshot();
+    return !state.managed && state.recovery_pending;
+  }));
+  EXPECT_EQ(prepare(token(), concrete_request()), 503);
+  release.set_value();
+  unblock.disable();
+  ASSERT_TRUE(owner_until([&]() {
+    return backend->status().recovery_retry_required && !rtsp_stream::source_snapshot().busy;
+  }));
+  EXPECT_EQ(backend->status().generation, generation);
+  ASSERT_TRUE(native_persistence->load());
+  EXPECT_FALSE(native_persistence->load()->empty());
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->modes.at("dock").m_resolution, (Resolution {1280, 720}));
+    EXPECT_EQ(model->removals, 0U);
+    model->api_check_hook = {};
+  }
+  EXPECT_FALSE(backend->admits(concrete_request()));
+  rtsp_stream::retry_source_cleanup();
+  ASSERT_TRUE(owner_until([]() {
+    return !rtsp_stream::source_snapshot().recovery_pending;
+  }));
+  ASSERT_TRUE(native_persistence->load());
+  EXPECT_TRUE(native_persistence->load()->empty());
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->modes.at("dock").m_resolution, (Resolution {3840, 2160}));
+    EXPECT_EQ(model->removals, 0U);
+  }
+  EXPECT_FALSE(backend->status().recovery_retry_required);
+  EXPECT_EQ(backend->status().generation, generation);
+  EXPECT_TRUE(backend->admits(concrete_request()));
+  const auto next = token();
+  ASSERT_EQ(prepare(next, concrete_request()), 200);
+  rtsp_stream::launch_session_clear(next->id);
+  ASSERT_TRUE(owner_until([]() {
+    const auto state = rtsp_stream::source_snapshot();
+    return !state.managed && !state.recovery_pending;
+  }));
+  EXPECT_EQ(model->removals, 1U);
+}
+
+TEST_F(ConcreteSourceRecoveryOwnerTest, PublicRetryRestartsRetiredVirtualRestorationAndWaitsForActualPhysicalRecovery) {
+  const auto first = token();
+  auto request = concrete_request();
+  // EnsurePrimary records the dock's real primary/mode obligations before it disappears.
+  // A virtual-only change can legitimately leave no pending settings after fallback recovery.
+  request.topology = config::video_t::dd_t::config_option_e::ensure_primary;
+  ASSERT_EQ(prepare(first, request), 200);
+  const auto generation = first->source_generation;
+  ASSERT_NE(concrete_transaction, nullptr);
+  const auto journal = concrete_transaction->journal();
+  const auto applied = journal->settings();
+  ASSERT_TRUE(applied);
+  SingleDisplayConfigState applied_state;
+  ASSERT_TRUE(fromJson(std::string {applied->begin(), applied->end()}, applied_state));
+  EXPECT_EQ(applied_state.m_modified.m_original_primary_device, "dock");
+  EXPECT_TRUE(applied_state.m_modified.m_original_modes.contains("dock"));
+  auto retired_entered = std::make_shared<std::promise<void>>();
+  const auto entered = retired_entered->get_future();
+  std::promise<void> release;
+  const auto gate = release.get_future().share();
+  auto fail_once = std::make_shared<std::atomic_bool>(true);
+  auto retired_attempts = std::make_shared<std::atomic_uint>(0);
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->primary, "virtual1");
+    model->present.erase("dock");
+    model->active = {{"virtual1"}};
+    model->api_check_hook = [this, fail_once, retired_attempts, retired_entered, gate]() {
+      if (concrete_transaction->status().source_released) {
+        ++*retired_attempts;
+        if (fail_once->exchange(false)) {
+          retired_entered->set_value();
+          gate.wait();
+          throw std::runtime_error {"inert retired B restore failure"};
+        }
+      }
+    };
+  }
+  auto unblock = util::fail_guard([&]() {
+    release.set_value();
+  });
+  rtsp_stream::launch_session_clear(first->id);
+  ASSERT_TRUE(owner_until([&]() {
+    return entered.wait_for(0s) == std::future_status::ready;
+  }));
+  EXPECT_TRUE(concrete_transaction->status().source_released);
+  EXPECT_TRUE(journal->source_retired());
+  EXPECT_EQ(model->removals, 1U);
+  const auto gated = rtsp_stream::source_snapshot();
+  EXPECT_TRUE(gated.managed);
+  EXPECT_TRUE(gated.busy);
+  const auto pending = journal->settings();
+  ASSERT_TRUE(pending);
+  EXPECT_FALSE(pending->empty());
+  SingleDisplayConfigState pending_state;
+  ASSERT_TRUE(fromJson(std::string {pending->begin(), pending->end()}, pending_state));
+  EXPECT_EQ(pending_state.m_initial.m_topology, (ActiveTopology {{"dock"}, {"panel"}}));
+  EXPECT_EQ(pending_state.m_modified.m_topology, (ActiveTopology {{"dock"}}));
+  EXPECT_EQ(pending_state.m_modified.m_original_primary_device, "dock");
+  EXPECT_TRUE(pending_state.m_modified.m_original_modes.contains("dock"));
+  release.set_value();
+  unblock.disable();
+  ASSERT_TRUE(owner_until([&]() {
+    const auto state = rtsp_stream::source_snapshot();
+    return !state.managed && !state.busy && state.recovery_pending && backend->status().recovery_retry_required;
+  }));
+  EXPECT_EQ(backend->status().generation, generation);
+  EXPECT_EQ(model->removals, 1U);
+  EXPECT_EQ(retired_attempts->load(), 1U);
+  EXPECT_EQ(journal->settings(), pending);
+  EXPECT_EQ(prepare(token(), native_request()), 503);
+  EXPECT_FALSE(backend->retry_recovery(generation + 1));
+  const auto before_retry = retired_attempts->load();
+  rtsp_stream::retry_source_cleanup();
+  ASSERT_TRUE(owner_until([&]() {
+    return retired_attempts->load() > before_retry && !backend->status().recovery_retry_required && !rtsp_stream::source_snapshot().busy;
+  }));
+  EXPECT_TRUE(rtsp_stream::source_snapshot().recovery_pending);
+  EXPECT_EQ(backend->status().generation, generation);
+  EXPECT_EQ(journal->record().generation, generation);
+  EXPECT_TRUE(journal->source_retired());
+  ASSERT_TRUE(journal->settings());
+  EXPECT_FALSE(journal->settings()->empty());
+  EXPECT_EQ(journal->settings(), pending);
+  EXPECT_FALSE(backend->admits(native_request()));
+  EXPECT_EQ(model->removals, 1U);
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->active, (ActiveTopology {{"panel"}}));
+    EXPECT_EQ(model->primary, "panel");
+    model->api_check_hook = {};
+    model->present.insert("dock");
+  }
+  ASSERT_TRUE(owner_until([]() {
+    return !rtsp_stream::source_snapshot().recovery_pending;
+  }));
+  EXPECT_TRUE(backend->admits(native_request()));
+  EXPECT_EQ(backend->status().generation, generation);
+  EXPECT_EQ(model->removals, 1U);
+  {
+    std::lock_guard lock {model->mutex};
+    EXPECT_EQ(model->active, (ActiveTopology {{"dock"}, {"panel"}}));
+    EXPECT_TRUE(model->active_device("dock"));
+    EXPECT_EQ(model->primary, "dock");
+  }
+  const auto next = token();
+  ASSERT_EQ(prepare(next, native_request()), 200);
+  rtsp_stream::launch_session_clear(next->id);
+  ASSERT_TRUE(owner_until([]() {
+    const auto state = rtsp_stream::source_snapshot();
+    return !state.managed && !state.recovery_pending;
+  }));
+  EXPECT_EQ(model->removals, 1U);
 }
 #endif

@@ -43,6 +43,12 @@ namespace {
     std::atomic_int begins {0}, validates {0}, probes {0}, restores {0}, cleanups {0}, completes {0};
     std::atomic_bool fail_probe {false}, fail_restore {false}, fail_cleanup {false}, fail_complete {false};
     std::atomic_bool pending_recovery {false};
+    std::atomic_bool enforce_recovery_kind {false}, refresh_recovery {false};
+    std::atomic_uint progresses {0};
+    bool defer_ready_until_progress = false, terminal_progress_failure = false;
+    std::shared_future<void> progress_gate;
+    std::promise<void> progress_entered;
+    std::function<void()> advance_progress_clock;
     std::shared_future<void> begin_gate;
     std::shared_future<void> complete_gate;
     std::promise<void> began;
@@ -57,6 +63,34 @@ namespace {
     bool retained_native_mode_changes = false;
     std::optional<bool> probe_requested_hdr;
     std::chrono::milliseconds observed_delay {};
+
+    bool admits(const display_policy::source_request_t &request) const override {
+      std::lock_guard lock {mutex};
+      return !enforce_recovery_kind || !state.recovery_pending || !state.source || request.virtual_display == (state.source->kind == capture_source_t::kind_e::owned_virtual);
+    }
+
+    void progress(std::uint64_t generation) override {
+      if (defer_ready_until_progress) {
+        if (++progresses == 1) {
+          progress_entered.set_value();
+        }
+        if (progress_gate.valid()) {
+          progress_gate.wait_for(2s);
+        }
+        if (advance_progress_clock) {
+          advance_progress_clock();
+        }
+        std::lock_guard lock {mutex};
+        if (state.generation == generation && !state.source_released) {
+          state.phase = terminal_progress_failure ? source_backend_status_t::phase_e::failed : source_backend_status_t::phase_e::ready;
+        }
+        return;
+      }
+      std::lock_guard lock {mutex};
+      if (refresh_recovery && state.generation == generation && state.source_released) {
+        state.recovery_pending = pending_recovery;
+      }
+    }
 
     bool begin(const display_policy::source_request_t &request, std::uint64_t generation, std::uint64_t epoch) override {
       if (++begins == 1) {
@@ -96,7 +130,7 @@ namespace {
         metadata->observed_hdr = false;
       }
       std::lock_guard lock {mutex};
-      state = {generation, source_backend_status_t::phase_e::ready, false, false, false, metadata};
+      state = {generation, defer_ready_until_progress ? source_backend_status_t::phase_e::preparing : source_backend_status_t::phase_e::ready, false, false, false, metadata};
       return true;
     }
 
@@ -215,9 +249,12 @@ namespace {
     }
 
     void TearDown() override {
+      test_support::set_source_progress_clock({});
       backend->fail_restore = false;
       backend->fail_cleanup = false;
       backend->fail_complete = false;
+      backend->pending_recovery = false;
+      backend->refresh_recovery = true;
       backend->delayed_probe_pin.reset();
       stop_application({});
       for (const auto &token : tokens) {
@@ -225,7 +262,7 @@ namespace {
       }
       EXPECT_TRUE(until([]() {
         retry_source_cleanup();
-        return !source_snapshot().managed;
+        return !source_snapshot().managed && !source_snapshot().recovery_pending;
       }));
       owner.reset();
       EXPECT_TRUE(set_source_backend({}));
@@ -290,6 +327,46 @@ namespace {
       return false;
     }
 
+    void slow_progress_observation(bool terminal_failure) {
+      auto ticks = std::make_shared<std::atomic_llong>(0);
+      test_support::set_source_progress_clock([ticks]() {
+        return std::chrono::steady_clock::time_point {} + std::chrono::milliseconds {ticks->load()};
+      });
+      backend->defer_ready_until_progress = true;
+      backend->terminal_progress_failure = terminal_failure;
+      backend->advance_progress_clock = [ticks]() {
+        ticks->fetch_add(101);
+      };
+      std::promise<void> release;
+      backend->progress_gate = release.get_future().share();
+      auto first = token();
+      auto pending = std::async(std::launch::async, [this, first]() {
+        return prepare(first);
+      });
+      auto unblock = util::fail_guard([&]() {
+        release.set_value();
+      });
+      ASSERT_EQ(backend->progress_entered.get_future().wait_for(1s), std::future_status::ready);
+      auto observation = std::async(std::launch::async, []() {
+        return source_snapshot();
+      });
+      ASSERT_EQ(observation.wait_for(1s), std::future_status::ready);
+      EXPECT_TRUE(observation.get().busy);
+      EXPECT_EQ(pending.wait_for(0ms), std::future_status::timeout);
+      release.set_value();
+      unblock.disable();
+      // Every refresh consumes 101 ms on the injected progress clock. No admission clock or
+      // deadline changes, and barriers rather than arbitrary sleeps control publication.
+      ASSERT_EQ(pending.wait_for(1s), std::future_status::ready);
+      EXPECT_EQ(pending.get(), terminal_failure ? 503 : 200);
+      EXPECT_EQ(backend->progresses, 1U);
+      EXPECT_EQ(backend->probes, terminal_failure ? 0 : 1);
+      launch_session_clear(first->id);
+      ASSERT_TRUE(until([]() {
+        return !source_snapshot().managed && !source_snapshot().recovery_pending;
+      }));
+    }
+
     inline static const std::string app_uuid = "22222222-2222-4222-8222-222222222222";
     std::atomic_bool app_live {false}, app_placeholder {false};
     std::atomic_uint64_t app_instance {21};
@@ -314,6 +391,46 @@ namespace {
     EXPECT_EQ(backend->begins, 1);
     release.set_value();
     EXPECT_EQ(pending.get(), 200);
+  }
+
+  TEST_F(RtspSourceOwnerTest, SlowCompletedProgressPublishesReadyBeforeAnotherRefresh) {
+    slow_progress_observation(false);
+  }
+
+  TEST_F(RtspSourceOwnerTest, SlowCompletedProgressConsumesTerminalFailureBeforeAnotherRefresh) {
+    slow_progress_observation(true);
+  }
+
+  TEST_F(RtspSourceOwnerTest, SlowProgressDoesNotDelayCancellationOrPublishAfterRevocation) {
+    auto ticks = std::make_shared<std::atomic_llong>(0);
+    test_support::set_source_progress_clock([ticks]() {
+      return std::chrono::steady_clock::time_point {} + std::chrono::milliseconds {ticks->load()};
+    });
+    backend->defer_ready_until_progress = true;
+    backend->advance_progress_clock = [ticks]() {
+      ticks->fetch_add(101);
+    };
+    std::promise<void> release;
+    backend->progress_gate = release.get_future().share();
+    auto first = token();
+    auto pending = std::async(std::launch::async, [this, first]() {
+      return prepare(first);
+    });
+    auto unblock = util::fail_guard([&]() {
+      release.set_value();
+    });
+    ASSERT_EQ(backend->progress_entered.get_future().wait_for(1s), std::future_status::ready);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, 0U));
+    ASSERT_EQ(pending.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(pending.get(), 403);
+    EXPECT_TRUE(source_snapshot().busy);
+    release.set_value();
+    unblock.disable();
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().managed && !source_snapshot().recovery_pending;
+    }));
+    EXPECT_EQ(backend->progresses, 1U);
+    EXPECT_EQ(backend->probes, 0);
   }
 
   TEST_F(RtspSourceOwnerTest, DeadlineConsumedByPreflightSkipsBeginAndAllowsReplacementAndShutdown) {
@@ -390,6 +507,9 @@ namespace {
     EXPECT_EQ(backend->begins, 1);
     config::stream.ping_timeout = original_timeout;
     backend->pending_recovery = false;
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().busy;
+    }));
     auto next = token();
     ASSERT_EQ(prepare(next), 200);
     EXPECT_EQ(backend->begins, 2);
@@ -419,6 +539,103 @@ namespace {
     EXPECT_TRUE(test_support::token_authorized(b));
     EXPECT_EQ(source_snapshot().media_pins, 1U);
     EXPECT_EQ(backend->restores, 0);
+  }
+
+  TEST_F(RtspSourceOwnerTest, CrossKindRetiredRecoveryRejectsBeforeNewGenerationOrProcessClaim) {
+    backend->enforce_recovery_kind = true;
+    backend->refresh_recovery = true;
+    for (const bool first_virtual : {false, true}) {
+      backend->pending_recovery = true;
+      auto first_request = std::make_shared<display_policy::source_request_t>(*request());
+      first_request->virtual_display = first_virtual;
+      auto first = token();
+      ASSERT_EQ(prepare(first, first_request), 200);
+      const auto generation = first->source_generation;
+      launch_session_clear(first->id);
+      ASSERT_TRUE(until([]() {
+        return !source_snapshot().managed && !source_snapshot().busy;
+      }));
+      auto opposite = std::make_shared<display_policy::source_request_t>(*request());
+      opposite->virtual_display = !first_virtual;
+      const auto begins = backend->begins.load();
+      EXPECT_EQ(prepare(token(), opposite), 503);
+      EXPECT_EQ(backend->begins, begins);
+      EXPECT_EQ(backend->status().generation, generation);
+      const auto completes = backend->completes.load();
+      backend->pending_recovery = false;
+      ASSERT_TRUE(until([&]() {
+        return backend->completes > completes && !source_snapshot().busy;
+      }));
+      auto second = token();
+      ASSERT_EQ(prepare(second, opposite), 200);
+      EXPECT_EQ(second->source_generation, generation + 1);
+      launch_session_clear(second->id);
+      ASSERT_TRUE(until([]() {
+        return !source_snapshot().managed && !source_snapshot().busy;
+      }));
+    }
+  }
+
+  TEST_F(RtspSourceOwnerTest, RetiredIdleRecoveryCompletesWithoutAReplacementOrRepeatedRemoval) {
+    backend->pending_recovery = true;
+    backend->refresh_recovery = true;
+    auto first = token();
+    ASSERT_EQ(prepare(first), 200);
+    const auto generation = first->source_generation;
+    launch_session_clear(first->id);
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().managed && !source_snapshot().busy;
+    }));
+    EXPECT_EQ(backend->completes, 0);
+    backend->pending_recovery = false;
+    ASSERT_TRUE(until([&]() {
+      return backend->completes == 1 && !source_snapshot().busy;
+    }));
+    EXPECT_EQ(backend->status().generation, generation);
+    EXPECT_EQ(backend->begins, 1);
+    EXPECT_EQ(backend->restores, 1);
+    EXPECT_EQ(backend->cleanups, 1);
+  }
+
+  TEST_F(RtspSourceOwnerTest, RecoveredGenerationSeedIsQuiescentAndDoesNotReuseAnOlderJournalGeneration) {
+    ASSERT_TRUE(seed_source_generation(900));
+    auto first = token();
+    ASSERT_EQ(prepare(first), 200);
+    EXPECT_GE(first->source_generation, 901U);
+    EXPECT_FALSE(seed_source_generation(2000));
+    EXPECT_FALSE(seed_source_generation(UINT64_MAX));
+    launch_session_clear(first->id);
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().managed;
+    }));
+  }
+
+  TEST_F(RtspSourceOwnerTest, IdleCompletionFencesFreshAdmissionWithoutCreatingANewSourceRecord) {
+    backend->pending_recovery = true;
+    backend->refresh_recovery = true;
+    std::promise<void> release;
+    backend->complete_gate = release.get_future().share();
+    auto unblock = util::fail_guard([&]() {
+      release.set_value();
+    });
+    auto first = token();
+    ASSERT_EQ(prepare(first), 200);
+    const auto generation = first->source_generation;
+    launch_session_clear(first->id);
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().managed;
+    }));
+    backend->pending_recovery = false;
+    ASSERT_EQ(backend->completion_started.get_future().wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_EQ(prepare(token()), 503);
+    EXPECT_FALSE(source_snapshot().managed);
+    EXPECT_EQ(backend->status().generation, generation);
+    release.set_value();
+    unblock.disable();
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().recovery_pending;
+    }));
   }
 
   TEST_F(RtspSourceOwnerTest, NativeFirstUsesObservedModeAndForceVirtualJoinKeepsExactNativeOutput) {

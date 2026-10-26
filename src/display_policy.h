@@ -16,6 +16,7 @@
 #include <utility>
 
 // lib includes
+#include <display_device/types.h>
 #include <nlohmann/json.hpp>
 
 // local includes
@@ -215,6 +216,13 @@ namespace display_policy {
     bool operator==(const mode_t &) const = default;
   };
 
+  /** @brief Frozen result of the ordinary parser, preserving disabled fields and tolerant parse failures. */
+  enum class native_action_e {
+    unchanged,  ///< Parsing failed or no native action was supplied; preserve existing configuration.
+    revert,  ///< Configuration was explicitly disabled; schedule ordinary restoration.
+    configure  ///< Apply the copied parsed configuration, including its optional fields.
+  };
+
   /** @brief Source inputs supplied only after host-side admission authorization. */
   struct fresh_source_t {
     admission_e admission = admission_e::video;  ///< Ordinary video or explicitly display-free future admission.
@@ -228,6 +236,8 @@ namespace display_policy {
     bool device_preferences_valid = true;  ///< Invalid persisted settings require repair before fresh preparation.
     mode_t selected_mode;  ///< Modern Sunshine selection after manual/automatic/remapping processing.
     std::optional<bool> requested_hdr;  ///< Actual parsed display HDR mutation, absent when display/HDR configuration is disabled.
+    native_action_e native_action = native_action_e::unchanged;  ///< Ordinary parser outcome, independent of the requested stream mode.
+    std::optional<display_device::SingleDisplayConfiguration> native_configuration;  ///< Full parsed action; absent fields remain disabled.
   };
 
   /** @brief Immutable preparation specification; the later source owner supplies observed device mapping. */
@@ -238,6 +248,8 @@ namespace display_policy {
     std::string edid_serial;  ///< Stable ASCII serial bounded to SudoVDA's 13-byte field.
     mode_t mode;  ///< Requested source mode, not an assertion of observed state.
     std::optional<bool> requested_hdr;  ///< Explicit parsed display setting, separate from stream hint and observed HDR.
+    native_action_e native_action = native_action_e::unchanged;  ///< Frozen ordinary configure/revert/no-change action.
+    std::optional<display_device::SingleDisplayConfiguration> native_configuration;  ///< Exact parsed optional resolution/rate/HDR and device preparation.
     config::video_t::dd_t::config_option_e topology;  ///< Existing Sunshine topology policy.
     std::string adapter_name;  ///< Configured render adapter, to be resolved before acquisition.
     std::string native_output;  ///< Configured native selector; no virtual-acquisition fallback is implied.
@@ -278,11 +290,19 @@ namespace display_policy {
     result.edid_serial = serial.substr(0, 13);
     result.mode = fresh.selected_mode;
     result.requested_hdr = fresh.requested_hdr;
+    result.native_action = fresh.native_action;
+    result.native_configuration = fresh.native_configuration;
     if (fresh.device.resolution) {
       result.mode.resolution = *fresh.device.resolution;
+      if (result.native_configuration) {
+        result.native_configuration->m_resolution = display_device::Resolution {fresh.device.resolution->width, fresh.device.resolution->height};
+      }
     }
     if (fresh.device.refresh_rate) {
       result.mode.refresh_rate = *fresh.device.refresh_rate;
+      if (result.native_configuration) {
+        result.native_configuration->m_refresh_rate = display_device::Rational {fresh.device.refresh_rate->numerator, fresh.device.refresh_rate->denominator};
+      }
     }
     const auto &mode = result.mode;
     if (!mode.resolution.width || !mode.resolution.height || mode.resolution.width > INT32_MAX || mode.resolution.height > INT32_MAX || !mode.refresh_rate.numerator || !mode.refresh_rate.denominator) {

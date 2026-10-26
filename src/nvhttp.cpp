@@ -44,6 +44,10 @@
 #include "uuid.h"
 #include "video.h"
 
+#ifdef _WIN32
+  #include "platform/windows/source_backend.h"
+#endif
+
 using namespace std::literals;
 
 namespace SimpleWeb {
@@ -128,6 +132,7 @@ namespace nvhttp {
     std::function<int()> source_probe_hook;  ///< Fake-only encoder qualification result.
     std::function<void()> source_rollback_hook;  ///< Matching fake cleanup without touching hardware.
     std::function<int()> source_sessions_hook;  ///< Fake-only existing-viewer count for HTTP component fixtures.
+    std::function<std::optional<bool>()> source_availability_hook;  ///< Checked read-only preflight replacement for inert fixtures.
   }  // namespace
 #endif
 
@@ -1634,8 +1639,9 @@ namespace nvhttp {
       };
 
       auto application = std::make_shared<application_operation_t>();
+      auto physical_available = std::make_shared<std::optional<bool>>(true);
       const auto encryption = net::encryption_mode_for_address(request->remote_endpoint().address());
-      auto status = rtsp_stream::prepare_source_launch(session, [session, args, identity, resuming, encryption, &host_audio, application](const rtsp_stream::source_snapshot_t &active) -> std::pair<int, std::shared_ptr<const display_policy::source_request_t>> {
+      auto status = rtsp_stream::prepare_source_launch(session, [session, args, identity, resuming, encryption, &host_audio, application, physical_available](const rtsp_stream::source_snapshot_t &active) -> std::pair<int, std::shared_ptr<const display_policy::source_request_t>> {
         const auto client = current_client(identity.uuid, identity.cert);
         if (!client || !permissions::allows(client->permissions, permissions::view)) {
           return {403, {}};
@@ -1678,6 +1684,10 @@ namespace nvhttp {
           return {200, active.request};
         }
         display_policy::fresh_source_t fresh;
+        if (!*physical_available) {
+          return {503, {}};
+        }
+        fresh.physical_source_available = **physical_available;
         fresh.authenticated_client_uuid = client->uuid;
         fresh.application_uuid = selected.first > 0 ? std::optional {selected.second} : std::nullopt;
         fresh.device = client->display;
@@ -1691,25 +1701,33 @@ namespace nvhttp {
           }
         }
         const auto parsed = display_device::parse_configuration(config::video, *session);
-        if (std::holds_alternative<display_device::failed_to_parse_tag_t>(parsed)) {
-          return {503, {}};
+        bool exact_source_rate = true;
+        if (std::holds_alternative<display_device::configuration_disabled_tag_t>(parsed)) {
+          fresh.native_action = display_policy::native_action_e::revert;
         }
         if (const auto configuration = std::get_if<display_device::SingleDisplayConfiguration>(&parsed)) {
+          fresh.native_action = display_policy::native_action_e::configure;
+          fresh.native_configuration = *configuration;
           if (configuration->m_resolution) {
             fresh.selected_mode.resolution = {configuration->m_resolution->m_width, configuration->m_resolution->m_height};
           }
           if (configuration->m_refresh_rate) {
             const auto rate = std::get_if<display_device::Rational>(&*configuration->m_refresh_rate);
-            if (!rate) {
-              return {503, {}};
+            if (rate) {
+              fresh.selected_mode.refresh_rate = {rate->m_numerator, rate->m_denominator};
+            } else {
+              exact_source_rate = false;
             }
-            fresh.selected_mode.refresh_rate = {rate->m_numerator, rate->m_denominator};
           }
           if (configuration->m_hdr_state) {
             fresh.requested_hdr = *configuration->m_hdr_state == display_device::HdrState::Enabled;
           }
         }
-        return {200, display_policy::resolve(config::video, fresh)};
+        auto source = display_policy::resolve(config::video, fresh);
+        if (source->virtual_display && (!exact_source_rate || std::holds_alternative<display_device::failed_to_parse_tag_t>(parsed))) {
+          return {503, {}};
+        }
+        return {200, std::move(source)};
       },
                                                        [session, application]() {
                                                          if (!application->execute) {
@@ -1723,7 +1741,7 @@ namespace nvhttp {
                                                            proc::proc.terminate_instance(application->instance);
                                                          }
                                                        },
-                                                       [session, file = config::stream.file_apps, identity]() {
+                                                       [session, file = config::stream.file_apps, identity, physical_available]() {
                                                          const auto state = proc::proc.lock_state();
                                                          const auto current = current_client(identity.uuid, identity.cert);
                                                          if (session->source_cancel->load() || !current || current->revision != session->authorization_revision || !permissions::allows(current->permissions, permissions::view)) {
@@ -1732,6 +1750,16 @@ namespace nvhttp {
                                                          const auto refreshed = proc::read_catalog_now(file);
                                                          if (refreshed.status != 200) {
                                                            throw std::runtime_error {"Application catalog refresh failed"};
+                                                         }
+#ifdef SUNSHINE_TESTS
+                                                         if (source_availability_hook) {
+                                                           *physical_available = source_availability_hook();
+                                                         } else
+#endif
+                                                         {
+#ifdef _WIN32
+                                                           *physical_available = platf::source_backend::physical_source_available();
+#endif
                                                          }
                                                        });
       const auto current = current_client(identity.uuid, identity.cert);
@@ -2149,12 +2177,13 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
-    void set_source_preparation_hooks(std::function<void(const rtsp_stream::launch_session_t &)> configure, std::function<int()> probe, std::function<void()> rollback, std::function<int()> sessions) {
+    void set_source_preparation_hooks(std::function<void(const rtsp_stream::launch_session_t &)> configure, std::function<int()> probe, std::function<void()> rollback, std::function<int()> sessions, std::function<std::optional<bool>()> availability) {
       rtsp_stream::catalog_operation([&]() {
         source_configure_hook = std::move(configure);
         source_probe_hook = std::move(probe);
         source_rollback_hook = std::move(rollback);
         source_sessions_hook = std::move(sessions);
+        source_availability_hook = std::move(availability);
       });
     }
 
