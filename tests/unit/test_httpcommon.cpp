@@ -1054,7 +1054,7 @@ protected:
     creation_time  ///< Change an existing-original candidate's creation time.
   };
 
-  HANDLE directory_handle = INVALID_HANDLE_VALUE;  ///< Guard against replacing the owned fixture directory.
+  HANDLE directory_handle = INVALID_HANDLE_VALUE;  ///< Held identity of the uniquely created fixture directory.
   BY_HANDLE_FILE_INFORMATION directory_identity {};  ///< Exact created directory identity.
   std::vector<std::pair<std::filesystem::path, BY_HANDLE_FILE_INFORMATION>> owned;  ///< Exact entries eligible for nonrecursive cleanup.
   std::filesystem::path sentinel, retry;  ///< Fixed leaves; no external fixture paths are accepted.
@@ -1080,10 +1080,39 @@ protected:
     }
   }
 
+  /** @brief Require the current plain directory path and held handle to identify the exact created directory. */
+  bool verified_directory() {
+    if (directory_handle == INVALID_HANDLE_VALUE || !plain_ancestors(directory)) {
+      return false;
+    }
+    BY_HANDLE_FILE_INFORMATION held {}, named {};
+    if (!GetFileInformationByHandle(directory_handle, &held) || !same_identity(directory_identity, held) || !(held.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (held.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+      return false;
+    }
+    HANDLE handle = CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    auto close = util::fail_guard([&]() {
+      EXPECT_TRUE(CloseHandle(handle));
+    });
+    return GetFileInformationByHandle(handle, &named) && same_identity(directory_identity, named) && (named.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(named.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+  }
+
+  /** @brief Change only the owned directory handle mode, checking the exact pathname before and after reopening. */
+  void reopen_directory(DWORD access, DWORD sharing) {
+    ASSERT_TRUE(verified_directory());
+    const auto closing = std::exchange(directory_handle, INVALID_HANDLE_VALUE);
+    ASSERT_TRUE(CloseHandle(closing));
+    directory_handle = CreateFileW(directory.c_str(), access, sharing, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    ASSERT_NE(directory_handle, INVALID_HANDLE_VALUE);
+    ASSERT_TRUE(verified_directory());
+  }
+
   /** @brief Admit only fixed fixture leaves and production temporary names in the guarded directory. */
   bool fixture_path(const std::filesystem::path &path) {
     const auto leaf = path.filename().string();
-    return path.parent_path() == directory && (path == file || path == retry || path == sentinel || leaf.starts_with(file.filename().string() + ".tmp-") || leaf.starts_with(retry.filename().string() + ".tmp-"));
+    return path.parent_path() == directory && (path == file || path == retry || path == sentinel || leaf.starts_with(file.filename().string() + ".tmp-") || leaf.starts_with(retry.filename().string() + ".tmp-")) && verified_directory();
   }
 
   /** @brief Remember a newly observed owned entry without allowing links or reparse objects. */
@@ -1179,6 +1208,10 @@ protected:
 
   /** @brief Distinguish genuine absence from an inaccessible or delete-pending entry. */
   bool missing(const std::filesystem::path &path) {
+    if (!fixture_path(path)) {
+      ADD_FAILURE() << "Absence inspection refused an unverified fixture path";
+      return false;
+    }
     return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND;
   }
 
@@ -1189,7 +1222,7 @@ protected:
     static std::size_t next_fixture = 0;
     directory = parent / ("miranda-state-tunneling-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + "-" + std::to_string(++next_fixture));
     ASSERT_TRUE(CreateDirectoryW(directory.c_str(), nullptr));
-    directory_handle = CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    directory_handle = CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     ASSERT_NE(directory_handle, INVALID_HANDLE_VALUE);
     ASSERT_TRUE(GetFileInformationByHandle(directory_handle, &directory_identity));
     ASSERT_TRUE(directory_identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
@@ -1214,19 +1247,33 @@ protected:
 
   void TearDown() override {
     http::test_support::set_state_file_hook({});
-    for (const auto &[path, identity] : owned) {
-      if (!missing(path)) {
-        remove_owned(path, identity);
-      }
-    }
     if (directory_handle != INVALID_HANDLE_VALUE) {
-      BY_HANDLE_FILE_INFORMATION current {};
-      std::error_code error;
-      if (plain_ancestors(directory) && GetFileInformationByHandle(directory_handle, &current) && same_identity(directory_identity, current) && std::filesystem::is_empty(directory, error) && !error) {
-        FILE_DISPOSITION_INFO disposition {TRUE};
-        EXPECT_TRUE(SetFileInformationByHandle(directory_handle, FileDispositionInfo, &disposition, sizeof(disposition)));
+      if (verified_directory()) {
+        for (const auto &[path, identity] : owned) {
+          if (!missing(path)) {
+            remove_owned(path, identity);
+          }
+        }
+        std::error_code error;
+        if (verified_directory() && std::filesystem::is_empty(directory, error) && !error) {
+          HANDLE deleting = CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+          if (deleting != INVALID_HANDLE_VALUE) {
+            BY_HANDLE_FILE_INFORMATION current {};
+            if (GetFileInformationByHandle(deleting, &current) && same_identity(directory_identity, current) && (current.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(current.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+              FILE_DISPOSITION_INFO disposition {TRUE};
+              EXPECT_TRUE(SetFileInformationByHandle(deleting, FileDispositionInfo, &disposition, sizeof(disposition)));
+            } else {
+              ADD_FAILURE() << "Fixture directory deletion refused an unverified opened identity";
+            }
+            EXPECT_TRUE(CloseHandle(deleting));
+          } else {
+            ADD_FAILURE() << "Fixture directory deletion could not open its known identity";
+          }
+        } else {
+          ADD_FAILURE() << "Fixture cleanup retained an unverified or nonempty directory";
+        }
       } else {
-        ADD_FAILURE() << "Fixture cleanup retained an unverified or nonempty directory";
+        ADD_FAILURE() << "Fixture cleanup refused a substituted or unverified directory path";
       }
       EXPECT_TRUE(CloseHandle(directory_handle));
     }
@@ -1260,6 +1307,7 @@ protected:
 
   /** @brief Record short-alias presence without changing volume settings or printing fixture paths. */
   void record_alias(const std::filesystem::path &path, const std::string &property) {
+    ASSERT_TRUE(fixture_path(path));
     std::array<wchar_t, 32768> name {};
     const auto length = GetShortPathNameW(path.c_str(), name.data(), static_cast<DWORD>(name.size()));
     ASSERT_TRUE(length && length < name.size());
@@ -1436,6 +1484,50 @@ TEST_F(StateFileCreationTimeTunnelingTest, ExistingOriginalCreationTimeMismatchS
   ASSERT_FALSE(HasFailure());
   remember(file, restored->identity);
   expect_sentinel_unchanged();
+}
+
+TEST_F(StateFileCreationTimeTunnelingTest, ParentHandleComparisonRequiresThePermissiveActualWriterToPublish) {
+  ASSERT_TRUE(missing(file));
+  ASSERT_TRUE(missing(retry));
+  reopen_directory(FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE);
+  ASSERT_FALSE(HasFatalFailure());
+  const auto restricted = save(file);
+  reopen_directory(FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+  ASSERT_FALSE(HasFatalFailure());
+  const auto permissive = save(retry);
+  RecordProperty("restricted_writer_saved", restricted.saved ? "true" : "false");
+  RecordProperty("restricted_prepared_observed", restricted.prepared ? "true" : "false");
+  RecordProperty("restricted_close_stage_observed", restricted.closed ? "true" : "false");
+  RecordProperty("restricted_verify_stage_observed", restricted.verified ? "true" : "false");
+  RecordProperty("permissive_writer_saved", permissive.saved ? "true" : "false");
+  ASSERT_TRUE(permissive.saved);
+  ASSERT_TRUE(permissive.prepared.has_value() && permissive.committed.has_value());
+  ASSERT_TRUE(permissive.closed && permissive.verified);
+  expect_components(*permissive.prepared, *permissive.committed);
+  const auto published = capture(retry);
+  ASSERT_TRUE(published.has_value());
+  expect_components(*permissive.committed, *published);
+  EXPECT_EQ(permissive.committed->basic.CreationTime.QuadPart, published->basic.CreationTime.QuadPart);
+  if (restricted.saved) {
+    ASSERT_TRUE(restricted.prepared.has_value() && restricted.committed.has_value());
+    ASSERT_TRUE(restricted.closed && restricted.verified);
+    expect_components(*restricted.prepared, *restricted.committed);
+    const auto old_published = capture(file);
+    ASSERT_TRUE(old_published.has_value());
+    expect_components(*restricted.committed, *old_published);
+    EXPECT_EQ(restricted.committed->basic.CreationTime.QuadPart, old_published->basic.CreationTime.QuadPart);
+  } else {
+    ASSERT_TRUE(restricted.prepared.has_value());
+    EXPECT_TRUE(restricted.closed);
+    EXPECT_FALSE(restricted.verified);
+    EXPECT_FALSE(restricted.committed.has_value());
+    EXPECT_TRUE(missing(file));
+  }
+  expect_sentinel_unchanged();
+  ASSERT_FALSE(HasFailure());
+  if (restricted.saved) {
+    GTEST_SKIP() << "Parent restriction comparison is unexercised: both one-shot actual writer attempts published";
+  }
 }
 
 TEST_F(StateFileTransactionTest, MandatorySelectorsFailClosedWithoutRequiringAuditPrivilege) {

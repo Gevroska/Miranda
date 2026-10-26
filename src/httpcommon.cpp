@@ -213,6 +213,32 @@ namespace http {
       }
     }
 
+    /**
+     * @brief Identify a refused recovery guard without repeating its observation or changing its result.
+     * @tparam Predicate Existing lazy recovery predicate.
+     * @param guard Fixed diagnostic label, never fixture or user data.
+     * @param predicate Existing observation, evaluated once and only when its original branch is reached.
+     * @param native_failure Whether false supplies an immediate native or injected-stage error.
+     * @return The unchanged predicate result; exceptions are identified and rethrown unchanged.
+     */
+    template<class Predicate>
+    bool state_recovery_guard(const char *guard, const Predicate &predicate, bool native_failure = false) {
+      try {
+        const bool matches = predicate();
+        const auto native_error = !matches && native_failure ? GetLastError() : ERROR_SUCCESS;
+        if (!matches) {
+          BOOST_LOG(error) << "State recovery guard refused: "sv << guard;
+          if (native_error != ERROR_SUCCESS) {
+            BOOST_LOG(error) << "State recovery native operation error: "sv << native_error;
+          }
+        }
+        return matches;
+      } catch (...) {
+        BOOST_LOG(error) << "State recovery guard inspection failed: "sv << guard;
+        throw;
+      }
+    }
+
     /** @brief Require a native transaction invariant without exposing native buffers. */
     void state_require(bool success, const char *reason) {
       if (!success) {
@@ -726,7 +752,12 @@ namespace http {
       });
       const auto recover = [&]() {
         if (!attempted) {
-          if ((original && !state_path_matches(destination, *original)) || (initial_captured && !original && !state_missing(destination))) {
+          if ((original && !state_recovery_guard("uncommitted_original", [&]() {
+                 return state_path_matches(destination, *original);
+               })) ||
+              (initial_captured && !original && !state_recovery_guard("uncommitted_absence", [&]() {
+                 return state_missing(destination);
+               }))) {
             return block();
           }
           return false;
@@ -737,20 +768,48 @@ namespace http {
         }
         const bool missing = state_missing(destination);
         const bool known_candidate = prepared && state_path_id(destination, prepared->identity);
-        if (!missing && !known_candidate) {
+        if (!missing && !state_recovery_guard("known_candidate", [&]() {
+              return known_candidate;
+            })) {
           return block();
         }
         if (original) {
-          if (!backup_owned || !state_path_matches(backup, *original) || !state_same(*original, state_capture(original_handle.value, backup)) || !state_stage(state_stage_e::restore, destination, temporary, backup) || !(missing ? state_missing(destination) : state_path_id(destination, prepared->identity)) || !state_path_matches(backup, *original)) {
+          if (!state_recovery_guard("backup_owned", [&]() {
+                return backup_owned;
+              }) ||
+              !state_recovery_guard("backup_snapshot", [&]() {
+                return state_path_matches(backup, *original);
+              }) ||
+              !state_recovery_guard("guarded_original_snapshot", [&]() {
+                return state_same(*original, state_capture(original_handle.value, backup));
+              }) ||
+              !state_recovery_guard("restore_stage", [&]() {
+                return state_stage(state_stage_e::restore, destination, temporary, backup);
+              },
+                                    true) ||
+              !state_recovery_guard("destination_after_restore_stage", [&]() {
+                return missing ? state_missing(destination) : state_path_id(destination, prepared->identity);
+              }) ||
+              !state_recovery_guard("backup_after_restore_stage", [&]() {
+                return state_path_matches(backup, *original);
+              })) {
             return block();
           }
           state_rename(backup, destination, backup, *original, !missing, [&]() {
             return (missing ? state_missing(destination) : state_path_id(destination, prepared->identity)) && state_same(*original, state_capture(original_handle.value, backup));
           });
-          if (!state_path_matches(destination, *original)) {
+          if (!state_recovery_guard("restored_original", [&]() {
+                return state_path_matches(destination, *original);
+              })) {
             return block();
           }
-        } else if (!missing && (!DeleteFileW(destination.c_str()) || !state_missing(destination))) {
+        } else if (!missing && (!state_recovery_guard("initial_candidate_delete", [&]() {
+                     return DeleteFileW(destination.c_str()) != FALSE;
+                   },
+                                                      true) ||
+                                !state_recovery_guard("initial_absence_after_delete", [&]() {
+                                  return state_missing(destination);
+                                }))) {
           return block();
         }
         BOOST_LOG(warning) << "State replacement was rejected; the original state was restored and verified"sv;
@@ -866,6 +925,7 @@ namespace http {
         state_log_failure(failure);
         return block();
       } catch (...) {
+        BOOST_LOG(error) << "State recovery inspection failed outside a named guard"sv;
         return block();
       }
     }
