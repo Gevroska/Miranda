@@ -43,4 +43,10 @@ The separate managed group has four passes and two preparation failures. Its com
 
 ## Delivery
 
+### Hosted process-creation observation
+
+The `4bbedaac` portability repair compiles on the hosted macOS targets, but their full suites expose a real-child executable lookup failure. Windows AMD64 runs 1,317 cases with 1,295 passes, 12 skips and ten failures; the affected managed cases fail during initial child creation before reaching their permission or revocation assertions. Windows ARM64 still reports missing aggregate-field initializers. Flatpak test failures and the remaining platform results require separate diagnosis. These are outstanding failures, not accepted platform coverage.
+
+The reviewed Windows diagnostic captures the native creation error immediately after the API call and preserves existing launch flags, atomic job assignment and token routing. Its test-only observation records primitive error and parent-job metadata. Before the unchanged hosted full suite, a separate helper compares two suspended current-account children in a new owned kill-on-close job, changing only the breakaway flag. It never resumes either initial thread, changes no parent-job policy and refuses to start the tests after uncertain cleanup. The comparison measures creation in that context; it does not establish command execution or explain the original failure by itself. Runtime evidence for this diagnostic remains pending.
+
 Native component integration is complete for the stated source checkpoint. Renewed portability checks and the complete hosted matrix remain outstanding. E2 must implement protected provisioning, recovered-episode adoption, startup/headless ordering and shutdown drain before production factory registration. This prerequisite remains inactive and unreleased.

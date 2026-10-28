@@ -381,6 +381,7 @@ jobs:
             throw 'Configured MSYS2 runtime directory is unavailable'
           }
           $env:PATH = "$runtimeBin;$env:PATH"
+          & (Join-Path $env:GITHUB_WORKSPACE 'tests/scripts/windows-process-creation-diagnostic.ps1')
           & ./test_sunshine.exe --gtest_color=yes --gtest_output=xml:test_results.xml
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE

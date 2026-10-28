@@ -544,9 +544,10 @@ namespace platf {
    * @param cmd The command that was used to launch the process.
    * @param ec A reference to an `std::error_code` object that will store any error that occurred during the launch.
    * @param process_info A reference to a `PROCESS_INFORMATION` structure that contains information about the new process.
+   * @param native_error Error captured immediately after a failed native creation call.
    * @return A `bp::child` object representing the new process, or an empty `bp::child` object if the launch failed.
    */
-  bp::child create_boost_child_from_results(bool process_launched, const std::string &cmd, std::error_code &ec, PROCESS_INFORMATION &process_info) {
+  bp::child create_boost_child_from_results(bool process_launched, const std::string &cmd, std::error_code &ec, PROCESS_INFORMATION &process_info, DWORD native_error) {
     // Use RAII to ensure the process is closed when we're done with it, even if there was an error.
     auto close_process_handles = util::fail_guard([process_launched, process_info]() {
       if (process_launched) {
@@ -566,8 +567,7 @@ namespace platf {
       BOOST_LOG(info) << cmd << " running with PID "sv << child.id();
       return child;
     } else {
-      auto winerror = GetLastError();
-      BOOST_LOG(error) << "Failed to launch process: "sv << winerror;
+      BOOST_LOG(error) << "Failed to launch process: "sv << native_error;
       ec = std::make_error_code(std::errc::invalid_argument);
       // We must NOT attach the failed process here, since this case can potentially be induced by ACL
       // manipulation (denying yourself execute permission) to cause an escalation of privilege.
@@ -1007,7 +1007,7 @@ namespace platf {
     std::wstring start_dir = utf_utils::from_utf8(working_dir.string());
     HANDLE job = group ? group->native_handle() : nullptr;
     STARTUPINFOEXW startup_info = create_startup_info(file, job ? &job : nullptr, ec);
-    PROCESS_INFORMATION process_info;
+    PROCESS_INFORMATION process_info {};
 
     // Clone the environment to create a local copy. Boost.Process (bp) shares the environment with all spawned processes.
     // Since we're going to modify the 'env' variable by merging user-specific environment variables into it,
@@ -1060,8 +1060,10 @@ namespace platf {
       }
     });
 
-    BOOL ret;
-    if (is_running_as_system()) {
+    BOOL ret = FALSE;
+    DWORD native_error = ERROR_SUCCESS;
+    const bool system_caller = is_running_as_system();
+    if (system_caller) {
       // Duplicate the current user's token
       HANDLE user_token = retrieve_users_token(elevated);
       if (!user_token) {
@@ -1086,6 +1088,7 @@ namespace platf {
         std::wstring env_block = create_environment_block(cloned_env);
         std::wstring wcmd = resolve_command_string(cmd, start_dir, user_token, creation_flags);
         ret = CreateProcessAsUserW(user_token, nullptr, (LPWSTR) wcmd.c_str(), nullptr, nullptr, !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES), creation_flags, env_block.data(), start_dir.empty() ? nullptr : start_dir.c_str(), (LPSTARTUPINFOW) &startup_info, &process_info);
+        native_error = ret ? ERROR_SUCCESS : GetLastError();
       });
     }
     // Otherwise, launch the process using CreateProcessW()
@@ -1110,10 +1113,27 @@ namespace platf {
       std::wstring env_block = create_environment_block(cloned_env);
       std::wstring wcmd = resolve_command_string(cmd, start_dir, nullptr, creation_flags);
       ret = CreateProcessW(nullptr, (LPWSTR) wcmd.c_str(), nullptr, nullptr, !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES), creation_flags, env_block.data(), start_dir.empty() ? nullptr : start_dir.c_str(), (LPSTARTUPINFOW) &startup_info, &process_info);
+      native_error = ret ? ERROR_SUCCESS : GetLastError();
     }
 
+#ifdef SUNSHINE_TESTS
+    if (!ret && !ec) {
+      BOOL in_job = FALSE;
+      const bool membership_observed = IsProcessInJob(GetCurrentProcess(), nullptr, &in_job);
+      const DWORD membership_error = membership_observed ? ERROR_SUCCESS : GetLastError();
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+      const bool limits_observed = membership_observed && in_job && QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &limits, sizeof(limits), nullptr);
+      const DWORD limits_error = limits_observed || !membership_observed || !in_job ? ERROR_SUCCESS : GetLastError();
+      BOOST_LOG(debug) << "Native launch observation: api="sv << (system_caller ? "CreateProcessAsUserW" : "CreateProcessW")
+                       << " native_error="sv << native_error << " flags="sv << creation_flags << " target_job="sv << !!job
+                       << " membership_observed="sv << membership_observed << " membership_error="sv << membership_error
+                       << " in_job="sv << !!in_job << " limits_observed="sv << limits_observed << " limits_error="sv << limits_error
+                       << " job_limits="sv << limits.BasicLimitInformation.LimitFlags;
+    }
+#endif
+
     // Use the results of the launch to create a bp::child object
-    return create_boost_child_from_results(ret, cmd, ec, process_info);
+    return create_boost_child_from_results(ret, cmd, ec, process_info, native_error);
   }
 
   /**
