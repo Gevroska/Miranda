@@ -488,6 +488,13 @@ namespace nvhttp {
    */
   namespace test_support {
     /**
+     * @brief Observe a durable authorization update immediately before its real revocation barrier.
+     * @param hook Callback copied under a test-only mutex and invoked after the auth lock is released.
+     * @note Empty restores ordinary execution; callback failures do not skip reconciliation.
+     */
+    void set_client_pre_reconcile_hook(std::function<void()> hook = {});
+
+    /**
      * @brief Substitute fresh-source setup and rollback for protocol fixtures without media hardware.
      * @note Optional session count supplies an explicitly fake existing-viewer scenario, never real display/capture proof.
      */

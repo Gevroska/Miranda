@@ -423,6 +423,18 @@ namespace {
           });
           handler(std::move(response), std::move(request));
         };
+        auto completed = std::make_shared<std::promise<void>>();
+        launch_handler_returned = completed->get_future().share();
+        auto observed = std::make_shared<std::atomic_bool>(false);
+        auto &launch = server->resource["^/launch$"]["GET"];
+        launch = [handler = std::move(launch), completed, observed](auto response, auto request) {
+          auto returned = util::fail_guard([completed, observed]() {
+            if (!observed->exchange(true)) {
+              completed->set_value();
+            }
+          });
+          handler(std::move(response), std::move(request));
+        };
       }
       server->start([this](unsigned short assigned_port) {
         port = assigned_port;
@@ -521,8 +533,12 @@ namespace {
       });
       if (!run_until([&]() {
             return completion->done;
-          }) ||
-          completion->error) {
+          })) {
+        ADD_FAILURE() << "HTTP header read timed out: callback_completed=" << completion->done
+                      << " native_error=" << static_cast<bool>(completion->error) << catalog_failure_markers();
+        return {};
+      }
+      if (completion->error) {
         ADD_FAILURE() << "HTTP header read failed: " << completion->error.message() << catalog_failure_markers();
         return {};
       }
@@ -547,8 +563,12 @@ namespace {
         });
         if (!run_until([&]() {
               return completion->done;
-            }) ||
-            completion->error) {
+            })) {
+          ADD_FAILURE() << "HTTP body read timed out: callback_completed=" << completion->done
+                        << " native_error=" << static_cast<bool>(completion->error) << catalog_failure_markers();
+          return {};
+        }
+        if (completion->error) {
           ADD_FAILURE() << "HTTP body read failed: " << completion->error.message() << catalog_failure_markers();
           return {};
         }
@@ -598,6 +618,7 @@ namespace {
     std::atomic_bool server_loop_returned {false};  ///< Distinguishes executor exit from a blocked handler.
     std::atomic_bool applist_entered {false};  ///< Actual protected callback entry, including authorization.
     std::atomic_bool applist_returned {false};  ///< Actual callback exit, including exception unwinding.
+    std::shared_future<void> launch_handler_returned;  ///< First actual protected launch callback exit, regardless of result.
     std::atomic_uint catalog_stages {0};  ///< Read-only restore, verify and pre-write observations, bits 0-2.
     std::mutex capture_mutex;  ///< Protects metadata produced by the server thread.
     std::vector<std::shared_ptr<rtsp_stream::launch_session_t>> captured_launches;  ///< Metadata guarded by capture_mutex.
@@ -1383,7 +1404,11 @@ namespace {
 
   TEST_F(ManagedHttpsProcessTest, LaunchRightRetainsItsViewingInclusionDuringDeferredExecution) {
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    ASSERT_TRUE(launch_handler_returned.valid());
+    ASSERT_GT(config::stream.ping_timeout.count(), 0);
     auto launching = begin_request(launch_path(app_b.second));
+    ASSERT_EQ(launch_handler_returned.wait_for(config::stream.ping_timeout), std::future_status::ready)
+      << "Real launch preparation did not return within the configured admission limit";
     EXPECT_TRUE(read_response(*launching).contains("status_code=\"200\""));
     const auto current = proc::proc.lifetime_snapshot();
     EXPECT_TRUE(current.tracked);
@@ -1515,25 +1540,59 @@ namespace {
     });
     auto stopping_client = begin_request("/cancel", true);
     ASSERT_EQ(stop_queued->get_future().wait_for(1s), std::future_status::ready);
+    auto persisted = std::make_shared<std::promise<void>>();
+    auto persisted_ready = persisted->get_future();
+    auto proceed = std::make_shared<std::promise<void>>();
+    const auto may_reconcile = proceed->get_future().share();
+    bool reconciliation_released = false;
+    const auto release_reconciliation = [&]() {
+      if (!reconciliation_released) {
+        proceed->set_value();
+        reconciliation_released = true;
+      }
+    };
+    bool command_released = false;
+    const auto release_command = [&]() {
+      if (!command_released) {
+        std::ofstream {gate} << "release";
+        command_released = true;
+      }
+    };
+    // Declared before the future so hook reset cannot race an in-flight callback.
+    auto reset_reconcile_hook = util::fail_guard([]() {
+      nvhttp::test_support::set_client_pre_reconcile_hook();
+    });
+    nvhttp::test_support::set_client_pre_reconcile_hook([persisted, may_reconcile]() {
+      persisted->set_value();
+      may_reconcile.wait();
+    });
     auto revoked = std::async(std::launch::async, [uuid = uuid_a]() {
       return nvhttp::update_client(uuid, std::nullopt, 0U);
     });
-    // Keep release guards after their futures so failure unwinding opens the gate before joining.
-    auto release_before_revocation_join = util::fail_guard([this]() {
-      std::ofstream {gate} << "release";
+    // Release both gates before joining the future on any assertion or exception path.
+    auto release_before_revocation_join = util::fail_guard([&]() {
+      release_reconciliation();
+      release_command();
     });
+    ASSERT_EQ(persisted_ready.wait_for(3s), std::future_status::ready)
+      << "Durable authorization preparation did not finish before the owner check";
+    ASSERT_FALSE(std::filesystem::exists(gate));
+    release_reconciliation();
     ASSERT_EQ(revoked.wait_for(1s), std::future_status::ready);
     EXPECT_TRUE(revoked.get());
+    EXPECT_FALSE(std::filesystem::exists(gate));
+    nvhttp::test_support::set_client_pre_reconcile_hook();
+    reset_reconcile_hook.disable();
     auto shutdown = std::async(std::launch::async, []() {
       rtsp_stream::test_support::stop_owner();
     });
-    auto release_before_shutdown_join = util::fail_guard([this]() {
-      std::ofstream {gate} << "release";
+    auto release_before_shutdown_join = util::fail_guard([&]() {
+      release_command();
     });
     ASSERT_EQ(shutdown_entered->get_future().wait_for(1s), std::future_status::ready);
     EXPECT_FALSE(std::filesystem::exists(gate));
     EXPECT_EQ(shutdown.wait_for(0ms), std::future_status::timeout);
-    std::ofstream {gate} << "release";
+    release_command();
     release_before_shutdown_join.disable();
     release_before_revocation_join.disable();
     ASSERT_EQ(mutation.wait_for(3s), std::future_status::ready);

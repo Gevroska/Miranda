@@ -133,6 +133,8 @@ namespace nvhttp {
     std::function<void()> source_rollback_hook;  ///< Matching fake cleanup without touching hardware.
     std::function<int()> source_sessions_hook;  ///< Fake-only existing-viewer count for HTTP component fixtures.
     std::function<std::optional<bool>()> source_availability_hook;  ///< Checked read-only preflight replacement for inert fixtures.
+    std::mutex client_pre_reconcile_hook_mutex;  ///< Protects publication of the test-only durable-update boundary.
+    std::function<void()> client_pre_reconcile_hook;  ///< Runs after durable authorization publication and auth-lock release.
   }  // namespace
 #endif
 
@@ -2153,6 +2155,20 @@ namespace nvhttp {
       }
     }
     if (authorization_update) {
+#ifdef SUNSHINE_TESTS
+      try {
+        std::function<void()> hook;
+        {
+          std::lock_guard lock {client_pre_reconcile_hook_mutex};
+          hook = client_pre_reconcile_hook;
+        }
+        if (hook) {
+          hook();
+        }
+      } catch (...) {
+        // A test observer must not bypass the actual revocation barrier.
+      }
+#endif
       rtsp_stream::reconcile_client(uuid, cert, destroy);
     }
     return true;
@@ -2177,6 +2193,11 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    void set_client_pre_reconcile_hook(std::function<void()> hook) {
+      std::lock_guard lock {client_pre_reconcile_hook_mutex};
+      client_pre_reconcile_hook = std::move(hook);
+    }
+
     void set_source_preparation_hooks(std::function<void(const rtsp_stream::launch_session_t &)> configure, std::function<int()> probe, std::function<void()> rollback, std::function<int()> sessions, std::function<std::optional<bool>()> availability) {
       rtsp_stream::catalog_operation([&]() {
         source_configure_hook = std::move(configure);
