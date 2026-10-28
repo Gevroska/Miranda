@@ -544,7 +544,16 @@ namespace rtsp_stream {
       const bool guarded = kind == source_work_e::claim || kind == source_work_e::begin || kind == source_work_e::validate || kind == source_work_e::probe || kind == source_work_e::execute;
       const auto launch = guarded && source->admission ? source->admission->launch : nullptr;
       const auto deadline = raised_timer.expiry();
-      auto task = [this, generation, revision, kind, launch, deadline, operation = std::move(operation)]() {
+      auto task = [
+#ifdef SUNSHINE_TESTS
+                    this,
+#endif
+                    generation,
+                    revision,
+                    kind,
+                    launch,
+                    deadline,
+                    operation = std::move(operation)]() {
         int status = 503;
         bool entered = false;
         try {

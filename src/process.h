@@ -15,6 +15,7 @@
 // standard includes
 #include <atomic>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -284,7 +285,11 @@ namespace proc {
     std::uint64_t _managed_source_generation = 0;  ///< A failed older admission cannot unmark a later claimant.
 
     struct publication_t {
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
       std::atomic<std::shared_ptr<const published_snapshot_t>> snapshot {std::make_shared<const published_snapshot_t>()};
+#else
+      std::shared_ptr<const published_snapshot_t> snapshot {std::make_shared<const published_snapshot_t>()};  ///< Accessed only through shared-pointer atomic operations.
+#endif
     };
 
     std::shared_ptr<publication_t> _publication = std::make_shared<publication_t>();

@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -612,6 +613,38 @@ TEST_F(ProcessUpdateTest, LifetimeSnapshotExcludesPlaceboAndDistinguishesApplica
   EXPECT_GT(second.instance, first.instance);
   EXPECT_TRUE(second.placeholder);
   EXPECT_FALSE(second.tracked);
+}
+
+TEST_F(ProcessUpdateTest, PublishedObservationAndBusyUpdatesRemainIndependentOfProcessState) {
+  using observation_t = std::shared_ptr<const proc::published_snapshot_t>;
+  const auto original = proc::proc.published_snapshot();
+  auto prepared = std::make_shared<proc::published_snapshot_t>(*original);
+  prepared->app_name = "Published replacement";
+  const observation_t replacement = std::move(prepared);
+  std::future<std::array<observation_t, 3>> observer;
+  bool ready = false;
+  {
+    const auto process_state = proc::proc.lock_state();
+    observer = std::async(std::launch::async, [replacement]() {
+      const auto initial = proc::proc.published_snapshot();
+      proc::proc.publish_operation(true);
+      const auto busy = proc::proc.published_snapshot();
+      proc::proc.publish_snapshot(replacement);
+      proc::proc.publish_operation(false);
+      return std::array<observation_t, 3> {initial, busy, proc::proc.published_snapshot()};
+    });
+    ready = observer.wait_for(std::chrono::seconds {2}) == std::future_status::ready;
+  }
+  ASSERT_TRUE(ready) << "Pointer publication waited for the process-state guard";
+  const auto observations = observer.get();
+  EXPECT_EQ(observations[0], original);
+  EXPECT_TRUE(observations[1]->operation_in_progress);
+  EXPECT_EQ(observations[1]->app_name, original->app_name);
+  EXPECT_FALSE(observations[2]->operation_in_progress);
+  EXPECT_EQ(observations[2]->app_name, replacement->app_name);
+  EXPECT_EQ(observations[2]->lifetime.instance, original->lifetime.instance);
+  EXPECT_EQ(observations[2]->apps, original->apps);
+  EXPECT_FALSE(original->operation_in_progress);
 }
 
 TEST_F(ProcessUpdateTest, AttemptOutputAndExactRollbackDoNotOwnAnEarlierIncarnation) {

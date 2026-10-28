@@ -26,19 +26,24 @@ Every armed recovery restoration entry uses a phase-independent B validation bou
 
 ## Acceptance and review
 
-Thirty-five authored regressions cover default/missing authority before B or driver access, expected pending versus prior uncertainty, conflicts/residue and changed bytes, real B unarmed/armed-present/armed-absent/retired reconstruction, independent deployment mismatch, unchanged identity/generation/baseline/mapping/settings, no repeated add or adapter selection, exact remove-and-close retirement ordering, partial B and adopted-lease retention, exceptions, competing inputs and same-generation retry. The fifteen correction cases also cover thrown heartbeat creation and repeated creation failure, actual sticky lease state, same-context refusal without losing authority/lease/gate, disabled-watchdog recovery, phase-independent changed/ambiguous mapping refusal before any additional settings mutation, exact present/absent transitions and interrupted first binding. Availability is modeled independently of capture metadata: actual driver GUID absence can progress with matching inactive or transient-active unavailable Windows paths, while an available inactive match refuses before settings mutation. Native primitives and authorization are explicitly injected models; the journal, byte transaction, B settings algorithm and receipt validation are real component code.
+Thirty-five regressions cover missing or denied held authority, pending state versus prior uncertainty, conflicting stores and changed bytes, exact unarmed/armed-present/armed-absent/retired reconstruction, independent deployment mismatch, stable generation/GUID/baseline/mapping/settings, no repeated add or adapter selection, actual receipt ordering, partial ownership retention, exceptions and competing inputs. Correction cases cover heartbeat-creation exceptions, sticky lease liveness, phase-independent retry binding, exact present/absent transitions, interrupted first binding and Windows target availability.
 
-Independent review of the original frozen candidate required corrections for thrown-heartbeat latching and stale recovery binding after callback cancellation. Renewed review closed both by source inspection and identified an availability distinction in absence revalidation. That narrow correction is prepared; renewed affected-source review, formatting and integration validation remain pending. No build, formatter, test executable, driver, VM or streaming campaign was run while preparing this change.
+Independent source review required corrections for heartbeat exception latching, stale retry binding and available versus unavailable all-path entries. Renewed review accepted the resulting source. Locked formatting and the integrated Windows UCRT64 application/test build pass. All 35 new cases pass within the complete affected component, startup and backend suites at source checkpoint `33397e1d20105ab0cab68c60ac9cca5898f74a10`.
 
 ## Validation
 
 | Check / environment | Candidate | Result | Evidence / limitation |
 |---|---|---|---|
-| Source inspection | Working changes on the stated base | Prepared | Narrow contracts and failure ownership inspected by the implementation worker; not independent review |
-| Component regressions | Working changes | Authored, not executed | Requires the coordinator's native Windows build and focused suites |
-| Production provisioning / RTSP adoption / completion | Excluded | Unimplemented | No production authority provider, registration, owner adoption or gate-release transition |
+| Independent source review and formatting | Reconstruction integrated in `33397e1d` | Pass | Reviewed failure ownership and corrections; no production authority provider |
+| Native affected suites | Verified source overlay equivalent to `33397e1d` | 150 component, 30 startup and 14 backend cases pass without skips | Includes all 35 new reconstruction regressions; injected authorization/native boundaries with real journal, transaction and B settings code |
+| Native neighboring suites | Same source overlay | 27 capture, 100 security and 41 source-owner cases pass without skips | Component/integration evidence only; not physical capture or streaming |
+| Managed process/permission suite | Same source overlay | Four passes, two preparation failures | Handler-return admission wait and command-entered prerequisite failed; the latter did not reach publication or revocation assertions. Neither establishes a fresh reconciliation-timeout reproduction |
+| Hosted portability repair | Follow-up to the stated checkpoint | Source review and formatting pass; execution pending | Conditional atomic shared-pointer APIs and test-only owner capture need renewed native/hosted checks; the new publication regression is not yet executed |
+| Production provisioning / RTSP adoption / completion | Excluded | Unimplemented in this prerequisite | No provider, registration, owner adoption or gate-release transition |
 | Driver / VM / physical streaming | Excluded | Unqualified | Injected primitives establish no installed-driver or hardware result |
+
+Earlier incomplete full-suite and process-exit failures remain separate evidence. Later scoped passes do not establish their original causes. The native build uses a verified source overlay and is not a clean committed release build.
 
 ## Delivery
 
-This is an inactive source prerequisite with no publication or release claim. Next actions are independent review, formatting and focused native validation of the integrated candidate. Atomic owner adoption, ordered completion and protected provisioning remain separate bounded work.
+The exact reconstruction prerequisite has passed independent source review and its affected native component checks. It remains inactive and unreleased. Renewed validation of the portability repair and complete hosted matrix remain outstanding. Atomic owner adoption, ordered completion and protected provisioning are separate bounded work.

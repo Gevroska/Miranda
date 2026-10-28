@@ -549,20 +549,33 @@ namespace proc {
   }
 
   std::shared_ptr<const published_snapshot_t> proc_t::published_snapshot() const {
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
     return _publication->snapshot.load();
+#else
+    return std::atomic_load(&_publication->snapshot);
+#endif
   }
 
   void proc_t::publish_snapshot(std::shared_ptr<const published_snapshot_t> snapshot) noexcept {
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
     _publication->snapshot.store(std::move(snapshot));
+#else
+    std::atomic_store(&_publication->snapshot, std::move(snapshot));
+#endif
   }
 
   void proc_t::publish_operation(bool busy) {
-    auto previous = _publication->snapshot.load();
+    auto previous = published_snapshot();
     for (;;) {
       auto next = std::make_shared<published_snapshot_t>(*previous);
       next->operation_in_progress = busy;
       std::shared_ptr<const published_snapshot_t> immutable = std::move(next);
-      if (_publication->snapshot.compare_exchange_weak(previous, immutable)) {
+#if defined(__cpp_lib_atomic_shared_ptr) && __cpp_lib_atomic_shared_ptr >= 201711L
+      const bool published = _publication->snapshot.compare_exchange_weak(previous, immutable);
+#else
+      const bool published = std::atomic_compare_exchange_weak(&_publication->snapshot, &previous, immutable);
+#endif
+      if (published) {
         return;
       }
     }
