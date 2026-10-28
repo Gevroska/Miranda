@@ -3294,8 +3294,8 @@ namespace video {
     encoder.av1.capabilities.set();
 
     // First, test encoder viability
-    config_t config_max_ref_frames = bind_config({1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0, 0});
-    config_t config_autoselect = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0, 0});
+    config_t config_max_ref_frames = bind_config({1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0, 0, {}, {}});
+    config_t config_autoselect = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0, 0, {}, {}});
 
     // If the encoder isn't supported at all (not even H.264), bail early
     reset_display(disp, encoder.platform_formats->dev_type, output_name, config_autoselect);
@@ -3389,7 +3389,7 @@ namespace video {
     // Test HDR and YUV444 support
     {
       auto test_yuv444 = [&](auto &flag_map, auto video_format) {
-        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 1, video_format, 0, 1, 0});
+        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 1, video_format, 0, 1, 0, {}, {}});
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
@@ -3410,7 +3410,7 @@ namespace video {
       };
 
       auto test_yuv420_hdr = [&](auto &flag_map, auto video_format) {
-        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0, 0});
+        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0, 0, {}, {}});
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
@@ -3431,7 +3431,7 @@ namespace video {
       };
 
       auto test_yuv444_hdr = [&](auto &flag_map, auto video_format) {
-        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 1, 0});
+        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 1, 0, {}, {}});
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {

@@ -331,6 +331,25 @@ TEST_F(SourceStartupTest, MissingAndDefaultDeniedRecoveryAuthorityEnterNeitherBN
   }
 }
 
+TEST_F(SourceStartupTest, UnreconstructedOfferRefusalKeepsExactCoordinatorContextAndGateWithoutStorageReopen) {
+  input.owned = encoded(pending_owned().dump());
+  auto coordinator = make();
+  auto recovery = coordinator->reconstruct({});
+  ASSERT_TRUE(recovery);
+  ASSERT_FALSE(recovery->reconstructed());
+  const auto exact = recovery;
+  const auto prior_reads = reads;
+  const auto floor = rtsp_stream::test_support::source_generation_floor();
+  EXPECT_FALSE(rtsp_stream::adopt_source_recovery(recovery));
+  EXPECT_EQ(recovery, exact);
+  EXPECT_EQ(reads, prior_reads);
+  EXPECT_EQ(rtsp_stream::test_support::source_generation_floor(), floor);
+  coordinator.reset();
+  EXPECT_EQ(recovery->generation(), 17u);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  EXPECT_FALSE(reset_persistence());
+}
+
 TEST_F(SourceStartupTest, PriorUncertaintyResidueOrConflictCannotBeReplacedByOwnedPending) {
   for (unsigned int kind = 0; kind < 5; ++kind) {
     test_reset_display_device();

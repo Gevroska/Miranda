@@ -1000,7 +1000,7 @@ namespace {
       return true;
     }
 
-    void make_startup() {
+    void make_startup(std::function<platf::source_startup::coordinator_t::test_storage_t()> read = {}) {
       canonical_path = std::filesystem::absolute(path).lexically_normal();
       canonical_path.make_preferred();
       platf::source_backend::test_dependencies_t dependencies;
@@ -1043,7 +1043,7 @@ namespace {
         }
         return result;
       };
-      startup = platf::source_startup::coordinator_t::test_make({canonical_path, canonical_path.parent_path() / (canonical_path.filename().native() + L".ordinary.state")}, {}, std::move(dependencies));
+      startup = platf::source_startup::coordinator_t::test_make({canonical_path, canonical_path.parent_path() / (canonical_path.filename().native() + L".ordinary.state")}, std::move(read), std::move(dependencies));
     }
 
     std::shared_ptr<platf::source_backend::recovery_context_t> reconstruct() {
@@ -1233,6 +1233,490 @@ namespace {
     }
   };
 }  // namespace
+
+namespace {
+  /** @brief Actual journal/B recovery retained by the real owner; no source factory is registered. */
+  class OwnedRecoveryAdoptionTest: public OwnedReconstructionTest {
+  protected:
+    std::unique_ptr<platf::deinit_t> recovery_owner;
+    std::uint64_t recovery_generation {};
+    std::shared_ptr<const proc::published_snapshot_t> saved_application;
+
+    void SetUp() override {
+      OwnedReconstructionTest::SetUp();
+      saved_application = proc::proc.published_snapshot();
+      proc::proc.publish_snapshot(std::make_shared<const proc::published_snapshot_t>());
+      recovery_owner = rtsp_stream::test_support::start_owner();
+    }
+
+    void TearDown() override {
+      rtsp_stream::test_support::set_owner_hook({});
+      recovery_owner.reset();
+      EXPECT_TRUE(rtsp_stream::test_support::discard_source_recovery());
+      proc::proc.publish_snapshot(std::move(saved_application));
+      OwnedReconstructionTest::TearDown();
+    }
+
+    void prepare_startup() {
+      // Select a new test episode before reconstruction; adoption must preserve this exact value.
+      recovery_generation = rtsp_stream::test_support::source_generation_floor() + 10;
+      auto data = journal_data();
+      data["generation"] = recovery_generation;
+      if (!data["mapping"].is_null()) {
+        data["mapping"]["generation"] = recovery_generation;
+      }
+      write_bytes(data.dump());
+      make_startup();
+      ASSERT_TRUE(reconstruct());
+      ASSERT_TRUE(context->reconstructed());
+    }
+
+    bool owner_until(const std::function<bool(const rtsp_stream::source_snapshot_t &)> &predicate) {
+      const auto deadline = std::chrono::steady_clock::now() + 3s;
+      do {
+        rtsp_stream::test_support::poll_source();
+        if (predicate(rtsp_stream::source_snapshot())) {
+          return true;
+        }
+        std::this_thread::yield();
+      } while (std::chrono::steady_clock::now() < deadline);
+      return false;
+    }
+
+    void reject_changed_after_transfer(bool journal_changed) {
+      ASSERT_TRUE(crash_episode());
+      model->api_unavailable = true;
+      prepare_startup();
+      ASSERT_TRUE(concrete_transaction->cancel(recovery_generation));
+      const auto mutations = model->settings_mutations;
+      rtsp_stream::test_support::set_owner_hook([](std::string_view event) {
+        if (event == "recovery_after_commit") {
+          throw std::runtime_error {"injected timer failure"};
+        }
+      });
+      auto alias = context;
+      ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+      rtsp_stream::test_support::set_owner_hook({});
+      if (journal_changed) {
+        write_bytes("malformed changed journal");
+      } else {
+        std::lock_guard lock {model->mutex};
+        auto changed = model->display("virtual1");
+        changed.monitor_path = L"changed-after-owner-transfer";
+        model->recovery_display_override = changed;
+      }
+      {
+        std::lock_guard lock {model->mutex};
+        model->api_unavailable = false;
+      }
+      rtsp_stream::retry_source_cleanup();
+      ASSERT_TRUE(owner_until([](const auto &state) {
+        return state.cleanup_blocked;
+      }));
+      EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+      EXPECT_FALSE(rtsp_stream::source_snapshot().awaiting_completion);
+      EXPECT_EQ(alias->generation(), recovery_generation);
+      EXPECT_EQ(model->settings_mutations, mutations);
+      EXPECT_EQ(model->removals, 0u);
+      EXPECT_TRUE(model->tick);
+      EXPECT_FALSE(verifier->lifetime.expired());
+      EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+      EXPECT_EQ(b_calls, 1u);
+      EXPECT_EQ(driver_calls, 1u);
+    }
+
+    void stop_after_persistent_timer_failure(bool concurrent_process) {
+      ASSERT_TRUE(crash_episode());
+      model->api_unavailable = true;
+      prepare_startup();
+      const auto exact_context = context.get();
+      std::weak_ptr<platf::source_backend::recovery_context_t> retained = context;
+      std::promise<void> observation_entered, registration_failed, failed_again, stop_entered;
+      std::promise<void> release_observation, process_entered, release_process;
+      const auto observation_gate = release_observation.get_future().share();
+      const auto process_gate = release_process.get_future().share();
+      std::atomic_bool fail_registration {true};
+      std::atomic_uint registrations {};
+      std::future<void> stopping, process;
+      bool observation_released = false, process_released = false, drain_succeeded = false;
+      // Failure cleanup can arrange a healthy registration after assertions stop the case.
+      // It cannot satisfy the bounded drain assertion made with persistent failure enabled.
+      auto cleanup = util::fail_guard([&]() {
+        fail_registration = false;
+        if (!observation_released) {
+          release_observation.set_value();
+        }
+        if (!process_released) {
+          release_process.set_value();
+        }
+        if (!drain_succeeded) {
+          rtsp_stream::retry_source_cleanup();
+        }
+        if (stopping.valid()) {
+          stopping.wait();
+        }
+        if (process.valid()) {
+          process.wait();
+        }
+        rtsp_stream::test_support::set_owner_hook({});
+      });
+      rtsp_stream::test_support::set_owner_hook([&](std::string_view event) {
+        if (event == "recovery_observation_before_progress") {
+          observation_entered.set_value();
+          observation_gate.wait();
+        } else if (event == "adopted_work_timer_before_registration" && fail_registration) {
+          const auto attempt = ++registrations;
+          if (attempt == 1) {
+            registration_failed.set_value();
+          }
+          if (attempt == 2) {
+            failed_again.set_value();
+          }
+          throw std::runtime_error {"persistent timer wait registration failure"};
+        } else if (event == "stop_begin") {
+          stop_entered.set_value();
+        }
+      });
+      ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+      ASSERT_FALSE(context);
+      ASSERT_EQ(observation_entered.get_future().wait_for(1s), std::future_status::ready);
+      ASSERT_EQ(registration_failed.get_future().wait_for(1s), std::future_status::ready);
+      startup.reset();
+      EXPECT_EQ(retained.lock().get(), exact_context);
+      EXPECT_TRUE(rtsp_stream::source_snapshot().cleanup_blocked);
+      EXPECT_TRUE(rtsp_stream::test_support::pending_owner_work());
+      if (concurrent_process) {
+        process = rtsp_stream::process_operation([&]() {
+          process_entered.set_value();
+          process_gate.wait();
+        });
+        ASSERT_EQ(process_entered.get_future().wait_for(1s), std::future_status::ready);
+        ASSERT_EQ(failed_again.get_future().wait_for(1s), std::future_status::ready);
+      }
+      stopping = std::async(std::launch::async, []() {
+        rtsp_stream::test_support::stop_owner();
+      });
+      ASSERT_EQ(stop_entered.get_future().wait_for(1s), std::future_status::ready);
+      EXPECT_EQ(stopping.wait_for(0ms), std::future_status::timeout);
+      release_observation.set_value();
+      observation_released = true;
+      if (concurrent_process) {
+        EXPECT_EQ(stopping.wait_for(30ms), std::future_status::timeout);
+        release_process.set_value();
+        process_released = true;
+      }
+      ASSERT_EQ(stopping.wait_for(1s), std::future_status::ready);
+      stopping.get();
+      drain_succeeded = true;
+      if (process.valid()) {
+        process.get();
+      }
+      EXPECT_FALSE(rtsp_stream::test_support::pending_owner_work());
+      EXPECT_EQ(retained.lock().get(), exact_context);
+      ASSERT_FALSE(retained.expired());
+      EXPECT_EQ(retained.lock()->generation(), recovery_generation);
+      EXPECT_FALSE(retained.lock()->status().source_released);
+      EXPECT_EQ(rtsp_stream::test_support::source_generation_floor(), recovery_generation);
+      EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+      EXPECT_TRUE(rtsp_stream::source_snapshot().cleanup_blocked);
+      EXPECT_TRUE(rtsp_stream::source_snapshot().recovery_pending);
+      EXPECT_FALSE(rtsp_stream::source_snapshot().awaiting_completion);
+      EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+      EXPECT_FALSE(reset_persistence());
+      EXPECT_FALSE(verifier->lifetime.expired());
+      EXPECT_TRUE(model->tick);
+      EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
+      EXPECT_EQ(journal_data().at("generation"), recovery_generation);
+      EXPECT_EQ(model->removals, 0u);
+      EXPECT_EQ(model->additions, 1u);
+      EXPECT_EQ(b_calls, 1u);
+      EXPECT_EQ(driver_calls, 1u);
+      EXPECT_GE(registrations.load(), concurrent_process ? 2u : 1u);
+    }
+
+    void expect_retained_completion(unsigned int expected_removals) {
+      ASSERT_TRUE(owner_until([](const auto &status) {
+        return status.awaiting_completion;
+      }));
+      EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+      EXPECT_TRUE(rtsp_stream::source_snapshot().recovery_pending);
+      EXPECT_FALSE(rtsp_stream::source_snapshot().managed);
+      EXPECT_FALSE(rtsp_stream::source_snapshot().source);
+      EXPECT_EQ(rtsp_stream::test_support::source_generation_floor(), recovery_generation);
+      EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+      EXPECT_FALSE(reset_persistence());
+      EXPECT_FALSE(verifier->lifetime.expired());
+      EXPECT_FALSE(journal_bytes().empty());
+      const auto data = journal_data();
+      EXPECT_EQ(data.at("generation"), recovery_generation);
+      EXPECT_TRUE(data.at("source_retired").get<bool>());
+      EXPECT_EQ(model->removals, expected_removals);
+    }
+  };
+}  // namespace
+
+TEST_F(OwnedRecoveryAdoptionTest, UnarmedActualBStopsBeforeCompletionAndRetainsProofAfterCoordinatorDestruction) {
+  ASSERT_TRUE(crash_episode(false));
+  prepare_startup();
+  const auto backend = platf::source_backend::test_recovery_backend(*context);
+  std::weak_ptr<platf::source_backend::recovery_context_t> weak = context;
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  EXPECT_FALSE(context);
+  startup.reset();
+  EXPECT_FALSE(weak.expired());
+  expect_retained_completion(0);
+  EXPECT_EQ(model->additions, 0u);
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_TRUE(backend->status().restoration_ready);
+  EXPECT_TRUE(backend->status().recovery_pending);
+  EXPECT_FALSE(backend->complete(recovery_generation));
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, FailedDispatchAndStoppedLoopRetainSoleActualContextAuthorityLeaseAndGate) {
+  ASSERT_TRUE(crash_episode());
+  prepare_startup();
+  std::weak_ptr<platf::source_backend::recovery_context_t> retained = context;
+  rtsp_stream::test_support::set_owner_hook([](std::string_view event) {
+    if (event == "recovery_after_commit") {
+      throw std::runtime_error {"injected timer dispatch failure"};
+    }
+  });
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  ASSERT_FALSE(context);
+  startup.reset();
+  EXPECT_FALSE(retained.expired());
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(model->tick);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().cleanup_blocked);
+  EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
+  rtsp_stream::test_support::set_owner_hook({});
+  recovery_owner.reset();
+  EXPECT_FALSE(retained.expired());
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(model->tick);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().recovery_pending);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().cleanup_blocked);
+  EXPECT_FALSE(rtsp_stream::set_source_backend({}));
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  EXPECT_FALSE(reset_persistence());
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_EQ(model->additions, 1u);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, PersistentTimerRegistrationFailureDrainsTheSoleActualRecoveryFutureOnStop) {
+  stop_after_persistent_timer_failure(false);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, PersistentTimerRegistrationFailureDrainsRecoveryAndConcurrentProcessWorkOnStop) {
+  stop_after_persistent_timer_failure(true);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, ArmedPresentUsesActualRemovalReceiptAndNeverReopensBOrCreatesIntent) {
+  ASSERT_TRUE(crash_episode());
+  prepare_startup();
+  const auto identity = journal_data().at("identity");
+  const auto adapter_selections = model->adapter_selections;
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  expect_retained_completion(1);
+  EXPECT_EQ(journal_data().at("identity"), identity);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(model->adapter_selections, adapter_selections);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, ArmedAbsentAdoptionRetiresTheSameEpisodeWithoutRemovingAnotherOutput) {
+  ASSERT_TRUE(crash_episode());
+  {
+    std::lock_guard lock {model->mutex};
+    model->present.erase("virtual1");
+    model->active = {{"dock"}};
+    model->primary = "dock";
+  }
+  prepare_startup();
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  expect_retained_completion(0);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, RetiredActualBContinuesWithoutDriverReacquisitionOrRepeatedRemoval) {
+  ASSERT_TRUE(begin());
+  ASSERT_TRUE(acquire());
+  ASSERT_TRUE(prepare());
+  ASSERT_TRUE(release(1));
+  source.reset();
+  prepare_startup();
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  expect_retained_completion(1);
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_EQ(model->additions, 1u);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, OfferedAndAdoptedAliasesCannotInspectFenceOrReconstructB) {
+  ASSERT_TRUE(crash_episode());
+  prepare_startup();
+  auto alias = context;
+  const auto before = startup->status();
+  std::promise<void> offered, release_offer;
+  const auto gate = release_offer.get_future().share();
+  rtsp_stream::test_support::set_owner_hook([&](std::string_view event) {
+    if (event == "recovery_offer_reserved") {
+      offered.set_value();
+      gate.wait();
+    }
+  });
+  auto adoption = std::async(std::launch::async, [&]() {
+    return rtsp_stream::adopt_source_recovery(context);
+  });
+  auto unblock = util::fail_guard([&]() {
+    release_offer.set_value();
+  });
+  ASSERT_EQ(offered.get_future().wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(startup->inspect().disposition, before.disposition);
+  EXPECT_EQ(startup->reconstruct({canonical_path, verifier}), alias);
+  EXPECT_FALSE(startup->release_for_ordinary());
+  EXPECT_FALSE(rtsp_stream::adopt_source_recovery(alias));
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  release_offer.set_value();
+  unblock.disable();
+  ASSERT_TRUE(adoption.get());
+  rtsp_stream::test_support::set_owner_hook({});
+  EXPECT_EQ(startup->inspect().disposition, before.disposition);
+  EXPECT_EQ(startup->reconstruct({canonical_path, verifier}), alias);
+  EXPECT_FALSE(rtsp_stream::adopt_source_recovery(alias));
+  alias.reset();
+  expect_retained_completion(1);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, CoordinatorOperationInFlightRejectsOfferWithoutWaitingOnOwnerOrChangingFloor) {
+  ASSERT_TRUE(crash_episode());
+  recovery_generation = rtsp_stream::test_support::source_generation_floor() + 10;
+  auto data = journal_data();
+  data["generation"] = recovery_generation;
+  data["mapping"]["generation"] = recovery_generation;
+  write_bytes(data.dump());
+  std::promise<void> entered, release_inspection;
+  auto gate = release_inspection.get_future().share();
+  std::atomic_bool block_next_read {false};
+  make_startup([&]() {
+    if (block_next_read.exchange(false)) {
+      entered.set_value();
+      gate.wait();
+    }
+    platf::source_startup::coordinator_t::test_storage_t observed;
+    observed.owned = {platf::source_startup::store_state_e::completed_empty, journal_bytes()};
+    return observed;
+  });
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  auto alias = context;
+  const auto floor = rtsp_stream::test_support::source_generation_floor();
+  block_next_read = true;
+  auto reconstruction = std::async(std::launch::async, [&]() {
+    return startup->reconstruct({canonical_path, verifier});
+  });
+  auto unblock = util::fail_guard([&]() {
+    release_inspection.set_value();
+  });
+  ASSERT_EQ(entered.get_future().wait_for(1s), std::future_status::ready);
+  EXPECT_FALSE(rtsp_stream::adopt_source_recovery(alias));
+  EXPECT_EQ(alias, context);
+  EXPECT_EQ(rtsp_stream::test_support::source_generation_floor(), floor);
+  release_inspection.set_value();
+  unblock.disable();
+  EXPECT_EQ(reconstruction.get(), context);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, RemovalFailureAndCloseOnlyRetryRetainTheActualLeaseAndIssuedRetirementOrder) {
+  ASSERT_TRUE(crash_episode());
+  prepare_startup();
+  {
+    std::lock_guard lock {model->mutex};
+    model->remove_failure = true;
+  }
+  auto alias = context;
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  ASSERT_TRUE(owner_until([](const auto &state) {
+    return state.cleanup_blocked;
+  }));
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
+  EXPECT_TRUE(model->tick);
+  startup.reset();
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  {
+    std::lock_guard lock {model->mutex};
+    model->remove_failure = false;
+    model->close_failure = true;
+  }
+  rtsp_stream::retry_source_cleanup();
+  ASSERT_TRUE(owner_until([&](const auto &state) {
+    return state.cleanup_blocked && model->removals == 1u;
+  }));
+  EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
+  EXPECT_TRUE(model->tick);
+  {
+    std::lock_guard lock {model->mutex};
+    model->close_failure = false;
+  }
+  rtsp_stream::retry_source_cleanup();
+  expect_retained_completion(1);
+  EXPECT_FALSE(alias->status().source);
+  EXPECT_TRUE(alias->status().source_released);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, ChangedActualMappingAfterTransferCannotAuthorizeSettingsOrRemoval) {
+  reject_changed_after_transfer(false);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, MalformedActualJournalAfterTransferRetainsTheExactBAndLeaseWithoutReopening) {
+  reject_changed_after_transfer(true);
+}
+
+TEST_F(OwnedRecoveryAdoptionTest, UnavailableSettingsAndStickyHeartbeatRetainActualResourcesAndGate) {
+  ASSERT_TRUE(crash_episode());
+  model->api_unavailable = true;
+  prepare_startup();
+  auto alias = context;
+  ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
+  EXPECT_FALSE(rtsp_stream::source_snapshot().awaiting_completion);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+  EXPECT_EQ(model->removals, 0u);
+  std::function<void()> tick;
+  {
+    std::lock_guard lock {model->mutex};
+    model->heartbeat_failure = true;
+    tick = model->tick;
+  }
+  ASSERT_TRUE(tick);
+  tick();
+  ASSERT_TRUE(owner_until([](const auto &state) {
+    return state.cleanup_blocked;
+  }));
+  startup.reset();
+  {
+    std::lock_guard lock {model->mutex};
+    model->heartbeat_failure = false;
+    model->api_unavailable = false;
+  }
+  rtsp_stream::retry_source_cleanup();
+  rtsp_stream::test_support::poll_source();
+  EXPECT_TRUE(alias->status().heartbeat_failed);
+  EXPECT_FALSE(rtsp_stream::source_snapshot().awaiting_completion);
+  EXPECT_TRUE(rtsp_stream::source_snapshot().busy);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
+  EXPECT_EQ(model->removals, 0u);
+}
 
 TEST_F(OwnedReconstructionTest, UnarmedReconstructsRealEpisodeWithoutDriverOrNewIntentAndKeepsGate) {
   ASSERT_TRUE(crash_episode(false));

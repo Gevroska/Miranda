@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <optional>
+#include <stdexcept>
 #include <thread>
 
 // lib imports
@@ -86,6 +88,44 @@ TEST(ProcessTest, PrepareCommand) {
   EXPECT_EQ(proc::prepare_command("flatpak-spawn --host steam"), "flatpak-spawn --host steam");
   EXPECT_EQ(proc::prepare_command(""), "");
 #endif
+}
+
+TEST(ProcessTest, LocalCommandScopeRestoresNestedPreparationModes) {
+  const std::string command = "/bin/sh \"fixture script.sh\"";
+#ifdef SUNSHINE_BUILD_FLATPAK
+  const auto default_command = "flatpak-spawn --host " + command;
+#else
+  const auto default_command = command;
+#endif
+  EXPECT_EQ(proc::prepare_command(command), default_command);
+  {
+    proc::test_support::scoped_local_commands_t local;
+    EXPECT_EQ(proc::prepare_command(command), command);
+    {
+      proc::test_support::scoped_local_commands_t nested;
+      EXPECT_EQ(proc::prepare_command(command), command);
+    }
+    EXPECT_EQ(proc::prepare_command(command), command);
+    {
+      proc::test_support::scoped_local_commands_t host {false};
+      EXPECT_EQ(proc::prepare_command(command), default_command);
+    }
+    EXPECT_EQ(proc::prepare_command(command), command);
+  }
+  EXPECT_EQ(proc::prepare_command(command), default_command);
+}
+
+TEST(ProcessTest, LocalCommandScopeRestoresPreparationAfterException) {
+  const auto default_command = proc::prepare_command("fixture");
+  EXPECT_THROW(
+    {
+      proc::test_support::scoped_local_commands_t local;
+      EXPECT_EQ(proc::prepare_command("fixture"), "fixture");
+      throw std::runtime_error {"fixture failure"};
+    },
+    std::runtime_error
+  );
+  EXPECT_EQ(proc::prepare_command("fixture"), default_command);
 }
 
 class ProcessPNGTest: public BaseTest {  // NOSONAR(cpp:S3656): protected members are intentional for test fixture subclassing
@@ -398,6 +438,8 @@ protected:
 /** @brief Real successful launcher exits observed at deterministic publication boundaries, without a source backend. */
 class ProcessPublicationTest: public ProcessRefreshTest {
 protected:
+  proc::test_support::scoped_local_commands_t local_commands;
+
   void SetUp() override {
     ProcessRefreshTest::SetUp();
     saved_proc = std::move(proc::proc);
@@ -435,12 +477,13 @@ protected:
       app.cmd = "cmd.exe /D /C \"" + script.string() + "\"";
     }
 #else
-    app.cmd = "/bin/true";
     const auto script = test_dir / "publication.sh";
     if (gated) {
       std::ofstream {script} << "while [ ! -e \"$P3C_PUBLICATION_GATE\" ]; do sleep 0.01; done\nexit 0\n";
-      app.cmd = "/bin/sh \"" + script.string() + "\"";
+    } else {
+      std::ofstream {script} << "exit 0\n";
     }
+    app.cmd = "/bin/sh \"" + script.string() + "\"";
 #endif
     std::vector<proc::ctx_t> apps;
     apps.emplace_back(std::move(app));
@@ -672,6 +715,33 @@ TEST_F(ProcessUpdateTest, OldManagementClaimCannotUnmarkReplacementOrLaterClaima
   auto launch = std::make_shared<rtsp_stream::launch_session_t>();
   ASSERT_EQ(proc::proc.execute(42, launch), 0);
   EXPECT_FALSE(proc::proc.restore_source_claim(*old));
+}
+
+TEST_F(ProcessUpdateTest, PublishesExactClaimsAcrossRollbackCatalogAndOperationSnapshots) {
+  const auto instance = proc::proc.lifetime_snapshot().instance;
+  const auto claim = proc::proc.claim_source(instance, 901);
+  ASSERT_TRUE(claim);
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_instance, instance);
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 901u);
+  proc::proc.publish_operation(true);
+  proc::proc.update_apps_and_env(buildNewSource());
+  proc::proc.refresh_published();
+  EXPECT_TRUE(proc::proc.published_snapshot()->operation_in_progress);
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 901u);
+  proc::proc.publish_operation(false);
+  const auto newer = proc::proc.claim_source(instance, 902);
+  ASSERT_TRUE(newer);
+  EXPECT_FALSE(proc::proc.restore_source_claim(*claim));
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 902u);
+  ASSERT_TRUE(proc::proc.restore_source_claim(*newer));
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 901u);
+  ASSERT_TRUE(proc::proc.restore_source_claim(*claim));
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_instance, 0u);
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 0u);
+  ASSERT_TRUE(proc::proc.claim_source(instance, 903));
+  proc::proc.terminate();
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_instance, 0u);
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 0u);
 }
 
 TEST_F(ProcessUpdateTest, UpdateAppsAndEnv_PreservesSessionEnvironment) {
@@ -988,6 +1058,7 @@ TEST(AppCatalogTest, EditorRetainsNestedMetadataAndRefusesAmbiguousLoss) {
  */
 class AppCatalogTransactionTest: public ProcessRefreshTest {
 protected:
+  std::optional<proc::test_support::scoped_local_commands_t> local_commands;
   proc::proc_t saved;
   fs::path file;
 
@@ -1009,6 +1080,7 @@ protected:
     proc::proc.terminate();
     proc::proc = std::move(saved);
     ProcessRefreshTest::TearDown();
+    local_commands.reset();
   }
 
   std::string bytes() const {
@@ -1121,6 +1193,26 @@ TEST_F(AppCatalogTransactionTest, ActiveEditDeletionAndEnvironmentPublicationPre
   EXPECT_EQ(proc::catalog::resolve("-1", captured.second, no_live_apps, captured, true), captured);
   proc::proc.terminate();
   EXPECT_THROW(proc::catalog::resolve("-1", captured.second, no_live_apps, proc::proc.active_identity(), false), proc::catalog::error);
+}
+
+TEST_F(AppCatalogTransactionTest, PreallocatedCatalogPublicationPreservesTheActualSourceClaim) {
+  const auto initial = read();
+  auto session = std::make_shared<rtsp_stream::launch_session_t>();
+  session->surround_info = 2;
+  const auto target = initial["apps"][0];
+  ASSERT_EQ(proc::proc.execute(std::stoi(target["id"].get<std::string>()), session), 0);
+  const auto instance = proc::proc.lifetime_snapshot().instance;
+  const auto claim = proc::proc.claim_source(instance, 701);
+  ASSERT_TRUE(claim);
+  auto edit = target;
+  edit["name"] = "Changed while claimed";
+  const auto result = proc::save_catalog_app(file.string(), initial["revision"], edit.dump());
+  ASSERT_EQ(result.status, 200) << result.body;
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_instance, instance);
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 701u);
+  EXPECT_EQ(proc::proc.published_snapshot()->lifetime.instance, instance);
+  ASSERT_TRUE(proc::proc.restore_source_claim(*claim));
+  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 0u);
 }
 
 #ifdef _WIN32
@@ -1355,6 +1447,7 @@ TEST_F(AppCatalogTransactionTest, OrderedDependentEnvironmentSurvivesNormalizati
 }
 
 TEST_F(AppCatalogTransactionTest, RealExitedChildCleanupSerializesWithProcessLanePublicationAndRunsUndoOnce) {
+  local_commands.emplace();
   // No settings manager is installed: real process cleanup must not configure host displays.
   display_device::test_reset_display_device();
   native_variable_scope parent_marker {"P1C_UNDO_ENVIRONMENT", "parent"};
@@ -1533,6 +1626,7 @@ TEST_F(AppCatalogTransactionTest, CaseVariantOverridesAndDependentLegacyIdentity
 }
 
 TEST_F(AppCatalogTransactionTest, ConfiguredPathSelectsTheExecutableWithInferredAndExplicitWorkingDirectories) {
+  local_commands.emplace();
   display_device::test_reset_display_device();
   const auto configured = fs::absolute(test_dir / "configured bin");
   const auto native = fs::absolute(test_dir / "native-bin");

@@ -26,7 +26,14 @@ namespace platf {
   class deinit_t;
 }
 
+#ifdef _WIN32
+namespace platf::source_backend {
+  class recovery_context_t;
+}
+#endif
+
 namespace rtsp_stream {
+  class rtsp_server_t;
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
 
 #pragma pack(push, 1)
@@ -143,6 +150,7 @@ namespace rtsp_stream {
     bool recovery_pending = false;  ///< Retired library recovery must survive the source.
     std::shared_ptr<const capture_source_t> source;  ///< Verified exact mapping after apply or retained validation.
     bool recovery_retry_required = false;  ///< Retired restoration stopped; waiting for unavailable hardware alone does not set this.
+    bool restoration_ready = false;  ///< Actual B restoration is clear, independently of a retained startup obligation.
   };
 
   /**
@@ -204,12 +212,22 @@ namespace rtsp_stream {
     std::size_t capture_pins {};  ///< Explicit actual-resource lifetimes.
     bool cleanup_blocked = false;  ///< Failed restoration/removal/retirement requires an explicit retry.
     bool recovery_pending = false;  ///< A retired backend still owns physical recovery independently of a source.
+    bool awaiting_completion = false;  ///< Adopted restoration/retirement finished; startup completion remains unavailable.
   };
 
   /** @brief Install an inert-by-default, allocation-only factory at a quiescent boundary; reject replacement while owned. */
   bool set_source_backend(std::function<std::shared_ptr<source_backend_t>()> factory);
-  /** @brief Internal startup seam: reserve all generations through a recovered journal at a quiescent boundary. */
-  bool seed_source_generation(std::uint64_t recovered_generation);
+#ifdef _WIN32
+  /**
+   * @brief Atomically adopt the exact reconstructed startup context on a live, quiescent owner.
+   * @details Consumes the caller reference only after custody and the generation floor commit.
+   * Rejection retains the identical context and floor. Adopted failures remain busy and retained;
+   * this inactive seam cannot complete B or release the startup gate. The owner object must
+   * outlive the retained episode; stopping its executor drains work but retains this custody.
+   * Object/process destruction remains explicit abandonment until shutdown integration exists.
+   */
+  bool adopt_source_recovery(std::shared_ptr<platf::source_backend::recovery_context_t> &context);
+#endif
   /** @brief Return the owner record; never infer source ownership from connection count or process running(). */
   source_snapshot_t source_snapshot();
   /**
@@ -365,6 +383,14 @@ namespace rtsp_stream {
     bool start_media(const std::shared_ptr<launch_session_t> &launch, bool success);
     /** @brief Release fake media after its simulated stop/join/slot removal. */
     void release_media(const std::shared_ptr<launch_session_t> &launch);
+    /** @brief Inspect the actual used generation floor without changing it. */
+    std::uint64_t source_generation_floor();
+    /** @brief Inject revision exhaustion only while no recovery operation is in flight. */
+    bool set_recovery_revision(std::uint64_t revision);
+    /** @brief Inspect retained recovery/process futures and queued process jobs without consuming them. */
+    bool pending_owner_work();
+    /** @brief Discard an inactive fixture after its owner has stopped; never a production completion. */
+    bool discard_source_recovery();
     /** @brief Poll the owner without waiting for a timer in deterministic component fixtures. */
     void poll_source();
     /** @brief Acquire on the owner for delayed resource-lifetime component fixtures. */

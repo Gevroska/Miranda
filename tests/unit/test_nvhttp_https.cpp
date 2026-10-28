@@ -1252,6 +1252,8 @@ namespace {
   /** @brief Real TLS routes, real process state and file-gated commands; no display or capture hardware. */
   class ManagedHttpsProcessTest: public HttpsClientIdentityTest {
   protected:
+    proc::test_support::scoped_local_commands_t local_commands;
+
     void SetUp() override {
       HttpsClientIdentityTest::SetUp();
       previous_proc = std::move(proc::proc);
@@ -1275,7 +1277,9 @@ namespace {
       wait_command = "cmd.exe /D /C \"" + script.string() + "\"";
 #else
       command = "/bin/sleep 60";
-      undo_command = "/bin/true";
+      undo_script = directory / "undo.sh";
+      std::ofstream {undo_script} << "exit 0\n";
+      undo_command = "/bin/sh \"" + undo_script.string() + "\"";
       script = directory / "wait.sh";
       std::ofstream {script} << "printf entered > \"$P3C_ENTERED\"\nwhile [ ! -e \"$P3C_GATE\" ]; do sleep 0.01; done\n";
       wait_command = "/bin/sh \"" + script.string() + "\"";
@@ -1333,7 +1337,7 @@ namespace {
       proc::proc.terminate();
       proc::proc = std::move(previous_proc);
       std::error_code error;
-      for (const auto &file : {gate, entered, script, std::filesystem::path {config::stream.file_apps}}) {
+      for (const auto &file : {gate, entered, script, undo_script, std::filesystem::path {config::stream.file_apps}}) {
         std::filesystem::remove(file, error);
       }
       config::stream.file_apps = previous_file;
@@ -1377,7 +1381,7 @@ namespace {
     proc::proc_t previous_proc;
     std::string previous_file, command, undo_command, wait_command;
     decltype(config::stream.ping_timeout) previous_timeout;
-    std::filesystem::path directory, gate, entered, script;
+    std::filesystem::path directory, gate, entered, script, undo_script;
     proc::catalog::json initial;
     std::pair<int, std::string> app_a, app_b;
     std::uint64_t a_instance {};
@@ -1501,6 +1505,15 @@ namespace {
     const auto changed = proc::save_catalog_app(config::stream.file_apps, initial["revision"], edit.dump());
     ASSERT_EQ(changed.status, 200);
     const auto revision = proc::catalog::parse(changed.body)["revision"].get<std::string>();
+    // Complete A's real cleanup before measuring B's configured-command admission.
+    auto preceding_cleanup = rtsp_stream::process_operation([]() {
+      proc::proc.terminate();
+    });
+    ASSERT_EQ(preceding_cleanup.wait_for(config::stream.ping_timeout), std::future_status::ready)
+      << "The preceding application's cleanup did not finish before the command fixture";
+    preceding_cleanup.get();
+    ASSERT_EQ(undo_count->load(), 1);
+    ASSERT_FALSE(proc::proc.lifetime_snapshot().tracked);
     config::stream.ping_timeout = 1500ms;
     auto expired = std::make_shared<std::promise<void>>();
     rtsp_stream::test_support::set_owner_hook([expired](std::string_view event) {

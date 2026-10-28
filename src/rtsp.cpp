@@ -39,6 +39,10 @@ extern "C" {
 #include "sync.h"
 #include "video.h"
 
+#ifdef _WIN32
+  #include "platform/windows/source_backend.h"
+#endif
+
 namespace asio = boost::asio;
 
 using asio::ip::tcp;
@@ -515,6 +519,49 @@ namespace rtsp_stream {
       std::shared_ptr<std::optional<proc::source_claim_t>> process_claim = std::make_shared<std::optional<proc::source_claim_t>>();  ///< Written only by the drained operation worker.
     };
 
+    enum class recovery_stage_e {
+      restoring,
+      removal_ready,
+      retired,
+      awaiting_completion
+    };
+    enum class recovery_operation_e {
+      observe,
+      restore,
+      retire,
+      retry_retired,
+      complete
+    };
+    enum class recovery_outcome_e {
+      pending,
+      removal_ready,
+      restored,
+      completed,
+      blocked
+    };
+
+    struct recovery_result_t {
+      std::uint64_t generation;  ///< Exact episode fence, never a newly allocated source generation.
+      std::uint64_t revision;  ///< Checked operation fence.
+      recovery_operation_e operation;  ///< Only the sole matching future may advance custody.
+      recovery_outcome_e outcome;
+    };
+
+    /** @brief Sole retained recovery, including failed and completion-withheld startup custody. */
+    struct recovery_record_t {
+#ifdef _WIN32
+      std::shared_ptr<platf::source_backend::recovery_context_t> startup;  ///< Exact startup proof outlives operation-lane ownership.
+#endif
+      std::shared_ptr<source_backend_t> backend;  ///< Actual retained B/lease, never reconstructed during transfer.
+      std::uint64_t generation {}, revision {};  ///< Exact generation and checked operation revision.
+      recovery_stage_e stage = recovery_stage_e::retired;  ///< Outstanding restoration, retirement or completion boundary.
+      recovery_operation_e operation = recovery_operation_e::observe;  ///< Tag required when consuming the sole future.
+      bool adopted = false;  ///< Adopted episodes can neither roll over nor complete in this slice.
+      bool blocked = false, retry_requested = false;  ///< Explicit retry coalesces while one operation is in flight.
+      std::optional<std::future<recovery_result_t>> work;  ///< Never destroyed while an operation is still running.
+      std::chrono::steady_clock::time_point next_progress {};  ///< Polling deadline advances after work finishes.
+    };
+
     /** @brief A capture destructor may only post while this owner's event emitter is alive. */
     struct source_emitter_t {
       std::mutex mutex;
@@ -532,7 +579,7 @@ namespace rtsp_stream {
     /** @brief Return copied source state at the admission ordering point. */
     source_snapshot_t snapshot() const {
       if (!source) {
-        return {.busy = recovery_work.has_value() || recovery_retry_requested, .recovery_pending = static_cast<bool>(recovery_backend)};
+        return {.busy = recovery && (recovery->adopted || recovery->work || recovery->retry_requested), .cleanup_blocked = recovery && recovery->blocked, .recovery_pending = static_cast<bool>(recovery), .awaiting_completion = recovery && recovery->stage == recovery_stage_e::awaiting_completion};
       }
       return {true, source->phase != source_phase_e::ready && source->phase != source_phase_e::retained, source->phase == source_phase_e::retained, source->appid, source->app_uuid, source->application_instance, source->request, source->metadata, source->prepared.size(), source->media.size(), source->capture.size(), source->cleanup_blocked};
     }
@@ -595,23 +642,40 @@ namespace rtsp_stream {
 
     /** @brief Ensure retained-app exit and backend progress are observed even without media workers. */
     void arm_source_timer() {
-      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty() && !recovery_work && (!recovery_backend || stopping))) {
+      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty() && !(recovery && recovery->work) && (!recovery || stopping || recovery->blocked || recovery->stage == recovery_stage_e::awaiting_completion))) {
         return;
       }
-      source_timer_armed = true;
-      source_timer.expires_after(10ms);
-      source_timer.async_wait([this](const boost::system::error_code &error) {
-        source_timer_armed = false;
-        if (!error) {
-          poll_process();
-          poll_preflight();
-          poll_source();
-          poll_retired_recovery();
-          if (source || preflight || process_work || !process_jobs.empty() || (recovery_backend && !stopping) || recovery_work) {
-            arm_source_timer();
-          }
+      try {
+        source_timer.expires_after(10ms);
+        source_timer_armed = true;
+#ifdef SUNSHINE_TESTS
+        if (recovery && recovery->adopted && (recovery->work || process_work)) {
+          notify_owner("adopted_work_timer_before_registration");
         }
-      });
+#endif
+        source_timer.async_wait([this](const boost::system::error_code &error) {
+          source_timer_armed = false;
+          if (!error) {
+            poll_process();
+            poll_preflight();
+            poll_source();
+            poll_retired_recovery();
+            if (source || preflight || process_work || !process_jobs.empty() || (recovery && !stopping && !recovery->blocked && recovery->stage != recovery_stage_e::awaiting_completion) || (recovery && recovery->work)) {
+              arm_source_timer();
+            }
+          }
+        });
+        source_timer_failed = false;
+      } catch (...) {
+        source_timer_armed = false;
+        if (recovery && recovery->adopted) {
+          source_timer_failed = true;
+          recovery->blocked = true;
+          recovery->retry_requested = false;
+          return;
+        }
+        throw;
+      }
     }
 
     /** @brief Finish an HTTPS result exactly once; cancellation must not await native cancellation. */
@@ -731,7 +795,7 @@ namespace rtsp_stream {
         result->set_value(backend_factory && !stopping ? 403 : 503);
         return;
       }
-      if (preflight || recovery_work || recovery_retry_requested || (source && snapshot().busy) || !session_raise(launch)) {
+      if (preflight || (recovery && (recovery->adopted || recovery->work || recovery->retry_requested)) || (source && snapshot().busy) || !session_raise(launch)) {
         result->set_value(503);
         return;
       }
@@ -834,8 +898,8 @@ namespace rtsp_stream {
       if (!retained) {
         std::shared_ptr<source_backend_t> candidate;
         try {
-          candidate = recovery_backend ? recovery_backend : backend_factory();
-          if (!candidate || recovery_work || recovery_retry_requested || !candidate->admits(*planned.second) || next_source_generation == UINT64_MAX) {
+          candidate = recovery ? recovery->backend : backend_factory();
+          if (!candidate || (recovery && (recovery->adopted || recovery->work || recovery->retry_requested)) || !candidate->admits(*planned.second) || next_source_generation == UINT64_MAX) {
             candidate.reset();
           }
         } catch (...) {
@@ -1011,7 +1075,8 @@ namespace rtsp_stream {
           }
         } else if (result.kind == source_work_e::complete) {
           if (result.status == 200) {
-            recovery_backend.reset();
+            recovery.reset();
+            published_recovery_generation = 0;
             source.reset();
             finish_stop();
             return;
@@ -1178,10 +1243,11 @@ namespace rtsp_stream {
         source->cleanup_blocked = true;
         return;
       }
-      recovery_backend = source->backend;
-      recovery_generation = source->generation;
-      recovery_blocked = false;
-      recovery_retry_requested = false;
+      auto retained = std::make_unique<recovery_record_t>();
+      retained->backend = source->backend;
+      retained->generation = source->generation;
+      recovery = std::move(retained);
+      published_recovery_generation = source->generation;
       if (status.recovery_pending) {
         source.reset();
         finish_stop();
@@ -1194,51 +1260,112 @@ namespace rtsp_stream {
       });
     }
 
-    /** @brief Continue a retired recovery episode on the operation lane, fencing admissions during completion. */
+    /** @brief Serialize tagged recovery work off-owner; startup custody stops before B completion. */
     void poll_retired_recovery() {
-      if (recovery_work) {
-        if (recovery_work->wait_for(0ms) != std::future_status::ready) {
+      if (recovery && recovery->work) {
+        if (recovery->work->wait_for(0ms) != std::future_status::ready) {
           return;
         }
-        const auto result = recovery_work->get();
-        recovery_work.reset();
-        if (result == 1) {
-          recovery_backend.reset();
-          recovery_generation = 0;
-          recovery_retry_requested = false;
-        } else if (result < 0) {
-          recovery_blocked = !recovery_retry_requested;
+        const auto result = recovery->work->get();
+        recovery->work.reset();
+        if (result.generation != recovery->generation || result.revision != recovery->revision || result.operation != recovery->operation) {
+          recovery->blocked = true;
+          finish_stop();
+          return;
+        }
+        recovery->next_progress = source_progress_now() + 100ms;
+        if (result.outcome == recovery_outcome_e::completed && !recovery->adopted) {
+          recovery.reset();
+          published_recovery_generation = 0;
+        } else if (result.outcome == recovery_outcome_e::blocked) {
+          recovery->blocked = !recovery->retry_requested;
+        } else if (result.outcome == recovery_outcome_e::restored) {
+          recovery->stage = recovery->adopted ? recovery_stage_e::awaiting_completion : recovery_stage_e::retired;
+          if (recovery->adopted) {
+            recovery->retry_requested = false;
+          }
+        } else if (result.outcome == recovery_outcome_e::removal_ready) {
+          recovery->stage = recovery_stage_e::removal_ready;
+          recovery->next_progress = {};
         }
         finish_stop();
+        if (stopped) {
+          return;
+        }
       }
-      if (source || preflight || stopping || !recovery_backend || recovery_blocked || std::chrono::steady_clock::now() < next_recovery_progress) {
+      if (source || preflight || stopping || !recovery || recovery->blocked || recovery->stage == recovery_stage_e::awaiting_completion || source_progress_now() < recovery->next_progress) {
         return;
       }
-      const auto backend = recovery_backend;
-      const auto generation = recovery_generation.load();
-      const auto retry = std::exchange(recovery_retry_requested, false);
-      next_recovery_progress = std::chrono::steady_clock::now() + 100ms;
-      recovery_work.emplace(std::async(std::launch::async, [backend, generation, retry]() {
-        try {
-          if (retry && !backend->retry_recovery(generation)) {
-            return -1;
-          }
-          backend->progress(generation);
-          const auto state = backend->status();
-          if (state.generation != generation || !state.source_released) {
-            return -1;
-          }
-          if (state.recovery_retry_required) {
-            return -1;
-          }
-          if (state.recovery_pending) {
-            return 0;
-          }
-          return backend->complete(generation) ? 1 : -1;
-        } catch (...) {
-          return -1;
-        }
-      }));
+      if (recovery->revision == UINT64_MAX) {
+        recovery->blocked = true;
+        recovery->retry_requested = false;
+        return;
+      }
+      const auto backend = recovery->backend;
+      const auto generation = recovery->generation;
+      const auto adopted = recovery->adopted;
+      const auto state = backend->status();
+      if (state.generation != generation || state.heartbeat_failed) {
+        recovery->blocked = true;
+        return;
+      }
+      auto operation = recovery_operation_e::observe;
+      if (std::exchange(recovery->retry_requested, false)) {
+        operation = state.source_released ? recovery_operation_e::retry_retired : recovery->stage == recovery_stage_e::removal_ready ? recovery_operation_e::retire :
+                                                                                                                                       recovery_operation_e::restore;
+      } else if (adopted && recovery->stage == recovery_stage_e::removal_ready) {
+        operation = recovery_operation_e::retire;
+      } else if (!adopted && state.source_released && !state.recovery_pending && !state.recovery_retry_required) {
+        operation = recovery_operation_e::complete;
+      }
+      const auto revision = ++recovery->revision;
+      recovery->operation = operation;
+      try {
+#ifdef SUNSHINE_TESTS
+        notify_owner("recovery_before_dispatch");
+#endif
+        recovery->work.emplace(std::async(std::launch::async, [backend, generation, revision, operation, adopted
+#ifdef SUNSHINE_TESTS
+                                                               ,
+                                                               this
+#endif
+        ]() {
+          auto outcome = recovery_outcome_e::blocked;
+          try {
+            bool ok = true;
+            if (operation == recovery_operation_e::restore)
+              ok = backend->restore(generation, 0ms);
+            else if (operation == recovery_operation_e::retire)
+              ok = backend->cleanup_and_retire(generation);
+            else if (operation == recovery_operation_e::retry_retired)
+              ok = backend->retry_recovery(generation);
+            else if (operation == recovery_operation_e::complete)
+              ok = !adopted && backend->complete(generation);
+            if (ok && operation == recovery_operation_e::complete) {
+              outcome = recovery_outcome_e::completed;
+            } else if (ok) {
+#ifdef SUNSHINE_TESTS
+              if (operation == recovery_operation_e::observe)
+                notify_owner("recovery_observation_before_progress");
+#endif
+              backend->progress(generation);
+              const auto current = backend->status();
+              if (current.generation == generation && !current.heartbeat_failed && !current.recovery_retry_required && current.phase != source_backend_status_t::phase_e::failed) {
+                if (adopted && current.source_released && current.restoration_ready)
+                  outcome = recovery_outcome_e::restored;
+                else if (adopted && !current.source_released && current.phase == source_backend_status_t::phase_e::removal_ready)
+                  outcome = recovery_outcome_e::removal_ready;
+                else if (adopted || current.source_released)
+                  outcome = recovery_outcome_e::pending;
+              }
+            }
+          } catch (...) {}
+          return recovery_result_t {generation, revision, operation, outcome};
+        }));
+      } catch (...) {
+        // Custody is already committed. Dispatch failure retains the actual context and gate.
+        recovery->blocked = true;
+      }
     }
 
     /** @brief Recheck authorization before publishing ready; only a tracked app may extend source lifetime. */
@@ -1294,20 +1421,75 @@ namespace rtsp_stream {
 
     /** @brief Configure the injection seam only while no source or operation owns the backend. */
     bool set_backend(std::function<std::shared_ptr<source_backend_t>()> factory) {
-      if (source || preflight || recovery_backend || session_count() || launch_event.view(0s)) {
+      if (source || preflight || recovery || session_count() || launch_event.view(0s)) {
         return false;
       }
       backend_factory = std::move(factory);
       return true;
     }
 
-    bool seed_generation(std::uint64_t generation) {
-      if (source || preflight || recovery_work || recovery_retry_requested || session_count() || launch_event.view(0s) || generation == UINT64_MAX) {
+#ifdef _WIN32
+    /** @brief Commit only preallocated state at the live owner's single admission ordering point. */
+    bool adopt_recovery(std::unique_ptr<recovery_record_t> &candidate) {
+      if (!running || stopping || source || preflight || recovery || process_work || !process_jobs.empty() || pending_process_posts || pending_admissions || liveness_queued || session_count() || launch_event.view(0s)) {
         return false;
       }
-      next_source_generation = std::max(next_source_generation.load(), generation);
+      for (const auto &weak : tokens) {
+        const auto token = weak.lock();
+        if (token && !token->cancelled && !token->admitted) {
+          return false;
+        }
+      }
+      const auto application = proc::proc.published_snapshot();
+      if (application->operation_in_progress || application->lifetime.appid > 0 || application->lifetime.tracked || application->lifetime.placeholder || application->managed_source_instance || application->managed_source_generation) {
+        return false;
+      }
+      const auto generation = candidate->generation;
+      const auto state = candidate->backend->status();
+      if (!candidate->startup->reconstructed() || !generation || generation == UINT64_MAX || generation <= next_source_generation || state.generation != generation || state.source || !candidate->startup->adopt_offer()) {
+        return false;
+      }
+      // These nonthrowing moves commit custody and the used-generation floor together.
+      next_source_generation = generation;
+      published_recovery_generation = generation;
+      recovery = std::move(candidate);
+      try {
+  #ifdef SUNSHINE_TESTS
+        notify_owner("recovery_after_commit");
+  #endif
+        arm_source_timer();
+      } catch (...) {
+        recovery->blocked = true;
+      }
       return true;
     }
+
+    bool dispatch_adoption(std::unique_ptr<recovery_record_t> candidate) {
+      if (on_owner()) {
+        return false;
+      }
+      auto task = std::make_shared<std::packaged_task<bool()>>([this, candidate = std::move(candidate)]() mutable {
+        return adopt_recovery(candidate);
+      });
+      auto result = task->get_future();
+      {
+        std::lock_guard lock {lifecycle_mutex};
+        if (!running || stopping) {
+          return false;
+        }
+        asio::post(io_context, [task]() {
+          (*task)();
+        });
+      }
+  #ifdef SUNSHINE_TESTS
+      // A posted offer must always await its custody result, even if a fixture observer fails.
+      try {
+        notify_owner("recovery_adoption_posted");
+      } catch (...) {}
+  #endif
+      return result.get();
+    }
+#endif
 
     bool has_backend() const {
       return static_cast<bool>(backend_factory);
@@ -1384,7 +1566,12 @@ namespace rtsp_stream {
         });
         (*task)();
       } else {
+        ++pending_process_posts;
+        auto failed_post = util::fail_guard([&]() {
+          --pending_process_posts;
+        });
         asio::post(io_context, [this, task]() {
+          --pending_process_posts;
 #ifdef SUNSHINE_TESTS
           notify_owner("process_operation_queued");
 #endif
@@ -1392,6 +1579,7 @@ namespace rtsp_stream {
             (*task)();
           });
         });
+        failed_post.disable();
       }
       return result;
     }
@@ -1491,22 +1679,26 @@ namespace rtsp_stream {
     /** @brief Recovery must remain postable while shutdown is draining, without waiting on its fence. */
     void post_retry_cleanup() {
       const auto generation = next_source_generation.load();
-      const auto retired_generation = recovery_generation.load();
+      const auto retired_generation = published_recovery_generation.load();
       asio::post(io_context, [this, generation, retired_generation]() {
         if (source && source->generation == generation) {
           retry_cleanup();
-        } else if (!source && recovery_backend && recovery_generation == retired_generation) {
-          recovery_blocked = false;
-          recovery_retry_requested = true;
-          next_recovery_progress = {};
+        } else if (!source && recovery && recovery->generation == retired_generation && recovery->stage != recovery_stage_e::awaiting_completion && recovery->revision != UINT64_MAX) {
+          recovery->blocked = false;
+          recovery->retry_requested = true;
+          recovery->next_progress = {};
           arm_source_timer();
         }
       });
     }
 
-    /** @brief Shutdown drains source completion events and capture releases before stopping its executor. */
+    /**
+     * @brief Drain accepted operations before stopping the executor, retaining adopted custody.
+     * @details An adopted record remains owned by this server after loop shutdown. Stopping is
+     * neither recovery completion nor gate release; the server object must outlive the episode.
+     */
     void finish_stop() {
-      if (!stopping || source || preflight || process_work || !process_jobs.empty() || recovery_work || !shutdown_completion) {
+      if (!stopping || source || preflight || process_work || !process_jobs.empty() || pending_process_posts || (recovery && recovery->work) || !shutdown_completion) {
 #ifdef SUNSHINE_TESTS
         if (stopping && !source && !preflight && process_work) {
           notify_owner("stop_process_work_pending");
@@ -1648,7 +1840,7 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
-      if (stopping || launch_event.view(0s) || !authorized(*launch_session, false)) {
+      if (stopping || (recovery && recovery->adopted) || launch_event.view(0s) || !authorized(*launch_session, false)) {
         return false;
       }
       tokens.emplace_back(launch_session);
@@ -1706,7 +1898,7 @@ namespace rtsp_stream {
      * @return Whether this is its first currently authorized ANNOUNCE.
      */
     bool claim(launch_session_t &session) {
-      if (session.admitted || !authorized(session)) {
+      if ((recovery && recovery->adopted) || session.admitted || !authorized(session)) {
         return false;
       }
       session.admitted = true;
@@ -1904,6 +2096,25 @@ namespace rtsp_stream {
      * @brief Runs an iteration of the RTSP server loop
      */
     void iterate() {
+      if (recovery && recovery->adopted && (source_timer_failed || stopping) && (recovery->work || process_work || !process_jobs.empty() || pending_process_posts)) {
+        // The owner loop itself drains accepted futures if timer registration remains unavailable.
+        // Keep executor work alive through Stop closing the listener; the finite wait is only for
+        // event dispatch, and the existing polls never wait for backend or process completion.
+        if (io_context.stopped()) {
+          io_context.restart();
+        }
+        auto drain_guard = asio::make_work_guard(io_context);
+        io_context.run_one_for(10ms);
+        if (stopped) {
+          return;
+        }
+        poll_process();
+        if (stopped) {
+          return;
+        }
+        poll_retired_recovery();
+        return;
+      }
       // If we have a session, we will return to the server loop every
       // 500ms to allow session cleanup to happen.
       if (session_count() > 0) {
@@ -1993,6 +2204,32 @@ namespace rtsp_stream {
       std::lock_guard observer {owner_hook_mutex};
       owner_hook = {};
       source_progress_clock = {};
+      source_timer_failed = false;
+    }
+
+    bool test_pending_owner_work() const {
+      return (recovery && recovery->work) || process_work || !process_jobs.empty() || pending_process_posts;
+    }
+
+    std::uint64_t test_generation_floor() const {
+      return next_source_generation;
+    }
+
+    bool test_recovery_revision(std::uint64_t revision) {
+      if (!recovery || recovery->work) {
+        return false;
+      }
+      recovery->revision = revision;
+      return true;
+    }
+
+    bool test_discard_recovery() {
+      if (running || (recovery && recovery->work)) {
+        return false;
+      }
+      recovery.reset();
+      published_recovery_generation = 0;
+      return true;
     }
 
     auto test_work_guard() {
@@ -2000,6 +2237,7 @@ namespace rtsp_stream {
     }
 #endif
 
+    std::atomic_uint pending_admissions {0};  ///< Includes requests queued before their owner admission callback.
     std::atomic_bool stopping {false};
     std::atomic_bool stopped {false};  ///< Owner loop termination follows the serialized stop operation.
 
@@ -2013,17 +2251,15 @@ namespace rtsp_stream {
     boost::asio::steady_timer raised_timer {io_context};
     boost::asio::steady_timer source_timer {io_context};  ///< Staged backend polling and retained-app liveness.
     bool source_timer_armed = false;
+    bool source_timer_failed = false;  ///< Independent owner-loop draining survives persistent timer-registration failure.
     std::optional<source_record_t> source;  ///< The sole owner of source accounting; metadata owns no capture pin.
     std::shared_ptr<preflight_t> preflight;  ///< Reservation and owned refresh continuation; no backend effect yet.
     std::deque<std::function<void()>> process_jobs;  ///< Owner-ordered process/catalog mutations and observations.
     std::optional<std::future<void>> process_work;  ///< Sole in-flight process operation, always polled.
     std::atomic_bool liveness_queued {false};
-    std::shared_ptr<source_backend_t> recovery_backend;  ///< Retired unavailable-display recovery outlives a source.
-    std::atomic_uint64_t recovery_generation {0};  ///< Retired logical generation remains fenced after the source is dropped.
-    std::optional<std::future<int>> recovery_work;  ///< Sole retired operation, never concurrent with a new source.
-    bool recovery_blocked = false;  ///< Failed completion requires an explicit retry.
-    bool recovery_retry_requested = false;  ///< A generation-fenced public request survives an in-flight observation and restarts stopped work.
-    std::chrono::steady_clock::time_point next_recovery_progress {};  ///< Bound idle polling while recovery waits for hardware.
+    std::unique_ptr<recovery_record_t> recovery;  ///< Exact backend and optional startup proof remain owned across blocked states.
+    std::atomic_uint64_t published_recovery_generation {0};  ///< Inert retry fence; the record owns its authoritative generation.
+    std::atomic_uint pending_process_posts {0};  ///< Requests accepted before their owner enqueue callback.
     std::function<std::shared_ptr<source_backend_t>()> backend_factory;  ///< Empty until explicitly integrated and qualified.
     std::shared_ptr<source_emitter_t> source_emitter = std::make_shared<source_emitter_t>();
     std::atomic_uint64_t next_source_generation {0};
@@ -2046,11 +2282,35 @@ namespace rtsp_stream {
     });
   }
 
-  bool seed_source_generation(std::uint64_t recovered_generation) {
-    return server.sync([recovered_generation]() {
-      return server.seed_generation(recovered_generation);
+#ifdef _WIN32
+  bool adopt_source_recovery(std::shared_ptr<platf::source_backend::recovery_context_t> &context) {
+    if (!context || server.on_owner() || !context->offer()) {
+      return false;
+    }
+    const auto retained = context;
+    auto withdraw = util::fail_guard([&]() {
+      retained->withdraw_offer();
     });
+    try {
+  #ifdef SUNSHINE_TESTS
+      server.notify_owner("recovery_offer_reserved");
+  #endif
+      auto candidate = std::make_unique<rtsp_server_t::recovery_record_t>();
+      candidate->startup = retained;
+      candidate->backend = retained->offered_backend();
+      candidate->generation = retained->generation();
+      candidate->adopted = true;
+      candidate->stage = rtsp_server_t::recovery_stage_e::restoring;
+      if (!candidate->backend || !server.dispatch_adoption(std::move(candidate))) {
+        return false;
+      }
+      context.reset();
+      return true;
+    } catch (...) {
+      return false;
+    }
   }
+#endif
 
   bool has_source_backend() {
     return server.sync([]() {
@@ -2069,6 +2329,10 @@ namespace rtsp_stream {
   }
 
   int prepare_source_launch(std::shared_ptr<launch_session_t> launch, std::function<std::pair<int, std::shared_ptr<const display_policy::source_request_t>>(const source_snapshot_t &)> plan, std::function<int()> execute, std::function<void()> rollback, std::function<void()> refresh) {
+    ++server.pending_admissions;
+    auto admission_done = util::fail_guard([]() {
+      --server.pending_admissions;
+    });
     if (server.on_owner()) {
       return 503;
     }
@@ -2092,6 +2356,10 @@ namespace rtsp_stream {
    * @brief Queue a launch session until the RTSP client connects.
    */
   bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    ++server.pending_admissions;
+    auto admission_done = util::fail_guard([]() {
+      --server.pending_admissions;
+    });
     return server.sync([&]() {
       launch_session->ready = true;
       return server.session_raise(launch_session);
@@ -2099,6 +2367,10 @@ namespace rtsp_stream {
   }
 
   int prepare_launch(std::shared_ptr<launch_session_t> launch_session, std::function<int()> prepare, std::function<void()> rollback) {
+    ++server.pending_admissions;
+    auto admission_done = util::fail_guard([]() {
+      --server.pending_admissions;
+    });
     return server.sync([&]() {
       if (server.process_busy()) {
         return 503;
@@ -2336,6 +2608,30 @@ namespace rtsp_stream {
     void release_media(const std::shared_ptr<launch_session_t> &launch) {
       server.sync([launch]() {
         server.release_source_pin(*launch, true);
+      });
+    }
+
+    std::uint64_t source_generation_floor() {
+      return server.sync([]() {
+        return server.test_generation_floor();
+      });
+    }
+
+    bool set_recovery_revision(std::uint64_t revision) {
+      return server.sync([revision]() {
+        return server.test_recovery_revision(revision);
+      });
+    }
+
+    bool pending_owner_work() {
+      return server.sync([]() {
+        return server.test_pending_owner_work();
+      });
+    }
+
+    bool discard_source_recovery() {
+      return server.sync([]() {
+        return server.test_discard_recovery();
       });
     }
 

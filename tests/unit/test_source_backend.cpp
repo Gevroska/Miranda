@@ -238,6 +238,7 @@ namespace {
   TEST_F(SourceBackendTest, ConstructorStatusAndAdmissionPerformNoNativeOrDriverIo) {
     const auto value = backend();
     EXPECT_EQ(value->status().generation, 0U);
+    EXPECT_FALSE(value->status().restoration_ready);
     EXPECT_TRUE(value->admits(request()));
     EXPECT_TRUE(value->admits(request(true)));
     EXPECT_EQ(callbacks, 0U);
@@ -264,6 +265,7 @@ namespace {
     ASSERT_TRUE(value->cleanup_and_retire(19));
     EXPECT_TRUE(value->status().source_released);
     EXPECT_FALSE(value->status().recovery_pending);
+    EXPECT_FALSE(value->status().restoration_ready);
     ASSERT_TRUE(value->complete(19));
     EXPECT_TRUE(value->admits(request()));
     ASSERT_TRUE(value->begin(request(), 20, 2));

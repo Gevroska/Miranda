@@ -123,6 +123,8 @@ namespace proc {
   /** @brief Immutable observation readable without the process mutex, including while a configured command waits. */
   struct published_snapshot_t {
     lifetime_snapshot_t lifetime;  ///< Last confirmed process/group observation.
+    std::uint64_t managed_source_instance {};  ///< Actual retained source cleanup claim, independent of process liveness.
+    std::uint64_t managed_source_generation {};  ///< Exact current claim generation, including an otherwise idle process.
     bool operation_in_progress = false;  ///< A configured command may currently hold process state.
     std::string app_name;  ///< Copied application name for platform notifications.
     std::shared_ptr<const std::vector<ctx_t>> apps = std::make_shared<const std::vector<ctx_t>>();  ///< Immutable published catalog.
@@ -385,6 +387,24 @@ namespace proc {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    /**
+     * @brief Keep real fixture commands in the test process's execution environment.
+     * @details The process-wide mode is read atomically by workers. Serialize scope ownership and nest
+     * scopes lexically; retain the scope until all command workers and undo cleanup have completed.
+     */
+    class scoped_local_commands_t {
+    public:
+      /** @brief Select local execution, or temporarily restore host preparation in a nested scope. */
+      explicit scoped_local_commands_t(bool local = true);
+      /** @brief Restore the preceding command-preparation mode, including during stack unwinding. */
+      ~scoped_local_commands_t();
+      scoped_local_commands_t(const scoped_local_commands_t &) = delete;
+      scoped_local_commands_t &operator=(const scoped_local_commands_t &) = delete;
+
+    private:
+      bool previous_;  ///< Command-preparation mode restored when this scope ends.
+    };
+
     /**
      * @brief Observe a real undo consumer while the process state and referenced environment remain locked.
      * @param hook Fixture observer; empty restores production behavior. Install/reset only with no active consumer.

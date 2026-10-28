@@ -14,6 +14,15 @@
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
+  // platform includes
+  // WinSock2.h must precede Windows.h from the recovery backend's display interfaces.
+  // clang-format off
+  #include <WinSock2.h>
+  #include <Windows.h>
+// clang-format on
+#endif
+
 // lib includes
 extern "C" {
 #include <moonlight-common-c/src/Rtsp.h>
@@ -24,6 +33,10 @@ extern "C" {
 #include <src/nvhttp.h>
 #include <src/process.h>
 #include <src/rtsp.h>
+
+#ifdef _WIN32
+  #include <src/platform/windows/source_backend.h>
+#endif
 
 namespace rtsp_stream {
   class rtsp_server_t;
@@ -45,7 +58,8 @@ namespace {
     std::atomic_bool pending_recovery {false};
     std::atomic_bool enforce_recovery_kind {false}, refresh_recovery {false};
     std::atomic_uint progresses {0};
-    bool defer_ready_until_progress = false, terminal_progress_failure = false;
+    std::atomic_bool defer_ready_until_progress {false};
+    bool terminal_progress_failure = false;
     std::shared_future<void> progress_gate;
     std::promise<void> progress_entered;
     std::function<void()> advance_progress_clock;
@@ -189,6 +203,7 @@ namespace {
       state.source_released = true;
       state.recovery_pending = pending_recovery;
       state.phase = source_backend_status_t::phase_e::restored;
+      state.restoration_ready = !pending_recovery;
       return true;
     }
 
@@ -200,6 +215,18 @@ namespace {
         complete_gate.wait_for(2s);
       }
       return !fail_complete;
+    }
+
+    void recovered(std::uint64_t generation, bool retired = false, bool ready = false) {
+      std::lock_guard lock {mutex};
+      state = {.generation = generation, .phase = ready ? source_backend_status_t::phase_e::restored : source_backend_status_t::phase_e::reverting, .source_released = retired, .recovery_pending = true, .restoration_ready = ready};
+    }
+
+    void restoration_finished(bool retired = true, bool available = true) {
+      std::lock_guard lock {mutex};
+      state.phase = retired ? source_backend_status_t::phase_e::restored : source_backend_status_t::phase_e::removal_ready;
+      state.source_released = retired;
+      state.restoration_ready = retired && available;
     }
 
     void heartbeat_failed() {
@@ -597,13 +624,12 @@ namespace {
     EXPECT_EQ(backend->cleanups, 1);
   }
 
-  TEST_F(RtspSourceOwnerTest, RecoveredGenerationSeedIsQuiescentAndDoesNotReuseAnOlderJournalGeneration) {
-    ASSERT_TRUE(seed_source_generation(900));
+  TEST_F(RtspSourceOwnerTest, OrdinaryAdmissionAdvancesTheUsedGenerationFloor) {
+    const auto floor = test_support::source_generation_floor();
     auto first = token();
     ASSERT_EQ(prepare(first), 200);
-    EXPECT_GE(first->source_generation, 901U);
-    EXPECT_FALSE(seed_source_generation(2000));
-    EXPECT_FALSE(seed_source_generation(UINT64_MAX));
+    EXPECT_GT(first->source_generation, floor);
+    EXPECT_EQ(test_support::source_generation_floor(), first->source_generation);
     launch_session_clear(first->id);
     ASSERT_TRUE(until([]() {
       return !source_snapshot().managed;
@@ -1229,4 +1255,457 @@ namespace {
     EXPECT_EQ(stopping.wait_for(2s), std::future_status::ready);
     stopping.get();
   }
+#ifdef _WIN32
+  class RtspRecoveryAdoptionTest: public RtspSourceOwnerTest {
+  protected:
+    std::shared_ptr<platf::source_backend::recovery_context_t> recovery(std::uint64_t generation = 0, bool retired = false, bool ready = false) {
+      if (!generation) {
+        generation = test_support::source_generation_floor() + 10;
+      }
+      auto recovered_backend = std::make_shared<source_backend_fake_t>();
+      recovered_backend->recovered(generation, retired, ready);
+      adopted_backend = recovered_backend;
+      return platf::source_backend::test_recovery_context(recovered_backend, generation);
+    }
+
+    void SetUp() override {
+      RtspSourceOwnerTest::SetUp();
+      proc::proc.publish_snapshot(std::make_shared<const proc::published_snapshot_t>());
+    }
+
+    void TearDown() override {
+      test_support::set_owner_hook({});
+      owner.reset();
+      EXPECT_TRUE(test_support::discard_source_recovery());
+      owner = test_support::start_owner();
+      RtspSourceOwnerTest::TearDown();
+    }
+
+    void reject_queued_request(unsigned int kind) {
+      auto context = recovery();
+      const auto exact = context;
+      const auto floor = test_support::source_generation_floor();
+      auto launch = token();
+      std::promise<void> entered, release, adoption_posted, admission_posted;
+      auto gate = release.get_future().share();
+      std::atomic_bool admission_observer {false};
+      test_support::set_owner_hook([&](std::string_view event) {
+        if (event == "recovery_adoption_posted") {
+          adoption_posted.set_value();
+        }
+        if (event == "operation_posted" && admission_observer.exchange(false)) {
+          admission_posted.set_value();
+        }
+      });
+      std::future<void> blocker, process;
+      std::future<bool> adoption, admission;
+      bool released = false;
+      auto unblock = util::fail_guard([&]() {
+        if (!released) {
+          release.set_value();
+        }
+        if (blocker.valid()) {
+          blocker.wait();
+        }
+        if (adoption.valid()) {
+          adoption.wait();
+        }
+        if (admission.valid()) {
+          admission.wait();
+        }
+        if (process.valid()) {
+          process.wait();
+        }
+        test_support::set_owner_hook({});
+      });
+      blocker = std::async(std::launch::async, [&]() {
+        test_support::owner_operation([&]() {
+          entered.set_value();
+          gate.wait();
+        });
+      });
+      ASSERT_EQ(entered.get_future().wait_for(1s), std::future_status::ready);
+      adoption = std::async(std::launch::async, [&]() {
+        return adopt_source_recovery(context);
+      });
+      ASSERT_EQ(adoption_posted.get_future().wait_for(1s), std::future_status::ready);
+      if (kind == 0) {
+        admission_observer = true;
+        admission = std::async(std::launch::async, [&]() {
+          return launch_session_raise(launch);
+        });
+        ASSERT_EQ(admission_posted.get_future().wait_for(1s), std::future_status::ready);
+      } else if (kind == 1) {
+        process = process_operation([]() {
+        });
+      } else {
+        refresh_process_liveness();
+      }
+      release.set_value();
+      released = true;
+      blocker.get();
+      EXPECT_FALSE(adoption.get());
+      EXPECT_EQ(context, exact);
+      EXPECT_EQ(test_support::source_generation_floor(), floor);
+      if (admission.valid()) {
+        EXPECT_TRUE(admission.get());
+        launch_session_clear(launch->id);
+      }
+      if (process.valid()) {
+        process.get();
+      }
+      process_operation([]() {
+      }).get();
+      test_support::set_owner_hook({});
+    }
+
+    std::shared_ptr<source_backend_fake_t> adopted_backend;
+  };
+
+  TEST_F(RtspRecoveryAdoptionTest, AtomicAdoptionConsumesOnlyTheExactContextAndStopsAtAwaitingCompletion) {
+    auto context = recovery(0, true, true);
+    const auto generation = context->generation();
+    auto alias = context;
+    EXPECT_TRUE(adopt_source_recovery(context));
+    EXPECT_FALSE(context);
+    EXPECT_EQ(test_support::source_generation_floor(), generation);
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().awaiting_completion;
+    }));
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_TRUE(source_snapshot().recovery_pending);
+    EXPECT_FALSE(source_snapshot().managed);
+    EXPECT_FALSE(adopt_source_recovery(alias));
+    EXPECT_TRUE(alias);
+    EXPECT_EQ(adopted_backend->begins, 0);
+    EXPECT_EQ(adopted_backend->probes, 0);
+    EXPECT_EQ(adopted_backend->restores, 0);
+    EXPECT_EQ(adopted_backend->cleanups, 0);
+    EXPECT_EQ(adopted_backend->completes, 0);
+    EXPECT_FALSE(source_snapshot().source);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, RefusalPreservesContextAndFloorForUnreconstructedZeroMaxAndOldGenerations) {
+    const auto floor = test_support::source_generation_floor();
+    for (auto generation : {std::uint64_t {0}, floor, UINT64_MAX}) {
+      auto value = std::make_shared<source_backend_fake_t>();
+      value->recovered(generation);
+      auto context = platf::source_backend::test_recovery_context(value, generation);
+      const auto exact = context;
+      EXPECT_FALSE(adopt_source_recovery(context));
+      EXPECT_EQ(context, exact);
+      EXPECT_EQ(test_support::source_generation_floor(), floor);
+    }
+    auto context = platf::source_backend::test_recovery_context(backend, floor + 10, false);
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_TRUE(context);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, PendingAndAcceptedAdmissionTokensRejectAdoptionWithoutConsumingIt) {
+    auto context = recovery();
+    const auto exact = context;
+    const auto floor = test_support::source_generation_floor();
+    auto launch = token();
+    ASSERT_TRUE(launch_session_raise(launch));
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+    // Keep an accepted socket's live token after removing its pending launch event.
+    test_support::owner_operation([&]() {
+      launch->admitted = true;
+    });
+    launch_session_clear(launch->id);
+    test_support::owner_operation([&]() {
+      launch->admitted = false;
+    });
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+    test_support::owner_operation([&]() {
+      launch->cancelled = true;
+    });
+    EXPECT_TRUE(adopt_source_recovery(context));
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, InflightProcessWorkAndActualClaimRejectAdoption) {
+    auto context = recovery();
+    const auto exact = context;
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    auto work = process_operation([&]() {
+      entered.set_value();
+      gate.wait();
+    });
+    auto unblock = util::fail_guard([&]() {
+      release.set_value();
+    });
+    ASSERT_EQ(entered.get_future().wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    release.set_value();
+    unblock.disable();
+    work.get();
+    auto published = std::make_shared<proc::published_snapshot_t>();
+    published->managed_source_instance = 71;
+    published->managed_source_generation = 19;
+    proc::proc.publish_snapshot(published);
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    proc::proc.publish_snapshot(std::make_shared<const proc::published_snapshot_t>());
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, InflightPreflightRejectsAdoptionBeforeAClaimOrBackendEntry) {
+    auto context = recovery();
+    const auto exact = context;
+    const auto floor = test_support::source_generation_floor();
+    auto launch = token();
+    auto selected = request();
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    auto admission = std::async(std::launch::async, [&]() {
+      return prepare_source_launch(launch, [selected](const auto &) {
+        return std::pair {200, selected};
+      },
+                                   {},
+                                   {},
+                                   [&]() {
+                                     entered.set_value();
+                                     gate.wait();
+                                   });
+    });
+    auto unblock = util::fail_guard([&]() {
+      release.set_value();
+    });
+    ASSERT_EQ(entered.get_future().wait_for(1s), std::future_status::ready);
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+    EXPECT_EQ(backend->begins, 0);
+    release.set_value();
+    unblock.disable();
+    EXPECT_EQ(admission.get(), 200);
+    launch_session_clear(launch->id);
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().managed;
+    }));
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, AdmissionQueuedBehindTheAdoptionCallbackStillRejectsItsCommit) {
+    reject_queued_request(0);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, ProcessRequestQueuedBehindTheAdoptionCallbackStillRejectsItsCommit) {
+    reject_queued_request(1);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, LivenessQueuedBehindTheAdoptionCallbackStillRejectsItsCommit) {
+    reject_queued_request(2);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, AdoptedRecoveryDeniesLegacyAndManagedAdmissionBeforeAnySideEffects) {
+    auto context = recovery(0, true, true);
+    ASSERT_TRUE(adopt_source_recovery(context));
+    auto launch = token();
+    unsigned int calls {};
+    EXPECT_FALSE(launch_session_raise(launch));
+    EXPECT_EQ(prepare_launch(launch, [&]() {
+                ++calls;
+                return 200;
+              }),
+              503);
+    EXPECT_EQ(prepare(launch), 503);
+    launch->ready = true;
+    EXPECT_FALSE(test_support::claim_launch(launch));
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(backend->begins, 0);
+    EXPECT_FALSE(set_source_backend({}));
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, PostcommitDispatchFailureRetainsBusyCustodyAndSameGenerationForRetry) {
+    test_support::set_owner_hook([](std::string_view event) {
+      if (event == "recovery_after_commit") {
+        throw std::runtime_error {"injected timer failure"};
+      }
+    });
+    auto context = recovery(0, true, true);
+    auto alias = context;
+    ASSERT_TRUE(adopt_source_recovery(context));
+    EXPECT_FALSE(context);
+    EXPECT_TRUE(source_snapshot().cleanup_blocked);
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_FALSE(adopt_source_recovery(alias));
+    test_support::set_owner_hook({});
+    retry_source_cleanup();
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().awaiting_completion;
+    }));
+    EXPECT_EQ(adopted_backend->completes, 0);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, DuplicateRetriesDuringInflightObservationCoalesceToOneCheckedRetry) {
+    auto context = recovery();
+    const auto generation = context->generation();
+    adopted_backend->defer_ready_until_progress = true;
+    std::promise<void> release;
+    adopted_backend->progress_gate = release.get_future().share();
+    auto unblock = util::fail_guard([&]() {
+      release.set_value();
+    });
+    ASSERT_TRUE(adopt_source_recovery(context));
+    ASSERT_EQ(adopted_backend->progress_entered.get_future().wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(adopted_backend->restores, 0);
+    retry_source_cleanup();
+    retry_source_cleanup();
+    source_snapshot();
+    EXPECT_EQ(adopted_backend->restores, 0);
+    adopted_backend->defer_ready_until_progress = false;
+    release.set_value();
+    unblock.disable();
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().awaiting_completion;
+    }));
+    EXPECT_EQ(adopted_backend->restores, 1);
+    EXPECT_EQ(adopted_backend->cleanups, 1);
+    EXPECT_EQ(adopted_backend->completes, 0);
+    EXPECT_EQ(test_support::source_generation_floor(), generation);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, RevisionExhaustionRejectsDuplicateRetriesAndRetainsTheBlockedEpisode) {
+    test_support::set_owner_hook([](std::string_view event) {
+      if (event == "recovery_after_commit") {
+        throw std::runtime_error {"injected timer failure"};
+      }
+    });
+    auto context = recovery();
+    const auto generation = context->generation();
+    ASSERT_TRUE(adopt_source_recovery(context));
+    test_support::set_owner_hook({});
+    ASSERT_TRUE(test_support::set_recovery_revision(UINT64_MAX));
+    retry_source_cleanup();
+    retry_source_cleanup();
+    test_support::poll_source();
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_TRUE(source_snapshot().cleanup_blocked);
+    EXPECT_EQ(test_support::source_generation_floor(), generation);
+    EXPECT_EQ(adopted_backend->restores, 0);
+    EXPECT_EQ(adopted_backend->cleanups, 0);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, OfflineAndOwnerThreadOffersRetainCallerCustodyAndFloor) {
+    auto context = recovery();
+    const auto exact = context;
+    const auto floor = test_support::source_generation_floor();
+    test_support::owner_operation([&]() {
+      EXPECT_FALSE(adopt_source_recovery(context));
+    });
+    EXPECT_EQ(context, exact);
+    owner.reset();
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+    owner = test_support::start_owner();
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, LiveApplicationAndExistingSourceRejectAdoptionWithUnchangedFloor) {
+    auto context = recovery();
+    const auto exact = context;
+    auto publication = std::make_shared<proc::published_snapshot_t>();
+    publication->lifetime = {7, app_uuid, 17, true, false};
+    proc::proc.publish_snapshot(publication);
+    const auto floor = test_support::source_generation_floor();
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+    proc::proc.publish_snapshot(std::make_shared<const proc::published_snapshot_t>());
+    auto launch = token();
+    ASSERT_EQ(prepare(launch), 200);
+    const auto used = test_support::source_generation_floor();
+    EXPECT_FALSE(adopt_source_recovery(context));
+    EXPECT_EQ(context, exact);
+    EXPECT_EQ(test_support::source_generation_floor(), used);
+    launch_session_clear(launch->id);
+    ASSERT_TRUE(until([]() {
+      return !source_snapshot().managed;
+    }));
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, SlowOffOwnerObservationDoesNotBlockCopiedStatusOrLegacyDenial) {
+    auto context = recovery();
+    adopted_backend->defer_ready_until_progress = true;
+    std::promise<void> release;
+    adopted_backend->progress_gate = release.get_future().share();
+    auto unblock = util::fail_guard([&]() {
+      release.set_value();
+    });
+    ASSERT_TRUE(adopt_source_recovery(context));
+    ASSERT_EQ(adopted_backend->progress_entered.get_future().wait_for(1s), std::future_status::ready);
+    auto observation = std::async(std::launch::async, []() {
+      return source_snapshot();
+    });
+    ASSERT_EQ(observation.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(observation.get().busy);
+    auto launch = token();
+    EXPECT_FALSE(launch_session_raise(launch));
+    EXPECT_EQ(adopted_backend->cleanups, 0);
+    EXPECT_EQ(adopted_backend->begins, 0);
+    auto stopping = std::async(std::launch::async, []() {
+      test_support::stop_owner();
+    });
+    EXPECT_EQ(stopping.wait_for(30ms), std::future_status::timeout);
+    release.set_value();
+    unblock.disable();
+    ASSERT_EQ(stopping.wait_for(1s), std::future_status::ready);
+    stopping.get();
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_TRUE(source_snapshot().recovery_pending);
+    EXPECT_EQ(adopted_backend->completes, 0);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, RestorationFailureRetainsTheSameRecoveryUntilExplicitRetry) {
+    auto context = recovery();
+    adopted_backend->fail_restore = true;
+    test_support::set_owner_hook([](std::string_view event) {
+      if (event == "recovery_after_commit") {
+        throw std::runtime_error {"injected timer failure"};
+      }
+    });
+    ASSERT_TRUE(adopt_source_recovery(context));
+    test_support::set_owner_hook({});
+    retry_source_cleanup();
+    ASSERT_TRUE(until([&]() {
+      return adopted_backend->restores == 1 && source_snapshot().cleanup_blocked;
+    }));
+    const auto floor = test_support::source_generation_floor();
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_EQ(adopted_backend->cleanups, 0);
+    adopted_backend->fail_restore = false;
+    retry_source_cleanup();
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().awaiting_completion;
+    }));
+    EXPECT_EQ(adopted_backend->begins, 0);
+    EXPECT_EQ(adopted_backend->cleanups, 1);
+    EXPECT_EQ(adopted_backend->completes, 0);
+    EXPECT_EQ(test_support::source_generation_floor(), floor);
+  }
+
+  TEST_F(RtspRecoveryAdoptionTest, UnavailableRestorationAndStickyHeartbeatCannotBecomeCompletionReady) {
+    auto context = recovery(0, true, false);
+    ASSERT_TRUE(adopt_source_recovery(context));
+    test_support::poll_source();
+    EXPECT_FALSE(source_snapshot().awaiting_completion);
+    EXPECT_TRUE(source_snapshot().busy);
+    adopted_backend->heartbeat_failed();
+    retry_source_cleanup();
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().cleanup_blocked;
+    }));
+    adopted_backend->restoration_finished();
+    retry_source_cleanup();
+    test_support::poll_source();
+    EXPECT_FALSE(source_snapshot().awaiting_completion);
+    EXPECT_EQ(adopted_backend->completes, 0);
+  }
+#endif
 }  // namespace

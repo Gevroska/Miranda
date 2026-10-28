@@ -102,6 +102,9 @@ namespace platf::source_startup {
      * retry that same context; competing inputs, prior uncertainty, changed bytes and ordinary
      * recovery refuse advancement. Inspection handles are released before B opens its checked
      * byte transaction. Failure never releases ordinary exclusion or replaces partial recovery.
+     * Offered/adopted contexts return only their existing alias; inspection and reconstruction
+     * cannot fence, reopen or mutate B after that custody boundary. A separate shared proof keeps
+     * immutable paths, sticky observations and the exact gate alive after coordinator destruction.
      */
     std::shared_ptr<source_backend::recovery_context_t> reconstruct(source_backend::options_t options);
     /** @brief Copy the last result without storage, scheduler or native access. */

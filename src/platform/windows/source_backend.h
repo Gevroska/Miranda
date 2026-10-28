@@ -21,7 +21,8 @@
 
 namespace platf::source_startup {
   class coordinator_t;
-}
+  struct recovery_proof_t;
+}  // namespace platf::source_startup
 
 namespace platf::source_backend {
   /**
@@ -83,9 +84,9 @@ namespace platf::source_backend {
 
   /**
    * @brief Retained reconstruction of one exact startup episode; this never represents a source.
-   * @details Only the startup coordinator can construct or retry this context. It retains partial
-   * B/lease state and authorization across failures. No completion, gate-release or RTSP adoption
-   * operation is supplied by this prerequisite.
+   * @details Coordinator operations and an owner offer exclude one another without blocking the
+   * owner. After adoption coordinator/caller aliases are inert. B, authorization and the exact
+   * startup proof survive coordinator destruction. Completion and gate release remain unavailable.
    */
   class recovery_context_t {
   public:
@@ -103,11 +104,29 @@ namespace platf::source_backend {
 
   private:
     friend class source_startup::coordinator_t;
+    friend class rtsp_stream::rtsp_server_t;
+    friend bool rtsp_stream::adopt_source_recovery(std::shared_ptr<recovery_context_t> &context);
 #ifdef SUNSHINE_TESTS
     friend std::shared_ptr<rtsp_stream::source_backend_t> test_recovery_backend(const recovery_context_t &context);
+    friend std::shared_ptr<recovery_context_t> test_recovery_context(std::shared_ptr<rtsp_stream::source_backend_t> backend, std::uint64_t generation, bool reconstructed);
 #endif
     struct state_t;
-    recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion);
+    recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<source_startup::recovery_proof_t> proof);
+#ifdef SUNSHINE_TESTS
+    recovery_context_t(std::shared_ptr<rtsp_stream::source_backend_t> backend, std::uint64_t generation);
+#endif
+    /** @brief Reserve exclusive coordinator mutation; an owner offer or adoption refuses immediately. */
+    bool begin_coordinator_operation();
+    /** @brief Release only this coordinator operation without changing offered/adopted custody. */
+    void end_coordinator_operation() noexcept;
+    /** @brief Reserve a caller-owned offer before posting to the owner; never wait on its executor. */
+    bool offer() noexcept;
+    /** @brief Return an unconsumed offer to its caller after refusal or precommit dispatch failure. */
+    void withdraw_offer() noexcept;
+    /** @brief Nonthrowing custody commit, called only at the owner's admission ordering point. */
+    bool adopt_offer() noexcept;
+    /** @brief Copy the retained backend privately while the offer excludes coordinator mutation. */
+    std::shared_ptr<rtsp_stream::source_backend_t> offered_backend() const;
     bool reconstruct();
     bool fence();
     std::unique_ptr<state_t> state_;
@@ -134,6 +153,8 @@ namespace platf::source_backend {
   diagnostics_t test_diagnostics(const rtsp_stream::source_backend_t &backend);
   /** @brief Model an independently held guarantee in tests only; no production provenance is claimed. */
   std::shared_ptr<recovery_authorization_t> test_recovery_authorization(sudovda::recovery_authority_t authority, std::shared_ptr<void> lifetime);
+  /** @brief Inject an inert owner-only backend; this fixture issues no production authorization or startup proof. */
+  std::shared_ptr<recovery_context_t> test_recovery_context(std::shared_ptr<rtsp_stream::source_backend_t> backend, std::uint64_t generation, bool reconstructed = true);
   /** @brief Inspect the retained concrete recovery backend in component fixtures only. */
   std::shared_ptr<rtsp_stream::source_backend_t> test_recovery_backend(const recovery_context_t &context);
 #endif

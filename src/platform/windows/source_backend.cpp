@@ -436,6 +436,7 @@ namespace platf::source_backend {
           published_.heartbeat_failed = diagnostics_.liveness.has_value();
           published_.recovery_pending = recovery_only_ || (observed.source_released && (observed.unavailable_settings_pending || observed.phase != owned_phase_e::restored));
           published_.recovery_retry_required = (recovery_only_ || observed.source_released) && observed.restore_retry_required;
+          published_.restoration_ready = observed.generation == generation && observed.source_released && observed.phase == owned_phase_e::restored && !observed.unavailable_settings_pending && !observed.restore_retry_required && !diagnostics_.liveness;
           if (effects_ == effects_e::none) {
             return;
           }
@@ -863,18 +864,25 @@ namespace platf::source_backend {
     options_t options;  ///< Exact original verifier/path; never replaced on a partial retry.
     std::string expected_bytes;  ///< Startup observation, compared in the initial B load transaction.
     std::uint64_t generation {};  ///< The journal's generation; never allocated or rotated here.
-    std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion;  ///< Sticky startup gate survives context/B failures.
+    enum class custody_e {
+      caller,
+      coordinator_operation,
+      offered,
+      adopted
+    };
+    std::atomic<custody_e> custody {custody_e::caller};  ///< One nonblocking ordering point before owner dispatch.
+    std::shared_ptr<source_startup::recovery_proof_t> proof;  ///< Immutable locations, sticky observations and exact gate; no owner/coordinator cycle.
     std::shared_ptr<recovery_authorization_t> authorization;  ///< Independent held guarantee, retained before B construction.
     std::shared_ptr<rtsp_stream::source_backend_t> backend;  ///< Destroy before authorization/exclusion if the retained context is finally abandoned.
     std::atomic_bool reconstructed {false};  ///< Successful reconstruction is distinct from source readiness or recovery completion.
   };
 
-  recovery_context_t::recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion):
+  recovery_context_t::recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<source_startup::recovery_proof_t> proof):
       state_ {std::make_unique<state_t>()} {
     state_->options = std::move(options);
     state_->expected_bytes = std::move(expected_bytes);
     state_->generation = generation;
-    state_->exclusion = std::move(exclusion);
+    state_->proof = std::move(proof);
     state_->backend = std::move(backend);
     static_cast<backend_t &>(*state_->backend).reserve_reconstruction(generation);
   }
@@ -894,10 +902,47 @@ namespace platf::source_backend {
   }
 
   diagnostics_t recovery_context_t::diagnostics() const {
+#ifdef SUNSHINE_TESTS
+    if (!dynamic_cast<const backend_t *>(state_->backend.get())) {
+      return {};
+    }
+#endif
     return static_cast<const backend_t &>(*state_->backend).diagnostics();
   }
 
+  bool recovery_context_t::begin_coordinator_operation() {
+    auto expected = state_t::custody_e::caller;
+    return state_->custody.compare_exchange_strong(expected, state_t::custody_e::coordinator_operation);
+  }
+
+  void recovery_context_t::end_coordinator_operation() noexcept {
+    auto expected = state_t::custody_e::coordinator_operation;
+    state_->custody.compare_exchange_strong(expected, state_t::custody_e::caller);
+  }
+
+  bool recovery_context_t::offer() noexcept {
+    auto expected = state_t::custody_e::caller;
+    return state_->custody.compare_exchange_strong(expected, state_t::custody_e::offered);
+  }
+
+  void recovery_context_t::withdraw_offer() noexcept {
+    auto expected = state_t::custody_e::offered;
+    state_->custody.compare_exchange_strong(expected, state_t::custody_e::caller);
+  }
+
+  bool recovery_context_t::adopt_offer() noexcept {
+    auto expected = state_t::custody_e::offered;
+    return state_->custody.compare_exchange_strong(expected, state_t::custody_e::adopted);
+  }
+
+  std::shared_ptr<rtsp_stream::source_backend_t> recovery_context_t::offered_backend() const {
+    return state_->backend;
+  }
+
   bool recovery_context_t::reconstruct() {
+    if (state_->custody != state_t::custody_e::coordinator_operation) {
+      return false;
+    }
     auto &backend = static_cast<backend_t &>(*state_->backend);
     const auto denied = [&](sudovda::failure_t failure) {
       backend.reconstruction_failure(failure);
@@ -927,6 +972,9 @@ namespace platf::source_backend {
   }
 
   bool recovery_context_t::fence() {
+    if (state_->custody != state_t::custody_e::coordinator_operation) {
+      return false;
+    }
     auto &backend = static_cast<backend_t &>(*state_->backend);
     try {
       return backend.fence_reconstruction();
@@ -971,6 +1019,18 @@ namespace platf::source_backend {
     };
 
     return lifetime ? std::make_shared<modeled_authorization_t>(std::move(authority), std::move(lifetime)) : nullptr;
+  }
+
+  recovery_context_t::recovery_context_t(std::shared_ptr<rtsp_stream::source_backend_t> backend, std::uint64_t generation):
+      state_ {std::make_unique<state_t>()} {
+    state_->backend = std::move(backend);
+    state_->generation = generation;
+  }
+
+  std::shared_ptr<recovery_context_t> test_recovery_context(std::shared_ptr<rtsp_stream::source_backend_t> backend, std::uint64_t generation, bool reconstructed) {
+    auto context = std::shared_ptr<recovery_context_t> {new recovery_context_t(std::move(backend), generation)};
+    context->state_->reconstructed = reconstructed;
+    return context;
   }
 
   std::shared_ptr<rtsp_stream::source_backend_t> test_recovery_backend(const recovery_context_t &context) {

@@ -57,6 +57,7 @@ namespace proc {
   proc_t proc;  ///< Global process registry used to track and terminate child processes.
 #ifdef SUNSHINE_TESTS
   namespace {
+    std::atomic_bool local_commands {false};  ///< Scoped real-child fixture mode; production preparation is the default.
     std::function<void(const boost::process::v1::environment &)> undo_environment_hook;  ///< Fixture observer installed only when no command consumer is active.
     std::function<lifetime_snapshot_t()> lifetime_snapshot_hook;  ///< Synthetic process lifetime for isolated owner cases.
     std::function<void()> execute_entry_hook;
@@ -65,6 +66,14 @@ namespace proc {
   }  // namespace
 
   namespace test_support {
+    scoped_local_commands_t::scoped_local_commands_t(bool local):
+        previous_ {local_commands.exchange(local)} {
+    }
+
+    scoped_local_commands_t::~scoped_local_commands_t() {
+      local_commands.exchange(previous_);
+    }
+
     void set_undo_environment_hook(std::function<void(const boost::process::v1::environment &)> hook) {
       undo_environment_hook = std::move(hook);
     }
@@ -280,6 +289,11 @@ namespace proc {
   }
 
   std::string prepare_command(const std::string &command) {
+#ifdef SUNSHINE_TESTS
+    if (local_commands.load()) {
+      return command;
+    }
+#endif
 #ifdef SUNSHINE_BUILD_FLATPAK
     constexpr auto host_command_prefix = "flatpak-spawn --host "sv;
     const auto stripped_command = boost::trim_copy(command);
@@ -590,6 +604,8 @@ namespace proc {
 #endif
     auto next = std::make_shared<published_snapshot_t>();
     next->lifetime = observe_lifetime(false);
+    next->managed_source_instance = _managed_source_instance;
+    next->managed_source_generation = _managed_source_generation;
     next->operation_in_progress = published_snapshot()->operation_in_progress;
     next->app_name = _app.name;
     next->apps = std::make_shared<const std::vector<ctx_t>>(_apps);
@@ -604,8 +620,13 @@ namespace proc {
       return std::nullopt;
     }
     const source_claim_t claim {instance, generation, _managed_source_instance, _managed_source_generation};
+    auto publication = std::make_shared<published_snapshot_t>(*published_snapshot());
+    publication->lifetime = observe_lifetime(false);
+    publication->managed_source_instance = instance;
+    publication->managed_source_generation = generation;
     _managed_source_instance = instance;
     _managed_source_generation = generation;
+    publish_snapshot(std::move(publication));
     return claim;
   }
 
@@ -614,8 +635,13 @@ namespace proc {
     if (_instance != claim.instance || _managed_source_instance != claim.instance || _managed_source_generation != claim.generation) {
       return false;
     }
+    auto publication = std::make_shared<published_snapshot_t>(*published_snapshot());
+    publication->lifetime = observe_lifetime(false);
+    publication->managed_source_instance = claim.previous_instance;
+    publication->managed_source_generation = claim.previous_generation;
     _managed_source_instance = claim.previous_instance;
     _managed_source_generation = claim.previous_generation;
+    publish_snapshot(std::move(publication));
     return true;
   }
 
@@ -1322,6 +1348,8 @@ namespace proc {
               }
             }
             response = {200, tree.dump()};
+            // The process-state guard also fences claim changes. Preserve the exact published
+            // claim in this preallocated catalog snapshot rather than creating a claim-free view.
             auto observation = std::make_shared<published_snapshot_t>(*proc.published_snapshot());
             observation->lifetime = proc.lifetime_snapshot();
             observation->app_name = proc.get_last_run_app_name();
