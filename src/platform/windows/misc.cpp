@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iterator>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -131,6 +132,25 @@ namespace bp = boost::process::v1;
 using namespace std::literals;
 
 namespace platf {
+  namespace {
+    /** @brief Preserve launch flags unless a checked immediate job forbids explicit breakaway. */
+    DWORD apply_parent_job_policy(DWORD flags, std::optional<DWORD> known_job_limits) {
+      if (known_job_limits && !(*known_job_limits & JOB_OBJECT_LIMIT_BREAKAWAY_OK)) {
+        flags &= ~static_cast<DWORD>(CREATE_BREAKAWAY_FROM_JOB);
+      }
+      return flags;
+    }
+  }  // namespace
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /** @brief Exercise the same launch policy without changing the test process's job membership. */
+    DWORD creation_flags_for_job(DWORD flags, std::optional<DWORD> known_job_limits) {
+      return apply_parent_job_policy(flags, known_job_limits);
+    }
+  }  // namespace test_support
+#endif
+
   std::vector<permission_status_t> get_permission_statuses() {
     return {{"config_directory", can_access_directory(appdata()) ? "granted" : "denied", true, true}};
   }
@@ -1024,7 +1044,15 @@ namespace platf {
       free_proc_thread_attr_list(list);
     });
 
-    DWORD creation_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
+    BOOL in_job = FALSE;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION parent_limits {};
+    std::optional<DWORD> known_job_limits;
+    // A checked restrictive job keeps its child by inheritance. Unknown policy retains the
+    // existing request; Windows enforces nested or concurrently changed limits at creation.
+    if (IsProcessInJob(GetCurrentProcess(), nullptr, &in_job) && in_job && QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &parent_limits, sizeof(parent_limits), nullptr)) {
+      known_job_limits = parent_limits.BasicLimitInformation.LimitFlags;
+    }
+    DWORD creation_flags = apply_parent_job_policy(EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB, known_job_limits);
 
     // Create a new console for interactive processes and use no console for non-interactive processes
     creation_flags |= interactive ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
