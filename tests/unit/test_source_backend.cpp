@@ -246,6 +246,14 @@ namespace {
     EXPECT_EQ(manager->reverts, 0U);
   }
 
+  TEST_F(SourceBackendTest, ExistingFreshSourceVerifierDefaultsToRecoveryDenialWithoutInventedRequest) {
+    denying_authority_t verifier;
+    const auto qualified = verifier.verify_recovery({});
+    EXPECT_FALSE(qualified);
+    EXPECT_EQ(verifier.calls, 0u);
+    EXPECT_EQ(callbacks, 0u);
+  }
+
   TEST_F(SourceBackendTest, MissingAuthorityUsesCleanNoEffectsRetirementAndLeavesNativeAvailable) {
     const auto value = backend();
     EXPECT_FALSE(value->begin(request(true), 19, 1));

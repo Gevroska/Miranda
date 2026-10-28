@@ -317,6 +317,8 @@ namespace display_device {
     static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> begin(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority);
     /** @brief Reopen existing intent and library recovery state; failed or ambiguous reads block recovery. */
     static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority);
+    /** @brief Reconstruct only bytes inspected by startup, rechecked inside the journal transaction. */
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, const std::string &expected_bytes);
     /** @brief Return durable capability for acquire_owned/recover; it conveys no exclusive-deployment proof. */
     std::shared_ptr<platf::sudovda::ownership_journal_t> journal() const;
     /** @brief Resolve exact target/LUID/path to the library identity; ambiguous/missing mappings fail. */
@@ -325,6 +327,13 @@ namespace display_device {
     bool bind_absent(const platf::sudovda::lease_t &lease, std::uint64_t generation);
     /** @brief Bind absence proved by this source's exact removal-and-close receipt. */
     bool bind_absent(const platf::sudovda::cleanup_receipt_t &receipt, std::uint64_t generation);
+    /**
+     * @brief Fence recovery callbacks, refresh the actual lease and validate it before restoration.
+     * @details Valid across prior B phases. Existing durable mappings remain immutable; exact
+     * present/absent changes update only transient binding after current Windows validation.
+     * An interrupted episode without a mapping may persist its first checked present binding.
+     */
+    std::expected<void, platf::sudovda::failure_t> revalidate_recovery_binding(platf::sudovda::lease_t &lease, std::uint64_t generation);
     /** @brief Apply with at most max_attempts; API-unavailable retries use the existing scheduler. */
     bool prepare(const SingleDisplayConfiguration &configuration, std::uint64_t generation, unsigned int max_attempts = 3);
     /** @brief Schedule existing-library restoration, retaining unavailable-device recovery independently. */
@@ -349,6 +358,8 @@ namespace display_device {
     static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> test_begin(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager = nullptr, std::shared_ptr<AudioContextInterface> audio = nullptr);
     /** @brief Recover through injected Windows primitives and the real library settings manager. */
     static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices);
+    /** @brief Exercise startup's checked-byte recovery through the same B implementation. */
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, const std::string &expected_bytes);
     /** @brief Replace retry sleep durations for deterministic component fixtures. */
     void test_set_retry_interval(std::chrono::milliseconds interval);
     /**
@@ -361,7 +372,7 @@ namespace display_device {
   private:
     struct state_t;
     explicit owned_display_configuration_t(std::unique_ptr<state_t> state);
-    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> make(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, bool recovery, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio);
+    static std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> make(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, bool recovery, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio, const std::string *expected_bytes = nullptr);
     std::unique_ptr<state_t> state_;
   };
 #endif

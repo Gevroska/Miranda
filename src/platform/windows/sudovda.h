@@ -254,6 +254,8 @@ namespace platf::sudovda {
     static std::expected<std::shared_ptr<ownership_journal_t>, failure_t> create(const std::filesystem::path &path, const ownership_record_t &record, const recovery_authority_t &authority, const std::vector<std::string> &observed_devices = {});
     /** @brief Read and validate one outstanding intent against independently supplied authority. */
     static std::expected<std::shared_ptr<ownership_journal_t>, failure_t> load(const std::filesystem::path &path, const recovery_authority_t &authority);
+    /** @brief Load only the exact inspected bytes, compared inside the checked byte transaction. */
+    static std::expected<std::shared_ptr<ownership_journal_t>, failure_t> load(const std::filesystem::path &path, const recovery_authority_t &authority, const std::string &expected_bytes);
     /** @brief Return the immutable source identity and pre-add baseline. */
     const ownership_record_t &record() const;
     /** @brief Revalidate unchanged journal bytes and independent authority before driver access. */
@@ -300,6 +302,7 @@ namespace platf::sudovda {
     bool confirm_unarmed();
     bool arm_add();
     bool add_armed() const;
+    static std::expected<std::shared_ptr<ownership_journal_t>, failure_t> load_impl(const std::filesystem::path &path, const recovery_authority_t &authority, const std::string *expected_bytes);
     std::shared_ptr<state_t> state_;
   };
 
@@ -339,6 +342,8 @@ namespace platf::sudovda {
      * after adoption retains the lease and intent; it never removes an output before restoration.
      */
     static acquisition_t recover(std::unique_ptr<system_t> system, const std::shared_ptr<ownership_journal_t> &journal, const recovery_authority_t &authority);
+    /** @brief Issue an unarmed receipt only after checking this exact unchanged, unretired journal. */
+    static std::expected<cleanup_receipt_t, failure_t> recover_unarmed(const std::shared_ptr<ownership_journal_t> &journal, const recovery_authority_t &authority);
     /** @brief Stop/join heartbeat, remove only the owned GUID, then close; failed removal is retryable. */
     std::expected<void, failure_t> cleanup();
     /** @brief Return checked protocol metadata, including TestBuild. */

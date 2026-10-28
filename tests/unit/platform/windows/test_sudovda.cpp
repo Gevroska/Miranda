@@ -13,6 +13,7 @@
   #include <filesystem>
   #include <limits>
   #include <map>
+  #include <stdexcept>
   #include <tuple>
   #include <utility>
 
@@ -59,6 +60,7 @@ namespace {
     unsigned int remove_failures {};
     unsigned int close_failures {};
     unsigned int heartbeat_start_failures {};
+    unsigned int heartbeat_start_throws {};
     std::chrono::milliseconds period {};
     std::function<void()> tick;
     bool ping_during_stop {};
@@ -191,6 +193,10 @@ namespace {
 
     std::expected<std::unique_ptr<heartbeat_t>, failure_t> heartbeat(std::chrono::milliseconds period, std::function<void()> callback) override {
       fake_->events.emplace_back("start");
+      if (fake_->heartbeat_start_throws) {
+        --fake_->heartbeat_start_throws;
+        throw std::runtime_error {"inert heartbeat creation failure"};
+      }
       if (fake_->heartbeat_start_failures) {
         --fake_->heartbeat_start_failures;
         return std::unexpected(failure_t {errc_t::heartbeat_failed, operation_t::heartbeat, ERROR_NOT_ENOUGH_MEMORY});
@@ -781,6 +787,57 @@ TEST_F(SudoVdaOwnershipTest, RequiresIndependentTrustedAuthorityBeforeCreatingIn
   EXPECT_TRUE(fake->events.empty());
 }
 
+TEST_F(SudoVdaOwnershipTest, ExpectedByteLoadComparesInsideExistingTransactionWithoutRewriting) {
+  ASSERT_TRUE(make_journal());
+  std::string original;
+  ASSERT_TRUE(http::update_state_file_bytes(path.string(), [&](const std::string &bytes) -> std::optional<std::string> {
+    original = bytes;
+    return std::nullopt;
+  }));
+  EXPECT_TRUE(ownership_journal_t::load(path, authority, original));
+  ASSERT_TRUE(http::update_state_file_bytes(path.string(), [](const std::string &bytes) -> std::optional<std::string> {
+    return bytes + " ";
+  }));
+  EXPECT_FALSE(ownership_journal_t::load(path, authority, original));
+  EXPECT_TRUE(ownership_journal_t::load(path, authority));
+  EXPECT_TRUE(fake->events.empty());
+}
+
+TEST_F(SudoVdaOwnershipTest, UnarmedRecoveryIssuesActualReceiptWithoutTransportOrDummyMode) {
+  const auto journal = make_journal();
+  ASSERT_TRUE(journal);
+  const auto proof = lease_t::recover_unarmed(journal, authority);
+  ASSERT_TRUE(proof);
+  EXPECT_EQ(proof->kind(), cleanup_receipt_t::kind_e::unarmed);
+  EXPECT_TRUE(journal->accepts_receipt(*proof));
+  EXPECT_TRUE(fake->events.empty());
+  EXPECT_TRUE(journal->retire(*proof));
+  EXPECT_FALSE(lease_t::recover_unarmed(journal, authority));
+}
+
+TEST_F(SudoVdaOwnershipTest, UnarmedRecoveryRejectsArmedChangedOrWrongDeploymentEvidence) {
+  auto journal = make_journal();
+  ASSERT_TRUE(journal);
+  auto other = authority;
+  other.deployment = "another-deployment";
+  EXPECT_FALSE(lease_t::recover_unarmed(journal, other));
+  ASSERT_TRUE(http::update_state_file_bytes(path.string(), [](const std::string &bytes) -> std::optional<std::string> {
+    return bytes + " ";
+  }));
+  EXPECT_FALSE(lease_t::recover_unarmed(journal, authority));
+  const auto unchanged = ownership_journal_t::load(path, authority);
+  ASSERT_TRUE(unchanged);
+  const auto proof = lease_t::recover_unarmed(*unchanged, authority);
+  ASSERT_TRUE(proof);
+  EXPECT_FALSE(journal->accepts_receipt(*proof));
+  ASSERT_TRUE((*unchanged)->retire(*proof));
+  ASSERT_TRUE((*unchanged)->complete());
+  journal = crash_journal();
+  ASSERT_TRUE(journal);
+  EXPECT_FALSE(lease_t::recover_unarmed(journal, authority));
+  EXPECT_TRUE(fake->events.empty());
+}
+
 TEST_F(SudoVdaOwnershipTest, JournalMutationsPersistObjectEnvelopeAcrossReloadAndRollover) {
   const auto journal {make_journal()};
   ASSERT_TRUE(journal);
@@ -999,6 +1056,26 @@ TEST_F(SudoVdaOwnershipTest, RecoveryOfAbsentOwnedGuidStillPerformsExactRemovalA
   ASSERT_TRUE(result.lease->cleanup_receipt());
   ASSERT_TRUE(journal->retire(*result.lease->cleanup_receipt()));
   EXPECT_TRUE(journal->complete());
+}
+
+TEST_F(SudoVdaOwnershipTest, ThrowingRecoveryHeartbeatCreationLatchesOnTheActualRetainedLease) {
+  const auto journal = crash_journal();
+  ASSERT_TRUE(journal);
+  fake->heartbeat_start_throws = 2;
+  auto result = lease_t::recover(std::make_unique<fake_system_t>(fake), journal, authority);
+  ASSERT_TRUE(result.lease);
+  ASSERT_TRUE(result.failure);
+  ASSERT_TRUE(result.liveness_failure);
+  ASSERT_TRUE(result.lease->heartbeat_failure());
+  EXPECT_EQ(result.lease->heartbeat_failure()->code, errc_t::heartbeat_failed);
+  EXPECT_EQ(result.lease->heartbeat_failure()->operation, operation_t::heartbeat);
+  EXPECT_EQ(count("start"), 2u);
+  EXPECT_FALSE(fake->tick);
+  EXPECT_TRUE(result.output_uncertain);
+  EXPECT_TRUE(result.lease->belongs_to(journal));
+  EXPECT_TRUE(journal->validate(authority));
+  EXPECT_EQ(count("remove"), 0u);
+  EXPECT_EQ(count("close"), 0u);
 }
 
 TEST_F(SudoVdaOwnershipTest, FailedRecoveryRemoveRetainsJournalLeaseAndHeartbeatForRetry) {

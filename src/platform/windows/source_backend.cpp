@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -38,6 +39,7 @@ namespace platf::source_backend {
       std::function<std::optional<LUID>(const std::string &)> render_adapter;  ///< Exact configured render adapter.
       std::function<std::unique_ptr<sudovda::system_t>()> make_system;  ///< Deferred driver transport allocation.
       std::function<std::expected<std::unique_ptr<display_device::owned_display_configuration_t>, sudovda::failure_t>(const std::filesystem::path &, const GUID &, std::uint64_t, const sudovda::recovery_authority_t &)> begin_owned;  ///< Existing B intent transaction.
+      std::function<std::expected<std::unique_ptr<display_device::owned_display_configuration_t>, sudovda::failure_t>(const std::filesystem::path &, const sudovda::recovery_authority_t &, const std::string &)> recover_owned;  ///< Exact B journal reconstruction.
 #ifdef SUNSHINE_TESTS
       std::function<int(const capture_source_t &, std::shared_ptr<capture_pin_t>)> probe {};  ///< Fake-only codec boundary; production always uses the managed video entry.
 #endif
@@ -87,7 +89,10 @@ namespace platf::source_backend {
         },
         resolve_render_adapter,
         sudovda::make_win32_system,
-        display_device::owned_display_configuration_t::begin
+        display_device::owned_display_configuration_t::begin,
+        [](const auto &path, const auto &authority, const auto &bytes) {
+          return display_device::owned_display_configuration_t::recover(path, authority, bytes);
+        }
       };
     }
 
@@ -126,6 +131,9 @@ namespace platf::source_backend {
           dependencies_ {std::move(dependencies)} {}
 
       bool admits(const display_policy::source_request_t &request) const override {
+        if (recovery_only_) {
+          return false;
+        }
         const auto startup = display_device::ordinary_startup_recovery();
         if (startup.mutation_excluded || (request.virtual_display && startup.recovery_pending)) {
           return false;
@@ -159,6 +167,132 @@ namespace platf::source_backend {
           result.liveness = heartbeat_view_->heartbeat_failure();
         }
         return result;
+      }
+
+      void reconstruction_failure(sudovda::failure_t failure) {
+        std::lock_guard lock {publication_mutex_};
+        if (!diagnostics_.acquisition) {
+          diagnostics_.acquisition = failure;
+        }
+      }
+
+      void reserve_reconstruction(std::uint64_t generation) {
+        generation_ = generation;
+        effects_ = effects_e::uncertain;
+        recovery_only_ = true;
+        set_episode(true);
+        std::lock_guard lock {publication_mutex_};
+        published_ = {.generation = generation, .phase = phase_e::cleanup_pending, .recovery_pending = true};
+      }
+
+      bool fence_reconstruction() {
+        return !owned_ || owned_->status().phase == owned_phase_e::reserved || owned_->cancel(generation_);
+      }
+
+      bool reconstruct(const std::string &expected_bytes, std::uint64_t generation, const sudovda::recovery_authority_t &authority, std::shared_ptr<recovery_authorization_t> authorization) {
+        if (!authorization || !generation || (recovery_only_ && generation != generation_) || (!recovery_only_ && status().generation)) {
+          return false;
+        }
+        if (!recovery_only_) {
+          reserve_reconstruction(generation);
+        }
+        if (!recovery_authorization_) {
+          authority_ = authority;
+          recovery_authorization_ = std::move(authorization);
+        }
+        if (!owned_) {
+          if (!dependencies_.recover_owned) {
+            reconstruction_failure({sudovda::errc_t::journal_failed, sudovda::operation_t::journal});
+            return false;
+          }
+          auto recovered = dependencies_.recover_owned(options_.journal_path, authority_, expected_bytes);
+          if (!recovered) {
+            reconstruction_failure(recovered.error());
+            return false;
+          }
+          // Retain the actual B object before journal validation, adapter construction or binding.
+          owned_ = std::move(*recovered);
+          if (!owned_) {
+            reconstruction_failure({sudovda::errc_t::journal_failed, sudovda::operation_t::journal});
+            return false;
+          }
+          effects_ = effects_e::owned;
+        }
+        const auto journal = owned_->journal();
+        if (!journal || journal->record().generation != generation_ || journal->record().deployment != authority_.deployment || !journal->validate(authority_)) {
+          reconstruction_failure({sudovda::errc_t::ownership_unverified, sudovda::operation_t::journal});
+          return false;
+        }
+        if (journal->source_retired()) {
+          retired_ = true;
+          const bool scheduled = owned_->restore(generation_);
+          progress(generation_);
+          return scheduled;
+        }
+        if (!journal->add_was_armed()) {
+          if (!receipt_) {
+            auto proof = sudovda::lease_t::recover_unarmed(journal, authority_);
+            if (!proof) {
+              reconstruction_failure(proof.error());
+              return false;
+            }
+            receipt_ = std::move(*proof);
+          }
+          if (!owned_->retire_source(*receipt_, generation_)) {
+            reconstruction_failure({sudovda::errc_t::journal_failed, sudovda::operation_t::journal});
+            return false;
+          }
+          retired_ = true;
+          progress(generation_);
+          return true;
+        }
+        if (recovery_transport_pending_ && lease_) {
+          // This adapter result failed before adopting the output. Retry only its retained close;
+          // an adopted lease follows the restoration/removal path and is never replaced here.
+          const auto closed = lease_->cleanup();
+          if (!closed) {
+            std::lock_guard lock {publication_mutex_};
+            diagnostics_.cleanup = closed.error();
+            return false;
+          }
+          {
+            std::lock_guard lock {publication_mutex_};
+            heartbeat_view_ = nullptr;
+          }
+          lease_.reset();
+          recovery_transport_pending_ = false;
+        }
+        if (!lease_) {
+          auto acquired = sudovda::lease_t::recover(dependencies_.make_system(), journal, authority_);
+          // A failed acquisition can already own the exact output and heartbeat. Store it before
+          // inspecting errors or doing any subsequent fallible mapping/restoration work.
+          lease_ = std::move(acquired.lease);
+          recovery_transport_pending_ = lease_ && acquired.failure && !acquired.output_uncertain;
+          {
+            std::lock_guard lock {publication_mutex_};
+            heartbeat_view_ = lease_.get();
+            if (acquired.failure && !diagnostics_.acquisition) {
+              diagnostics_.acquisition = acquired.failure;
+            }
+            if (acquired.cleanup_failure) {
+              diagnostics_.cleanup = acquired.cleanup_failure;
+            }
+            if (acquired.liveness_failure) {
+              diagnostics_.liveness = acquired.liveness_failure;
+            }
+          }
+          if (acquired.failure || !lease_) {
+            return false;
+          }
+        }
+        if (!revalidate_recovery_binding()) {
+          reconstruction_failure({sudovda::errc_t::ownership_unverified, sudovda::operation_t::journal});
+          progress(generation_);
+          return false;
+        }
+        const bool scheduled = owned_->restore(generation_);
+        progress(generation_);
+        return scheduled;
       }
 
       bool begin(const display_policy::source_request_t &request, std::uint64_t generation, std::uint64_t epoch) override {
@@ -300,8 +434,8 @@ namespace platf::source_backend {
             diagnostics_.liveness = heartbeat;
           }
           published_.heartbeat_failed = diagnostics_.liveness.has_value();
-          published_.recovery_pending = observed.source_released && (observed.unavailable_settings_pending || observed.phase != owned_phase_e::restored);
-          published_.recovery_retry_required = observed.source_released && observed.restore_retry_required;
+          published_.recovery_pending = recovery_only_ || (observed.source_released && (observed.unavailable_settings_pending || observed.phase != owned_phase_e::restored));
+          published_.recovery_retry_required = (recovery_only_ || observed.source_released) && observed.restore_retry_required;
           if (effects_ == effects_e::none) {
             return;
           }
@@ -334,7 +468,7 @@ namespace platf::source_backend {
           }
           published_.source_released = retired_ && observed.source_released;
         }
-        if (!retired_ && observed.generation == generation && observed.phase == owned_phase_e::ready && lease_ && lease_->display() && api_) {
+        if (!recovery_only_ && !retired_ && observed.generation == generation && observed.phase == owned_phase_e::ready && lease_ && lease_->display() && api_) {
           auto source = virtual_source(observed);
           const auto checked = source ? capture_binding::verify(*source, *api_) : std::nullopt;
           if (checked) {
@@ -400,7 +534,11 @@ namespace platf::source_backend {
         if (!owned_ || effects_ == effects_e::uncertain) {
           return false;
         }
-        if (owned_->status().phase == owned_phase_e::reserved && !bind_for_restoration()) {
+        if (recovery_only_ && !owned_->journal()->source_retired()) {
+          if (!revalidate_recovery_binding()) {
+            return false;
+          }
+        } else if (owned_->status().phase == owned_phase_e::reserved && !bind_for_restoration()) {
           return false;
         }
         if (!owned_->restore(owned_->status().generation, delay)) {
@@ -438,7 +576,7 @@ namespace platf::source_backend {
             if (!lease_->identity_absent() || !lease_->belongs_to(owned_->journal())) {
               return false;
             }
-          } else if (!lease_->refresh_display() || !same_lease_mapping()) {
+          } else if (recovery_only_ ? !revalidate_recovery_binding() : (!lease_->refresh_display() || !same_lease_mapping())) {
             return false;
           }
           // Refresh the retained exact target, then obtain current B removal permission. A
@@ -472,7 +610,7 @@ namespace platf::source_backend {
       }
 
       bool complete(std::uint64_t generation) override {
-        if (generation != generation_ || !retired_) {
+        if (recovery_only_ || generation != generation_ || !retired_) {
           return false;
         }
         if (owned_) {
@@ -638,6 +776,26 @@ namespace platf::source_backend {
         return mapping && current && capture_binding::luid(mapping->target.adapter) == capture_binding::luid(current->target.adapter) && mapping->target.target == current->target.target && boost::iequals(mapping->monitor_path, current->monitor_path) && owned_->status().device_id == mapping->device_id;
       }
 
+      bool revalidate_recovery_binding() {
+        if (!owned_ || !lease_ || recovery_transport_pending_) {
+          return false;
+        }
+        const auto validated = owned_->revalidate_recovery_binding(*lease_, generation_);
+        if (!validated) {
+          if (validated.error().code == sudovda::errc_t::heartbeat_failed) {
+            std::lock_guard lock {publication_mutex_};
+            if (!diagnostics_.liveness) {
+              diagnostics_.liveness = validated.error();
+            }
+            published_.heartbeat_failed = true;
+          } else {
+            reconstruction_failure(validated.error());
+          }
+          return false;
+        }
+        return true;
+      }
+
       bool bind_for_restoration() {
         if (receipt_) {
           return receipt_->kind() == sudovda::cleanup_receipt_t::kind_e::unarmed || owned_->bind_absent(*receipt_, owned_->status().generation);
@@ -670,6 +828,7 @@ namespace platf::source_backend {
       }
 
       options_t options_;  ///< Stored verifier and journal location; construction performs no qualification.
+      std::shared_ptr<recovery_authorization_t> recovery_authorization_;  ///< Held through every B callback, heartbeat, cleanup and partial failure.
       dependencies_t dependencies_;  ///< Deferred boundaries called only on the operation lane.
       display_device::native_display_configuration_t native_;  ///< Existing ordinary scheduler facade.
       std::shared_ptr<display_device::WinApiLayerInterface> api_;  ///< Readback API, allocated after begin enters.
@@ -682,14 +841,100 @@ namespace platf::source_backend {
       effects_e effects_ = effects_e::none;  ///< NoEffects differs from entered uncertain B intent.
       bool retired_ = false;  ///< Logical source retirement is independent of physical recovery.
       bool removed_waiting_close_ = false;  ///< Exact removal succeeded; retry close without repeating removal.
+      bool recovery_transport_pending_ = false;  ///< Actual adapter retained only a failed pre-adoption transport close.
       mutable std::mutex publication_mutex_;  ///< Only copied state; never held across native work.
       source_backend_status_t published_;  ///< Copyable logical status; no resource pin is stored in metadata.
       const sudovda::lease_t *heartbeat_view_ = nullptr;  ///< Publication-locked failure-latch view; detached before operation-lane destruction.
       diagnostics_t diagnostics_;  ///< Independent failure observations retained through cleanup retries.
       bool episode_live_ = false;  ///< Admission exclusion lasts until actual recovery completion.
       bool episode_virtual_ = false;  ///< Cross-kind recovery cannot be transferred implicitly.
+      std::atomic_bool recovery_only_ {false};  ///< Reconstruction cannot admit, begin, probe, publish readiness or complete startup.
     };
   }  // namespace
+
+  recovery_authorization_t::recovery_authorization_t(sudovda::recovery_authority_t authority):
+      authority_ {std::move(authority)} {}
+
+  std::expected<std::shared_ptr<recovery_authorization_t>, sudovda::failure_t> authority_verifier_t::verify_recovery(const std::filesystem::path &) {
+    return std::unexpected(sudovda::failure_t {sudovda::errc_t::ownership_unverified, sudovda::operation_t::journal});
+  }
+
+  struct recovery_context_t::state_t {
+    options_t options;  ///< Exact original verifier/path; never replaced on a partial retry.
+    std::string expected_bytes;  ///< Startup observation, compared in the initial B load transaction.
+    std::uint64_t generation {};  ///< The journal's generation; never allocated or rotated here.
+    std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion;  ///< Sticky startup gate survives context/B failures.
+    std::shared_ptr<recovery_authorization_t> authorization;  ///< Independent held guarantee, retained before B construction.
+    std::shared_ptr<rtsp_stream::source_backend_t> backend;  ///< Destroy before authorization/exclusion if the retained context is finally abandoned.
+    std::atomic_bool reconstructed {false};  ///< Successful reconstruction is distinct from source readiness or recovery completion.
+  };
+
+  recovery_context_t::recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion):
+      state_ {std::make_unique<state_t>()} {
+    state_->options = std::move(options);
+    state_->expected_bytes = std::move(expected_bytes);
+    state_->generation = generation;
+    state_->exclusion = std::move(exclusion);
+    state_->backend = std::move(backend);
+    static_cast<backend_t &>(*state_->backend).reserve_reconstruction(generation);
+  }
+
+  recovery_context_t::~recovery_context_t() = default;
+
+  std::uint64_t recovery_context_t::generation() const {
+    return state_->generation;
+  }
+
+  bool recovery_context_t::reconstructed() const {
+    return state_->reconstructed.load();
+  }
+
+  rtsp_stream::source_backend_status_t recovery_context_t::status() const {
+    return state_->backend->status();
+  }
+
+  diagnostics_t recovery_context_t::diagnostics() const {
+    return static_cast<const backend_t &>(*state_->backend).diagnostics();
+  }
+
+  bool recovery_context_t::reconstruct() {
+    auto &backend = static_cast<backend_t &>(*state_->backend);
+    const auto denied = [&](sudovda::failure_t failure) {
+      backend.reconstruction_failure(failure);
+      return false;
+    };
+    state_->reconstructed = false;
+    try {
+      if (!state_->authorization) {
+        if (!state_->options.authority) {
+          return denied({sudovda::errc_t::exclusive_control_required, sudovda::operation_t::journal});
+        }
+        auto qualified = state_->options.authority->verify_recovery(state_->options.journal_path);
+        if (!qualified || !*qualified) {
+          return denied(qualified ? sudovda::failure_t {sudovda::errc_t::ownership_unverified, sudovda::operation_t::journal} : qualified.error());
+        }
+        state_->authorization = std::move(*qualified);
+      }
+      const auto &authority = state_->authorization->authority_;
+      if (authority.deployment.empty() || !authority.trusted_storage || !authority.exclusive_driver_control) {
+        return denied({sudovda::errc_t::ownership_unverified, sudovda::operation_t::journal});
+      }
+      state_->reconstructed = backend.reconstruct(state_->expected_bytes, state_->generation, authority, state_->authorization);
+    } catch (const std::exception &) {
+      return denied({sudovda::errc_t::journal_failed, sudovda::operation_t::journal});
+    }
+    return state_->reconstructed;
+  }
+
+  bool recovery_context_t::fence() {
+    auto &backend = static_cast<backend_t &>(*state_->backend);
+    try {
+      return backend.fence_reconstruction();
+    } catch (const std::exception &) {
+      backend.reconstruction_failure({sudovda::errc_t::journal_failed, sudovda::operation_t::journal});
+      return false;
+    }
+  }
 
   std::optional<bool> physical_source_available() {
     return checked_availability(display_device::WinApiLayer {});
@@ -701,7 +946,7 @@ namespace platf::source_backend {
 
 #ifdef SUNSHINE_TESTS
   std::shared_ptr<rtsp_stream::source_backend_t> test_make_backend(options_t options, test_dependencies_t dependencies) {
-    auto boundaries = dependencies_t {std::move(dependencies.make_api), std::move(dependencies.capture_names), std::move(dependencies.wake_native), std::move(dependencies.render_adapter), std::move(dependencies.make_system), std::move(dependencies.begin_owned)};
+    auto boundaries = dependencies_t {std::move(dependencies.make_api), std::move(dependencies.capture_names), std::move(dependencies.wake_native), std::move(dependencies.render_adapter), std::move(dependencies.make_system), std::move(dependencies.begin_owned), std::move(dependencies.recover_owned)};
     boundaries.probe = std::move(dependencies.probe);
     return std::make_shared<backend_t>(std::move(options), std::move(boundaries));
   }
@@ -712,6 +957,24 @@ namespace platf::source_backend {
 
   diagnostics_t test_diagnostics(const rtsp_stream::source_backend_t &backend) {
     return dynamic_cast<const backend_t &>(backend).diagnostics();
+  }
+
+  std::shared_ptr<recovery_authorization_t> test_recovery_authorization(sudovda::recovery_authority_t authority, std::shared_ptr<void> lifetime) {
+    class modeled_authorization_t final: public recovery_authorization_t {
+    public:
+      modeled_authorization_t(sudovda::recovery_authority_t authority, std::shared_ptr<void> lifetime):
+          recovery_authorization_t {std::move(authority)},
+          lifetime_ {std::move(lifetime)} {}
+
+    private:
+      std::shared_ptr<void> lifetime_;  ///< Test model only; no protected deployment was provisioned.
+    };
+
+    return lifetime ? std::make_shared<modeled_authorization_t>(std::move(authority), std::move(lifetime)) : nullptr;
+  }
+
+  std::shared_ptr<rtsp_stream::source_backend_t> test_recovery_backend(const recovery_context_t &context) {
+    return context.state_->backend;
   }
 #endif
 }  // namespace platf::source_backend

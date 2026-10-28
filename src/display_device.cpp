@@ -1685,7 +1685,7 @@ namespace display_device {
     state_->scheduler.reset();
   }
 
-  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::make(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, bool recovery, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio) {
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::make(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, bool recovery, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio, const std::string *expected_bytes) {
     using namespace platf::sudovda;
     const auto fail {[](errc_t code) {
       return std::unexpected(failure_t {code, operation_t::journal});
@@ -1716,7 +1716,7 @@ namespace display_device {
       return fail(errc_t::enumeration_failed);
     }
     if (recovery) {
-      auto journal {ownership_journal_t::load(journal_path, authority)};
+      auto journal {expected_bytes ? ownership_journal_t::load(journal_path, authority, *expected_bytes) : ownership_journal_t::load(journal_path, authority)};
       if (!journal) {
         return std::unexpected(journal.error());
       }
@@ -1782,6 +1782,11 @@ namespace display_device {
     return make(journal_path, {}, 0, authority, true, api, std::make_shared<WinDisplayDevice>(api, false), nullptr, std::make_shared<sunshine_audio_context_t>());
   }
 
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, const std::string &expected_bytes) {
+    auto api {std::make_shared<WinApiLayer>()};
+    return make(journal_path, {}, 0, authority, true, api, std::make_shared<WinDisplayDevice>(api, false), nullptr, std::make_shared<sunshine_audio_context_t>(), &expected_bytes);
+  }
+
   std::shared_ptr<platf::sudovda::ownership_journal_t> owned_display_configuration_t::journal() const {
     std::lock_guard command {state_->command_mutex};
     return state_->journal;
@@ -1831,6 +1836,102 @@ namespace display_device {
     }
     state_->owned_absent = true;
     return true;
+  }
+
+  std::expected<void, platf::sudovda::failure_t> owned_display_configuration_t::revalidate_recovery_binding(platf::sudovda::lease_t &lease, std::uint64_t generation) {
+    using namespace platf::sudovda;
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || !state_->scheduler || !lease.belongs_to(state_->journal) || !IsEqualGUID(lease.identity(), state_->journal->record().identity)) {
+      return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+    }
+    ++state_->revision;
+    state_->scheduler->stop();
+    const auto fail = [&](owned_display_error_e error, failure_t failure = {errc_t::ownership_unverified, operation_t::journal}) -> std::expected<void, failure_t> {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.phase = owned_display_phase_e::cleanup_pending;
+      state_->status.removal_permitted = false;
+      state_->status.restore_error = error;
+      state_->status.restore_retry_required = true;
+      return std::unexpected(failure);
+    };
+    {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.removal_permitted = false;
+    }
+    if (state_->journal->source_retired() || !state_->journal->validate(state_->authority)) {
+      return fail(owned_display_error_e::recovery_state_unproven);
+    }
+    if (const auto failure = lease.heartbeat_failure()) {
+      return fail(owned_display_error_e::recovery_state_unproven, *failure);
+    }
+    const auto refreshed = lease.refresh_display();
+    if (!refreshed) {
+      return fail(owned_display_error_e::observed_source_mismatch, refreshed.error());
+    }
+    const auto mapping = state_->journal->mapping();
+    std::string retained_id;
+    {
+      std::lock_guard lock {state_->status_mutex};
+      retained_id = state_->status.device_id;
+    }
+    if (lease.identity_absent()) {
+      if (lease.display() || (mapping && !retained_id.empty() && retained_id != mapping->device_id) || (!mapping && (!retained_id.empty() || state_->bound_display))) {
+        return fail(owned_display_error_e::observed_source_mismatch);
+      }
+      // Driver absence cannot override a conflicting available Windows target, monitor path or
+      // library identity. All-path queries may retain unavailable entries after monitor removal.
+      const auto paths = state_->api->queryDisplayConfig(QueryType::All);
+      if (!paths) {
+        return fail(owned_display_error_e::observed_source_mismatch);
+      }
+      if (mapping) {
+        const auto expected_path = utf_utils::to_utf8(mapping->monitor_path);
+        for (const auto &path : paths->m_paths) {
+          if (!path.targetInfo.targetAvailable) {
+            continue;
+          }
+          const bool same_target = path.targetInfo.adapterId.HighPart == mapping->target.adapter.HighPart && path.targetInfo.adapterId.LowPart == mapping->target.adapter.LowPart && path.targetInfo.id == mapping->target.target;
+          if (same_target || boost::iequals(state_->api->getMonitorDevicePath(path), expected_path) || state_->api->getDeviceId(path) == mapping->device_id) {
+            return fail(owned_display_error_e::observed_source_mismatch);
+          }
+        }
+      }
+      if (!state_->journal->validate(state_->authority)) {
+        return fail(owned_display_error_e::journal_unavailable);
+      }
+      if (const auto failure = lease.heartbeat_failure()) {
+        return fail(owned_display_error_e::recovery_state_unproven, *failure);
+      }
+      state_->bound_display.reset();
+      state_->owned_absent = true;
+      return {};
+    }
+    const auto &display = lease.display();
+    if (!display) {
+      return fail(owned_display_error_e::observed_source_mismatch);
+    }
+    const auto id = state_->resolve(*display);
+    if (id.empty() || (!retained_id.empty() && retained_id != id)) {
+      return fail(owned_display_error_e::observed_source_mismatch);
+    }
+    if (mapping) {
+      if (mapping->device_id != id || mapping->target.adapter.HighPart != display->target.adapter.HighPart || mapping->target.adapter.LowPart != display->target.adapter.LowPart || mapping->target.target != display->target.target || !boost::iequals(mapping->monitor_path, display->monitor_path)) {
+        return fail(owned_display_error_e::observed_source_mismatch);
+      }
+    } else if (state_->bound_display || !retained_id.empty() || !state_->journal->bind_mapping(*display, id)) {
+      return fail(owned_display_error_e::recovery_state_unproven);
+    }
+    if (!state_->journal->validate(state_->authority)) {
+      return fail(owned_display_error_e::journal_unavailable);
+    }
+    if (const auto failure = lease.heartbeat_failure()) {
+      return fail(owned_display_error_e::recovery_state_unproven, *failure);
+    }
+    state_->bound_display = *display;
+    state_->owned_absent = false;
+    std::lock_guard lock {state_->status_mutex};
+    state_->status.device_id = id;
+    return {};
   }
 
   bool owned_display_configuration_t::prepare(const SingleDisplayConfiguration &configuration, std::uint64_t generation, unsigned int max_attempts) {
@@ -2186,6 +2287,10 @@ namespace display_device {
 
   std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices) {
     return make(journal_path, {}, 0, authority, true, std::move(api), std::move(devices), nullptr, nullptr);
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, const std::string &expected_bytes) {
+    return make(journal_path, {}, 0, authority, true, std::move(api), std::move(devices), nullptr, nullptr, &expected_bytes);
   }
   #endif
 #endif

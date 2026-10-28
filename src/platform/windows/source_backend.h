@@ -19,7 +19,34 @@
 #include "src/display_device.h"
 #include "src/rtsp.h"
 
+namespace platf::source_startup {
+  class coordinator_t;
+}
+
 namespace platf::source_backend {
+  /**
+   * @brief Opaque lifetime of independently established recovery authorization.
+   * @details A provider must retain protected storage/write access, the independent deployment
+   * identity and exclusive driver control until this object is destroyed. It must not revoke or
+   * release those guarantees while any recovery callback, heartbeat or cleanup can still run.
+   * The protected constructor is a provider contract, not a journal/path/Boolean-based issuer.
+   * There is no production provider in this component.
+   */
+  class recovery_authorization_t {
+  public:
+    virtual ~recovery_authorization_t() = default;
+    recovery_authorization_t(const recovery_authorization_t &) = delete;
+    recovery_authorization_t &operator=(const recovery_authorization_t &) = delete;
+
+  protected:
+    /** @brief Bind independently obtained deployment metadata to this provider's held lifetime. */
+    explicit recovery_authorization_t(sudovda::recovery_authority_t authority);
+
+  private:
+    friend class recovery_context_t;
+    const sudovda::recovery_authority_t authority_;
+  };
+
   /**
    * @brief Future protected provisioning verifier, invoked only on the operation lane.
    * @details An implementation must independently verify protected provisioning and exclusive
@@ -31,6 +58,8 @@ namespace platf::source_backend {
     virtual ~authority_verifier_t() = default;
     /** @brief Qualify this journal location and requested source before B intent or driver access. */
     virtual std::expected<sudovda::recovery_authority_t, sudovda::failure_t> verify(const std::filesystem::path &journal_path, const display_policy::source_request_t &request, std::uint64_t generation) = 0;
+    /** @brief Default-deny recovery qualification without manufacturing a fresh source request. */
+    virtual std::expected<std::shared_ptr<recovery_authorization_t>, sudovda::failure_t> verify_recovery(const std::filesystem::path &journal_path);
   };
 
   /** @brief Inert construction inputs; no storage or driver access occurs when they are copied. */
@@ -41,7 +70,7 @@ namespace platf::source_backend {
 
   /** @brief Distinct acquisition/cleanup/liveness diagnostics copied without exposing operational paths. */
   struct diagnostics_t {
-    std::optional<sudovda::failure_t> acquisition;  ///< Original begin/acquisition failure.
+    std::optional<sudovda::failure_t> acquisition;  ///< Original begin/acquisition or reconstruction failure.
     std::optional<sudovda::failure_t> cleanup;  ///< Independent cleanup failure.
     std::optional<sudovda::failure_t> liveness;  ///< Sticky acquisition or heartbeat failure.
   };
@@ -49,8 +78,40 @@ namespace platf::source_backend {
   /** @brief Read-only checked physical availability; an unavailable query is never headless evidence. */
   std::optional<bool> physical_source_available();
 
-  /** @brief Construct an inactive dispatcher; selection and all native work begin only through begin(). */
+  /** @brief Construct an inactive dispatcher; copying options performs no storage or native work. */
   std::shared_ptr<rtsp_stream::source_backend_t> make_backend(options_t options = {});
+
+  /**
+   * @brief Retained reconstruction of one exact startup episode; this never represents a source.
+   * @details Only the startup coordinator can construct or retry this context. It retains partial
+   * B/lease state and authorization across failures. No completion, gate-release or RTSP adoption
+   * operation is supplied by this prerequisite.
+   */
+  class recovery_context_t {
+  public:
+    ~recovery_context_t();
+    recovery_context_t(const recovery_context_t &) = delete;
+    recovery_context_t &operator=(const recovery_context_t &) = delete;
+    /** @brief Copy the original pending generation, including after partial reconstruction failure. */
+    std::uint64_t generation() const;
+    /** @brief Whether exact B and the required lease/receipt are retained; never capture readiness. */
+    bool reconstructed() const;
+    /** @brief Copy inert recovery progress without exposing a capture source or application claim. */
+    rtsp_stream::source_backend_status_t status() const;
+    /** @brief Copy independent acquisition, cleanup and liveness failures. */
+    diagnostics_t diagnostics() const;
+
+  private:
+    friend class source_startup::coordinator_t;
+#ifdef SUNSHINE_TESTS
+    friend std::shared_ptr<rtsp_stream::source_backend_t> test_recovery_backend(const recovery_context_t &context);
+#endif
+    struct state_t;
+    recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion);
+    bool reconstruct();
+    bool fence();
+    std::unique_ptr<state_t> state_;
+  };
 
 #ifdef SUNSHINE_TESTS
   /** @brief Inert boundaries for exercising the concrete adapter with existing B and D fixtures. */
@@ -61,6 +122,7 @@ namespace platf::source_backend {
     std::function<std::optional<LUID>(const std::string &)> render_adapter;  ///< Exact configured rendering adapter selection.
     std::function<std::unique_ptr<sudovda::system_t>()> make_system;  ///< Deferred fake driver transport.
     std::function<std::expected<std::unique_ptr<display_device::owned_display_configuration_t>, sudovda::failure_t>(const std::filesystem::path &, const GUID &, std::uint64_t, const sudovda::recovery_authority_t &)> begin_owned;  ///< Existing B transaction with injected primitives.
+    std::function<std::expected<std::unique_ptr<display_device::owned_display_configuration_t>, sudovda::failure_t>(const std::filesystem::path &, const sudovda::recovery_authority_t &, const std::string &)> recover_owned;  ///< Real B reconstruction through injected native primitives and expected journal bytes.
     std::function<int(const rtsp_stream::capture_source_t &, std::shared_ptr<rtsp_stream::capture_pin_t>)> probe;  ///< Inert probe boundary retaining the actual owner-issued ticket.
   };
 
@@ -70,5 +132,9 @@ namespace platf::source_backend {
   std::optional<bool> test_physical_source_available(const display_device::WinApiLayerInterface &api);
   /** @brief Copy concrete diagnostics without entering native work. */
   diagnostics_t test_diagnostics(const rtsp_stream::source_backend_t &backend);
+  /** @brief Model an independently held guarantee in tests only; no production provenance is claimed. */
+  std::shared_ptr<recovery_authorization_t> test_recovery_authorization(sudovda::recovery_authority_t authority, std::shared_ptr<void> lifetime);
+  /** @brief Inspect the retained concrete recovery backend in component fixtures only. */
+  std::shared_ptr<rtsp_stream::source_backend_t> test_recovery_backend(const recovery_context_t &context);
 #endif
 }  // namespace platf::source_backend

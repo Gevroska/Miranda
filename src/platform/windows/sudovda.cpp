@@ -485,6 +485,14 @@ namespace platf::sudovda {
   }
 
   std::expected<std::shared_ptr<ownership_journal_t>, failure_t> ownership_journal_t::load(const std::filesystem::path &path, const recovery_authority_t &authority) {
+    return load_impl(path, authority, nullptr);
+  }
+
+  std::expected<std::shared_ptr<ownership_journal_t>, failure_t> ownership_journal_t::load(const std::filesystem::path &path, const recovery_authority_t &authority, const std::string &expected_bytes) {
+    return load_impl(path, authority, &expected_bytes);
+  }
+
+  std::expected<std::shared_ptr<ownership_journal_t>, failure_t> ownership_journal_t::load_impl(const std::filesystem::path &path, const recovery_authority_t &authority, const std::string *expected_bytes) {
     if (path.empty() || !valid_authority(authority, authority.deployment)) {
       return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
     }
@@ -492,7 +500,7 @@ namespace platf::sudovda {
     state->path = path;
     bool valid {false};
     const bool read {http::update_state_file_bytes(path.string(), [&](const std::string &current) -> std::optional<std::string> {
-      if (current.empty() || current.size() > 24 * 1024 * 1024) {
+      if (current.empty() || current.size() > 24 * 1024 * 1024 || (expected_bytes && current != *expected_bytes)) {
         return std::nullopt;
       }
       try {
@@ -667,7 +675,7 @@ namespace platf::sudovda {
 
   bool ownership_journal_t::confirm_unarmed() {
     std::lock_guard lock {state_->mutex};
-    state_->unarmed_confirmed = !state_->data.at("add_armed").get<bool>() && state_->unchanged();
+    state_->unarmed_confirmed = !state_->data.at("add_armed").get<bool>() && !state_->data.at("source_retired").get<bool>() && state_->unchanged();
     return state_->unarmed_confirmed;
   }
 
@@ -817,22 +825,30 @@ namespace platf::sudovda {
       if (heartbeat || heartbeat_period.count() == 0) {
         return {};
       }
-      auto result = system->heartbeat(heartbeat_period, [this] {
-        if (auto ping = command(wire::ping); !ping) {
-          remember_heartbeat_failure(ping.error());
+      try {
+        auto result = system->heartbeat(heartbeat_period, [this] {
+          if (auto ping = command(wire::ping); !ping) {
+            remember_heartbeat_failure(ping.error());
+          }
+        });
+        if (!result) {
+          remember_heartbeat_failure(result.error());
+          return std::unexpected(result.error());
         }
-      });
-      if (!result) {
-        remember_heartbeat_failure(result.error());
-        return std::unexpected(result.error());
-      }
-      if (!*result) {
-        const failure_t failure {errc_t::heartbeat_failed, operation_t::heartbeat, ERROR_INVALID_HANDLE};
+        if (!*result) {
+          const failure_t failure {errc_t::heartbeat_failed, operation_t::heartbeat, ERROR_INVALID_HANDLE};
+          remember_heartbeat_failure(failure);
+          return std::unexpected(failure);
+        }
+        heartbeat = std::move(*result);
+        return {};
+      } catch (...) {
+        const failure_t failure {errc_t::heartbeat_failed, operation_t::heartbeat};
+        // Retained ownership must carry the failure itself, including when the failure handler's
+        // second creation attempt also throws. A copied acquisition diagnostic is insufficient.
         remember_heartbeat_failure(failure);
         return std::unexpected(failure);
       }
-      heartbeat = std::move(*result);
-      return {};
     }
   };
 
@@ -1004,6 +1020,13 @@ namespace platf::sudovda {
     return result;
   }
 
+  std::expected<cleanup_receipt_t, failure_t> lease_t::recover_unarmed(const std::shared_ptr<ownership_journal_t> &journal, const recovery_authority_t &authority) {
+    if (!journal || !journal->validate(authority) || journal->source_retired() || !journal->confirm_unarmed()) {
+      return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+    }
+    return cleanup_receipt_t {journal, journal->record().identity, journal->record().generation, cleanup_receipt_t::kind_e::unarmed};
+  }
+
   acquisition_t lease_t::recover(std::unique_ptr<system_t> system, const std::shared_ptr<ownership_journal_t> &journal, const recovery_authority_t &authority) {
     if (!system || !journal || !journal->validate(authority) || journal->source_retired() || !journal->add_armed()) {
       return {nullptr, failure_t {errc_t::ownership_unverified, operation_t::journal}, {}};
@@ -1020,54 +1043,70 @@ namespace platf::sudovda {
     const auto fail = [&](failure_t failure) -> acquisition_t {
       // Before adoption, closing the handle is safe; after adoption the owner must restore first.
       if (state.owned) {
-        const auto heartbeat {state.start_heartbeat()};
-        return {std::move(lease), failure, {}, {}, heartbeat ? std::nullopt : std::make_optional(heartbeat.error()), true};
+        try {
+          const auto heartbeat {state.start_heartbeat()};
+          return {std::move(lease), failure, {}, {}, heartbeat ? std::nullopt : std::make_optional(heartbeat.error()), true};
+        } catch (...) {
+          const failure_t liveness {errc_t::heartbeat_failed, operation_t::heartbeat};
+          state.remember_heartbeat_failure(liveness);
+          return {std::move(lease), failure, {}, {}, liveness, true};
+        }
       }
-      auto cleanup {lease->cleanup()};
-      return cleanup ? acquisition_t {nullptr, failure, {}} : acquisition_t {std::move(lease), failure, cleanup.error()};
+      try {
+        auto cleanup {lease->cleanup()};
+        return cleanup ? acquisition_t {nullptr, failure, {}} : acquisition_t {std::move(lease), failure, cleanup.error()};
+      } catch (...) {
+        return {std::move(lease), failure, failure_t {errc_t::close_failed, operation_t::close}};
+      }
     };
-    if (auto result {state.system->open()}; !result) {
-      return fail(result.error());
+    try {
+      if (auto result {state.system->open()}; !result) {
+        return fail(result.error());
+      }
+      state.opened = true;
+      if (auto result {state.command(wire::version, {}, output_bytes(state.version))}; !result) {
+        return fail(result.error());
+      }
+      if (state.version.test_build > 1 || state.version.major != wire::client_version.major || state.version.minor < wire::client_version.minor) {
+        return fail({errc_t::incompatible_protocol, operation_t::version});
+      }
+      wire::watchdog_t watchdog {};
+      if (auto result {state.command(wire::watchdog, {}, output_bytes(watchdog))}; !result) {
+        return fail(result.error());
+      }
+      if (watchdog.countdown > watchdog.timeout || watchdog.timeout == 1) {
+        return fail({watchdog.timeout == 1 ? errc_t::unsupported_watchdog : errc_t::malformed_response, operation_t::watchdog});
+      }
+      if (watchdog.timeout) {
+        state.heartbeat_period = std::chrono::milliseconds {std::min<std::uint64_t>(1000, std::uint64_t {watchdog.timeout} * 1000 / 3)};
+      }
+      // No caller-supplied GUID reaches removal: identity came only from the validated journal.
+      state.owned = true;
+      if (auto result {state.start_heartbeat()}; !result) {
+        return fail(result.error());
+      }
+      auto present {state.system->enumerate()};
+      if (!present) {
+        return fail(present.error());
+      }
+      const bool absent {std::ranges::none_of(present->identities, [&](const auto &identity) {
+        return IsEqualGUID(identity, state.identity);
+      })};
+      auto normalized {normalized_owned_display(*present, state.identity)};
+      if (!normalized) {
+        return fail(normalized.error());
+      }
+      state.display = std::move(*normalized);
+      if (!absent && !state.display) {
+        return fail({errc_t::enumeration_timeout, operation_t::enumerate});
+      }
+      state.absent = absent;
+      return {std::move(lease), {}, {}};
+    } catch (...) {
+      // A native/test boundary can throw after adoption. Preserve its actual lease and heartbeat
+      // exactly as for an expected failure; destruction must not abandon that recovery output.
+      return fail({errc_t::transport_failed, operation_t::enumerate});
     }
-    state.opened = true;
-    if (auto result {state.command(wire::version, {}, output_bytes(state.version))}; !result) {
-      return fail(result.error());
-    }
-    if (state.version.test_build > 1 || state.version.major != wire::client_version.major || state.version.minor < wire::client_version.minor) {
-      return fail({errc_t::incompatible_protocol, operation_t::version});
-    }
-    wire::watchdog_t watchdog {};
-    if (auto result {state.command(wire::watchdog, {}, output_bytes(watchdog))}; !result) {
-      return fail(result.error());
-    }
-    if (watchdog.countdown > watchdog.timeout || watchdog.timeout == 1) {
-      return fail({watchdog.timeout == 1 ? errc_t::unsupported_watchdog : errc_t::malformed_response, operation_t::watchdog});
-    }
-    if (watchdog.timeout) {
-      state.heartbeat_period = std::chrono::milliseconds {std::min<std::uint64_t>(1000, std::uint64_t {watchdog.timeout} * 1000 / 3)};
-    }
-    // No caller-supplied GUID reaches removal: identity came only from the validated journal.
-    state.owned = true;
-    if (auto result {state.start_heartbeat()}; !result) {
-      return fail(result.error());
-    }
-    auto present {state.system->enumerate()};
-    if (!present) {
-      return fail(present.error());
-    }
-    const bool absent {std::ranges::none_of(present->identities, [&](const auto &identity) {
-      return IsEqualGUID(identity, state.identity);
-    })};
-    auto normalized {normalized_owned_display(*present, state.identity)};
-    if (!normalized) {
-      return fail(normalized.error());
-    }
-    state.display = std::move(*normalized);
-    if (!absent && !state.display) {
-      return fail({errc_t::enumeration_timeout, operation_t::enumerate});
-    }
-    state.absent = absent;
-    return {std::move(lease), {}, {}};
   }
 
   std::expected<void, failure_t> lease_t::cleanup() {

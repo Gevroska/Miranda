@@ -17,6 +17,7 @@
   #include <future>
   #include <map>
   #include <mutex>
+  #include <stdexcept>
   #include <thread>
   #include <tuple>
 
@@ -67,6 +68,13 @@ namespace {
     std::vector<ActiveTopology> topology_requests;
     unsigned int pings {};
     unsigned int removals {};
+    unsigned int additions {};
+    unsigned int adapter_selections {};
+    unsigned int settings_mutations {};
+    unsigned int heartbeat_creations {};
+    unsigned int heartbeat_creation_throws {};
+    unsigned int watchdog_timeout {3};
+    unsigned int transport_closes {};
     bool query_failure {};
     bool ambiguous {};
     bool alternative {};
@@ -82,6 +90,12 @@ namespace {
     bool capture_metadata {};  ///< Enable complete D readback only for the concrete-backend cases.
     bool heartbeat_failure {};  ///< Inject a sticky asynchronous ping failure.
     bool close_failure {};  ///< Keep a removed lease alive until its transport close succeeds.
+    bool enumeration_exception {};  ///< Throw after recovery has adopted the journal-backed lease.
+    bool protocol_failure {};  ///< Fail recovery before output adoption, allowing close-only retry coverage.
+    std::optional<display_t> recovery_display_override;  ///< Driver observation only; never changes persisted mapping.
+    std::string recovery_library_id;  ///< Current Windows identity override for the recorded virtual target.
+    bool recovery_driver_absent {};  ///< Driver absence conflicting with a still-present Windows mapping.
+    std::optional<DISPLAYCONFIG_PATH_INFO> retained_windows_path;  ///< Explicit stale Windows path, independent of current driver enumeration.
 
     bool active_device(const std::string &id) const {
       return std::ranges::any_of(active, [&](const auto &group) {
@@ -102,6 +116,9 @@ namespace {
     }
 
     display_t display(const std::string &id) const {
+      if (id == "virtual1" && recovery_display_override) {
+        return *recovery_display_override;
+      }
       return {{display_adapter, target(id)}, id == "virtual1" ? first_identity : second_identity, id == "virtual1" ? L"virtual1-path" : L"virtual2-path", id == "virtual1" ? L"virtual1-capture" : L"virtual2-capture", display_adapter, target(id), active_device(id), true};
     }
   };
@@ -131,8 +148,8 @@ namespace {
         path.sourceInfo.adapterId = display_adapter;
         path.sourceInfo.id = display_model_t::target(id);
         path.flags = model_->active_device(id) ? DISPLAYCONFIG_PATH_ACTIVE : 0;
+        path.targetInfo.targetAvailable = TRUE;
         if (model_->capture_metadata) {
-          path.targetInfo.targetAvailable = TRUE;
           path.targetInfo.refreshRate = {model_->modes.at(id).m_refresh_rate.m_numerator, model_->modes.at(id).m_refresh_rate.m_denominator};
           path.sourceInfo.sourceModeInfoIdx = result.m_modes.size();
           DISPLAYCONFIG_MODE_INFO mode {};
@@ -157,6 +174,9 @@ namespace {
           result.m_paths.push_back(alternative);
         }
       }
+      if (model_->retained_windows_path && (type == QueryType::All || (model_->retained_windows_path->flags & DISPLAYCONFIG_PATH_ACTIVE))) {
+        result.m_paths.push_back(*model_->retained_windows_path);
+      }
       return result;
     }
 
@@ -174,6 +194,9 @@ namespace {
 
     std::string getDeviceId(const DISPLAYCONFIG_PATH_INFO &path) const override {
       std::lock_guard lock {model_->mutex};
+      if (path.targetInfo.id == display_model_t::target("virtual1") && !model_->recovery_library_id.empty()) {
+        return model_->recovery_library_id;
+      }
       if (path.sourceInfo.id >= 100 && model_->conflicting_library_id) {
         return "conflicting-id";
       }
@@ -293,6 +316,7 @@ namespace {
 
     bool setTopology(const ActiveTopology &topology) override {
       std::lock_guard lock {model_->mutex};
+      ++model_->settings_mutations;
       model_->topology_requests.push_back(topology);
       if (model_->topology_failure || !isTopologyValid(topology)) {
         return false;
@@ -325,6 +349,7 @@ namespace {
 
     bool setDisplayModes(const DeviceDisplayModeMap &modes) override {
       std::lock_guard lock {model_->mutex};
+      ++model_->settings_mutations;
       if (model_->mode_failure) {
         return false;
       }
@@ -344,6 +369,7 @@ namespace {
 
     bool setAsPrimary(const std::string &id) override {
       std::lock_guard lock {model_->mutex};
+      ++model_->settings_mutations;
       if (!model_->active_device(id)) {
         return false;
       }
@@ -364,6 +390,7 @@ namespace {
 
     bool setHdrStates(const HdrStateMap &states) override {
       std::lock_guard lock {model_->mutex};
+      ++model_->settings_mutations;
       for (const auto &[id, state] : states) {
         if (!model_->active_device(id)) {
           return false;
@@ -426,6 +453,7 @@ namespace {
 
     std::expected<void, failure_t> close() override {
       std::lock_guard lock {model_->mutex};
+      ++model_->transport_closes;
       if (model_->close_failure) {
         return std::unexpected(failure_t {errc_t::close_failed, operation_t::close});
       }
@@ -435,12 +463,16 @@ namespace {
     std::expected<std::size_t, failure_t> ioctl(DWORD code, std::span<const std::byte> input, std::span<std::byte> output) override {
       std::lock_guard lock {model_->mutex};
       if (code == wire::version) {
+        if (model_->protocol_failure) {
+          return std::unexpected(failure_t {errc_t::transport_failed, operation_t::version});
+        }
         const wire::version_t version {0, 2, 1, 1};
         std::memcpy(output.data(), &version, sizeof(version));
       } else if (code == wire::watchdog) {
-        const wire::watchdog_t watchdog {3, 3};
+        const wire::watchdog_t watchdog {model_->watchdog_timeout, model_->watchdog_timeout};
         std::memcpy(output.data(), &watchdog, sizeof(watchdog));
       } else if (code == wire::add) {
+        ++model_->additions;
         if (model_->add_failure) {
           return std::unexpected(failure_t {errc_t::transport_failed, operation_t::add, ERROR_TIMEOUT});
         }
@@ -478,14 +510,22 @@ namespace {
         if (model_->heartbeat_failure) {
           return std::unexpected(failure_t {errc_t::heartbeat_failed, operation_t::heartbeat});
         }
+      } else if (code == wire::set_adapter) {
+        ++model_->adapter_selections;
       }
       return output.size();
     }
 
     std::expected<enumeration_t, failure_t> enumerate() override {
       std::lock_guard lock {model_->mutex};
+      if (model_->enumeration_exception) {
+        throw std::runtime_error {"inert adopted recovery enumeration failure"};
+      }
       enumeration_t result;
       for (const auto &id : {std::string {"virtual1"}, std::string {"virtual2"}}) {
+        if (id == "virtual1" && model_->recovery_driver_absent) {
+          continue;
+        }
         if (model_->present.contains(id)) {
           const auto display {model_->display(id)};
           result.identities.push_back(display.identity);
@@ -504,6 +544,11 @@ namespace {
 
     std::expected<std::unique_ptr<heartbeat_t>, failure_t> heartbeat(std::chrono::milliseconds, std::function<void()> callback) override {
       std::lock_guard lock {model_->mutex};
+      ++model_->heartbeat_creations;
+      if (model_->heartbeat_creation_throws) {
+        --model_->heartbeat_creation_throws;
+        throw std::runtime_error {"inert heartbeat creation failure"};
+      }
       model_->tick = std::move(callback);
       return std::make_unique<model_heartbeat_t>(model_);
     }
@@ -883,6 +928,770 @@ namespace {
     }
   };
 }  // namespace
+
+namespace {
+  /** @brief Test-only model of held deployment authorization; never infers it from the journal. */
+  class reconstruction_authority_t final: public platf::source_backend::authority_verifier_t {
+  public:
+    std::string deployment {"transaction-fixture"};
+    unsigned int calls {};
+    bool denied {};
+    std::weak_ptr<void> lifetime;
+
+    std::expected<recovery_authority_t, failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
+      ADD_FAILURE() << "Recovery must not synthesize a fresh source request";
+      return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+    }
+
+    std::expected<std::shared_ptr<platf::source_backend::recovery_authorization_t>, failure_t> verify_recovery(const std::filesystem::path &) override {
+      ++calls;
+      if (denied) {
+        return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+      }
+      auto held = std::make_shared<int>(0);
+      lifetime = held;
+      return platf::source_backend::test_recovery_authorization({deployment, true, true}, std::move(held));
+    }
+  };
+
+  class OwnedReconstructionTest: public OwnedDisplayTest {
+  protected:
+    std::shared_ptr<reconstruction_authority_t> verifier {std::make_shared<reconstruction_authority_t>()};
+    std::unique_ptr<platf::source_startup::coordinator_t> startup;
+    std::shared_ptr<platf::source_backend::recovery_context_t> context;
+    unsigned int b_calls {}, driver_calls {};
+    bool fail_driver_allocation {};
+    std::function<void()> before_b;
+    std::filesystem::path canonical_path;
+
+    void TearDown() override {
+      context.reset();
+      startup.reset();
+      OwnedDisplayTest::TearDown();
+    }
+
+    std::string journal_bytes() {
+      std::ifstream input {path, std::ios::binary};
+      return {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
+    }
+
+    nlohmann::json journal_data() {
+      return nlohmann::json::parse(journal_bytes());
+    }
+
+    void write_bytes(const std::string &bytes) {
+      std::ofstream output {path, std::ios::binary | std::ios::trunc};
+      output << bytes;
+      ASSERT_TRUE(output.good());
+    }
+
+    bool crash_episode(bool armed = true) {
+      if (!begin()) {
+        return false;
+      }
+      if (armed && (!acquire() || !prepare())) {
+        return false;
+      }
+      if (!source->cancel(1)) {
+        return false;
+      }
+      lease.reset();  // A managed abandoned lease closes without removing; durable intent remains.
+      source.reset();
+      return true;
+    }
+
+    void make_startup() {
+      canonical_path = std::filesystem::absolute(path).lexically_normal();
+      canonical_path.make_preferred();
+      platf::source_backend::test_dependencies_t dependencies;
+      dependencies.make_api = []() -> std::shared_ptr<WinApiLayerInterface> {
+        ADD_FAILURE() << "Recovery must not initialize capture readback";
+        return {};
+      };
+      dependencies.capture_names = []() {
+        ADD_FAILURE() << "Recovery must not enumerate capture selectors";
+        return std::vector<std::string> {};
+      };
+      dependencies.render_adapter = [](const auto &) -> std::optional<LUID> {
+        ADD_FAILURE() << "Recovery must not select a rendering adapter";
+        return {};
+      };
+      dependencies.begin_owned = [](const auto &, const auto &, auto, const auto &) -> std::expected<std::unique_ptr<owned_display_configuration_t>, failure_t> {
+        ADD_FAILURE() << "Recovery must not create or rotate intent";
+        return std::unexpected(failure_t {errc_t::journal_failed, operation_t::journal});
+      };
+      dependencies.make_system = [this]() -> std::unique_ptr<system_t> {
+        ++driver_calls;
+        EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+        EXPECT_FALSE(verifier->lifetime.expired());
+        if (fail_driver_allocation) {
+          throw std::runtime_error {"inert recovery allocation failure"};
+        }
+        return std::make_unique<model_system_t>(model);
+      };
+      dependencies.recover_owned = [this](const auto &file, const auto &qualification, const auto &expected) {
+        ++b_calls;
+        EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+        EXPECT_FALSE(verifier->lifetime.expired());
+        if (before_b) {
+          before_b();
+        }
+        auto result = owned_display_configuration_t::test_recover(file, qualification, api, devices, expected);
+        if (result) {
+          (*result)->test_set_retry_interval(10ms);
+          concrete_transaction = result->get();
+        }
+        return result;
+      };
+      startup = platf::source_startup::coordinator_t::test_make({canonical_path, canonical_path.parent_path() / (canonical_path.filename().native() + L".ordinary.state")}, {}, std::move(dependencies));
+    }
+
+    std::shared_ptr<platf::source_backend::recovery_context_t> reconstruct() {
+      context = startup->reconstruct({canonical_path, verifier});
+      return context;
+    }
+
+    void reject_heartbeat_creation(unsigned int throws) {
+      ASSERT_TRUE(crash_episode());
+      const auto original = journal_bytes();
+      const auto mutations = model->settings_mutations;
+      const auto closes = model->transport_closes;
+      const auto creations = model->heartbeat_creations;
+      model->heartbeat_creation_throws = throws;
+      make_startup();
+      ASSERT_TRUE(reconstruct());
+      EXPECT_FALSE(context->reconstructed());
+      // Before progress publishes copied diagnostics, status reads the actual retained lease latch.
+      EXPECT_TRUE(context->status().heartbeat_failed);
+      ASSERT_TRUE(context->diagnostics().acquisition);
+      ASSERT_TRUE(context->diagnostics().liveness);
+      EXPECT_EQ(context->diagnostics().liveness->operation, operation_t::heartbeat);
+      EXPECT_EQ(model->heartbeat_creations, creations + 2);
+      EXPECT_EQ(static_cast<bool>(model->tick), throws == 1);
+      const auto retained = context;
+      const auto backend = platf::source_backend::test_recovery_backend(*context);
+      EXPECT_EQ(reconstruct(), retained);
+      EXPECT_FALSE(context->reconstructed());
+      EXPECT_FALSE(backend->restore(1, 0ms));
+      EXPECT_FALSE(backend->cleanup_and_retire(1));
+      EXPECT_TRUE(context->status().heartbeat_failed);
+      EXPECT_EQ(model->heartbeat_creations, creations + 2);
+      EXPECT_EQ(model->settings_mutations, mutations);
+      EXPECT_EQ(model->transport_closes, closes);
+      EXPECT_EQ(model->removals, 0u);
+      EXPECT_EQ(model->additions, 1u);
+      EXPECT_EQ(b_calls, 1u);
+      EXPECT_EQ(driver_calls, 1u);
+      EXPECT_EQ(journal_bytes(), original);
+      EXPECT_FALSE(verifier->lifetime.expired());
+      EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+    }
+
+    void reject_changed_binding(unsigned int kind, bool initially_absent = false, bool inactive_conflict = false) {
+      ASSERT_TRUE(crash_episode());
+      {
+        std::lock_guard lock {model->mutex};
+        model->api_unavailable = true;
+        if (initially_absent) {
+          model->present.erase("virtual1");
+          model->active = {{"dock"}};
+          model->primary = "dock";
+        }
+      }
+      make_startup();
+      ASSERT_TRUE(reconstruct());
+      ASSERT_TRUE(context->reconstructed());
+      ASSERT_TRUE(concrete_transaction->cancel(1));
+      const auto original = journal_bytes();
+      const auto mapping = journal_data().at("mapping");
+      const auto mutations = model->settings_mutations;
+      {
+        std::lock_guard lock {model->mutex};
+        model->present.insert("virtual1");
+        model->active = {{"virtual1"}};
+        model->primary = "virtual1";
+        auto changed = model->display("virtual1");
+        if (kind == 0) {
+          changed.monitor_path = L"changed-owned-monitor-path";
+          model->recovery_display_override = changed;
+        } else if (kind == 1) {
+          ++changed.target.target;
+          model->recovery_display_override = changed;
+        } else if (kind == 2) {
+          model->recovery_library_id = "changed-owned-library-id";
+        } else if (kind == 3) {
+          model->alternative = true;
+          model->conflicting_library_id = true;
+        } else {
+          model->recovery_driver_absent = true;
+          if (inactive_conflict) {
+            model->active = {{"dock"}};
+            model->primary = "dock";
+          }
+        }
+        model->api_unavailable = false;
+      }
+      if (kind == 4) {
+        const auto windows = api->queryDisplayConfig(QueryType::All);
+        ASSERT_TRUE(windows);
+        const auto matching = std::ranges::find_if(windows->m_paths, [](const auto &path) {
+          return path.targetInfo.id == display_model_t::target("virtual1");
+        });
+        ASSERT_NE(matching, windows->m_paths.end());
+        EXPECT_EQ(matching->targetInfo.targetAvailable, TRUE);
+        EXPECT_EQ(static_cast<bool>(matching->flags & DISPLAYCONFIG_PATH_ACTIVE), !inactive_conflict);
+        const auto driver = model_system_t {model}.enumerate();
+        ASSERT_TRUE(driver);
+        EXPECT_TRUE(driver->identities.empty());
+      }
+      const auto retained = context;
+      const auto backend = platf::source_backend::test_recovery_backend(*context);
+      EXPECT_EQ(reconstruct(), retained);
+      EXPECT_FALSE(context->reconstructed());
+      EXPECT_FALSE(backend->restore(1, 0ms));
+      EXPECT_FALSE(backend->cleanup_and_retire(1));
+      EXPECT_EQ(model->settings_mutations, mutations);
+      EXPECT_EQ(model->removals, 0u);
+      EXPECT_EQ(model->additions, 1u);
+      EXPECT_EQ(b_calls, 1u);
+      EXPECT_EQ(driver_calls, 1u);
+      EXPECT_EQ(journal_bytes(), original);
+      EXPECT_EQ(journal_data().at("mapping"), mapping);
+      EXPECT_FALSE(verifier->lifetime.expired());
+      EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+      ASSERT_TRUE(model->tick);
+      model->tick();
+      EXPECT_GT(model->pings, 0u);
+      {
+        std::lock_guard lock {model->mutex};
+        model->recovery_display_override.reset();
+        model->recovery_library_id.clear();
+        model->alternative = false;
+        model->conflicting_library_id = false;
+        model->recovery_driver_absent = false;
+        if (inactive_conflict) {
+          model->active = {{"virtual1"}};
+          model->primary = "virtual1";
+        }
+      }
+      EXPECT_EQ(reconstruct(), retained);
+      EXPECT_TRUE(context->reconstructed());
+      EXPECT_EQ(journal_data().at("mapping"), mapping);
+      EXPECT_EQ(context->generation(), 1u);
+      EXPECT_EQ(b_calls, 1u);
+      EXPECT_EQ(driver_calls, 1u);
+      EXPECT_GT(model->settings_mutations, mutations);
+    }
+
+    void accept_unavailable_retained_path(bool active) {
+      ASSERT_TRUE(crash_episode());
+      const auto original = journal_data();
+      {
+        std::lock_guard lock {model->mutex};
+        model->present.erase("virtual1");
+        model->active = {{"dock"}};
+        model->primary = "dock";
+        DISPLAYCONFIG_PATH_INFO retained {};
+        retained.sourceInfo.adapterId = display_adapter;
+        retained.sourceInfo.id = display_model_t::target("virtual1");
+        retained.targetInfo.adapterId = display_adapter;
+        retained.targetInfo.id = display_model_t::target("virtual1");
+        retained.targetInfo.targetAvailable = FALSE;
+        retained.flags = active ? DISPLAYCONFIG_PATH_ACTIVE : 0;
+        model->retained_windows_path = retained;
+      }
+      const auto driver = model_system_t {model}.enumerate();
+      ASSERT_TRUE(driver);
+      EXPECT_TRUE(driver->identities.empty());
+      const auto windows = api->queryDisplayConfig(QueryType::All);
+      ASSERT_TRUE(windows);
+      const auto retained = std::ranges::find_if(windows->m_paths, [](const auto &path) {
+        return path.targetInfo.id == display_model_t::target("virtual1");
+      });
+      ASSERT_NE(retained, windows->m_paths.end());
+      EXPECT_FALSE(retained->targetInfo.targetAvailable);
+      EXPECT_EQ(static_cast<bool>(retained->flags & DISPLAYCONFIG_PATH_ACTIVE), active);
+      make_startup();
+      ASSERT_TRUE(reconstruct());
+      ASSERT_TRUE(context->reconstructed());
+      ASSERT_TRUE(concrete_transaction);
+      const auto observed = concrete_transaction->test_status_after_scheduled_work();
+      EXPECT_EQ(observed.phase, owned_display_phase_e::removal_ready);
+      EXPECT_TRUE(observed.removal_permitted);
+      EXPECT_EQ(observed.revert_result, SettingsManagerInterface::RevertResult::Ok);
+      const auto current = journal_data();
+      EXPECT_EQ(current.at("mapping"), original.at("mapping"));
+      EXPECT_EQ(current.at("identity"), original.at("identity"));
+      EXPECT_EQ(current.at("generation"), original.at("generation"));
+      EXPECT_EQ(current.at("baseline"), original.at("baseline"));
+      EXPECT_EQ(model->additions, 1u);
+      EXPECT_EQ(model->removals, 0u);
+      EXPECT_EQ(b_calls, 1u);
+      EXPECT_EQ(driver_calls, 1u);
+      EXPECT_FALSE(verifier->lifetime.expired());
+      EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+    }
+  };
+}  // namespace
+
+TEST_F(OwnedReconstructionTest, UnarmedReconstructsRealEpisodeWithoutDriverOrNewIntentAndKeepsGate) {
+  ASSERT_TRUE(crash_episode(false));
+  const auto original = journal_data();
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  EXPECT_EQ(context->generation(), 1u);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_EQ(model->additions, 0u);
+  EXPECT_EQ(model->removals, 0u);
+  const auto current = journal_data();
+  EXPECT_EQ(current.at("identity"), original.at("identity"));
+  EXPECT_EQ(current.at("generation"), original.at("generation"));
+  EXPECT_EQ(current.at("baseline"), original.at("baseline"));
+  EXPECT_TRUE(current.at("source_retired").get<bool>());
+  EXPECT_FALSE(context->status().source);
+  EXPECT_TRUE(context->status().source_released);
+  EXPECT_TRUE(context->status().recovery_pending);
+  EXPECT_FALSE(startup->status().prior_uncertainty);
+  EXPECT_FALSE(startup->release_for_ordinary());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  EXPECT_FALSE(verifier->lifetime.expired());
+}
+
+TEST_F(OwnedReconstructionTest, DeniedAuthorityRetainsOneContextBeforeBAndRetriesOnlyTheSameVerifier) {
+  ASSERT_TRUE(crash_episode(false));
+  const auto original = journal_bytes();
+  verifier->denied = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  EXPECT_EQ(b_calls, 0u);
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_EQ(journal_bytes(), original);
+  const auto retained = context;
+  EXPECT_FALSE(startup->reconstruct({canonical_path, std::make_shared<reconstruction_authority_t>()}));
+  verifier->denied = false;
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 0u);
+}
+
+TEST_F(OwnedReconstructionTest, ArmedPresentRetainsExactSettingsAndRequiresRealCloseReceiptBeforeRetirement) {
+  ASSERT_TRUE(crash_episode());
+  const auto original = journal_data();
+  model->api_unavailable = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  const auto backend = platf::source_backend::test_recovery_backend(*context);
+  EXPECT_EQ(context->generation(), 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(model->adapter_selections, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_EQ(journal_data().at("settings"), original.at("settings"));
+  EXPECT_EQ(journal_data().at("baseline"), original.at("baseline"));
+  EXPECT_EQ(journal_data().at("mapping"), original.at("mapping"));
+  EXPECT_FALSE(backend->status().source);
+  EXPECT_FALSE(backend->admits(concrete_request()));
+  EXPECT_FALSE(backend->begin(concrete_request(), 2, 1));
+  EXPECT_EQ(backend->probe({}, {}), 503);
+  EXPECT_FALSE(backend->validate_retained({}, 1));
+  EXPECT_FALSE(backend->cleanup_and_retire(2));
+  EXPECT_FALSE(backend->cleanup_and_retire(1));
+  {
+    std::lock_guard lock {model->mutex};
+    model->api_unavailable = false;
+  }
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  model->close_failure = true;
+  EXPECT_FALSE(backend->cleanup_and_retire(1));
+  EXPECT_EQ(model->removals, 1u);
+  EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
+  ASSERT_TRUE(context->diagnostics().cleanup);
+  model->close_failure = false;
+  EXPECT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_EQ(model->removals, 1u);
+  EXPECT_TRUE(journal_data().at("source_retired").get<bool>());
+  EXPECT_FALSE(backend->complete(1));
+  EXPECT_FALSE(startup->release_for_ordinary());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, ArmedAbsentUsesExactRecoveryLeaseWithoutAddOrSourceReadiness) {
+  ASSERT_TRUE(crash_episode());
+  model->present.erase("virtual1");
+  model->active = {{"dock"}};
+  model->primary = "dock";
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  const auto backend = platf::source_backend::test_recovery_backend(*context);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_FALSE(backend->status().source);
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_TRUE(journal_data().at("source_retired").get<bool>());
+  EXPECT_EQ(journal_data().at("generation"), 1);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, ReinspectionFencesRetainedBRetryBeforeOpeningCheckedStorageHandles) {
+  ASSERT_TRUE(crash_episode());
+  model->api_unavailable = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::promise<void> release;
+  const auto release_future = release.get_future().share();
+  std::atomic_bool blocked {false};
+  {
+    std::lock_guard lock {model->mutex};
+    model->api_check_hook = [&]() {
+      if (!blocked.exchange(true)) {
+        entered.set_value();
+        release_future.wait();
+      }
+    };
+  }
+  const bool observed = entered_future.wait_for(2s) == std::future_status::ready;
+  if (!observed) {
+    release.set_value();
+    std::ignore = concrete_transaction->cancel(1);
+    std::lock_guard lock {model->mutex};
+    model->api_check_hook = {};
+    FAIL() << "Expected the retained B retry callback";
+  }
+  auto retry = std::async(std::launch::async, [&]() {
+    return startup->reconstruct({canonical_path, verifier});
+  });
+  EXPECT_EQ(retry.wait_for(20ms), std::future_status::timeout);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  release.set_value();
+  EXPECT_EQ(retry.get(), context);
+  EXPECT_FALSE(startup->status().prior_uncertainty);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  ASSERT_TRUE(concrete_transaction->cancel(1));
+  {
+    std::lock_guard lock {model->mutex};
+    model->api_check_hook = {};
+  }
+}
+
+TEST_F(OwnedReconstructionTest, RetiredEpisodeResumesBWithoutReacquiringOrRemoving) {
+  ASSERT_TRUE(begin());
+  ASSERT_TRUE(acquire());
+  ASSERT_TRUE(prepare());
+  ASSERT_TRUE(release(1));
+  source.reset();
+  const auto original = journal_data();
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_EQ(model->removals, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(journal_data().at("identity"), original.at("identity"));
+  EXPECT_EQ(journal_data().at("generation"), original.at("generation"));
+  EXPECT_EQ(journal_data().at("baseline"), original.at("baseline"));
+  EXPECT_TRUE(context->status().source_released);
+  EXPECT_FALSE(context->status().source);
+  EXPECT_FALSE(startup->release_for_ordinary());
+}
+
+TEST_F(OwnedReconstructionTest, BindingFailureRetainsAdoptedLeaseAuthorityAndSameGenerationForRetry) {
+  ASSERT_TRUE(crash_episode());
+  const auto original = journal_bytes();
+  model->query_failure = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  const auto retained = context;
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  ASSERT_TRUE(model->tick);
+  model->tick();
+  EXPECT_GT(model->pings, 0u);
+  EXPECT_FALSE(startup->reconstruct({canonical_path, std::make_shared<reconstruction_authority_t>()}));
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  auto changed = nlohmann::json::parse(original);
+  changed["generation"] = std::uint64_t {2};
+  changed["mapping"]["generation"] = std::uint64_t {2};
+  write_bytes(changed.dump());
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_FALSE(context->reconstructed());
+  EXPECT_EQ(context->generation(), 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_TRUE(model->tick);
+  write_bytes(original);
+  model->query_failure = false;
+  ASSERT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(verifier->calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(context->generation(), 1u);
+}
+
+TEST_F(OwnedReconstructionTest, LaterOrdinaryConflictRetainsPartialLeaseAndCannotBeClearedByDeletion) {
+  ASSERT_TRUE(crash_episode());
+  model->query_failure = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_FALSE(context->reconstructed());
+  const auto ordinary_path = canonical_path.parent_path() / (canonical_path.filename().native() + L".ordinary.state");
+  {
+    std::ofstream output {ordinary_path, std::ios::binary};
+    output << journal_data().at("baseline").get<std::string>();
+  }
+  EXPECT_FALSE(startup->reconstruct({canonical_path, verifier}));
+  EXPECT_TRUE(startup->status().prior_uncertainty);
+  std::error_code error;
+  std::filesystem::remove(ordinary_path, error);
+  EXPECT_FALSE(error);
+  EXPECT_FALSE(startup->reconstruct({canonical_path, verifier}));
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_TRUE(model->tick);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, FailureAfterBRetainsReservationAndRetriesWithoutReopeningB) {
+  ASSERT_TRUE(crash_episode());
+  fail_driver_allocation = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_FALSE(owned_display_configuration_t::test_recover(path, authority, api, devices));
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  const auto retained = context;
+  fail_driver_allocation = false;
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 2u);
+  EXPECT_EQ(model->additions, 1u);
+}
+
+TEST_F(OwnedReconstructionTest, ExceptionAfterDriverAdoptionReturnsAndRetainsTheActualLease) {
+  ASSERT_TRUE(crash_episode());
+  model->enumeration_exception = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  ASSERT_TRUE(context->diagnostics().acquisition);
+  EXPECT_EQ(context->diagnostics().acquisition->code, errc_t::transport_failed);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_TRUE(model->tick);
+  const auto retained = context;
+  model->enumeration_exception = false;
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  startup.reset();
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, FailedPreAdoptionCloseRetriesTransportWithoutRemovingOrReopeningB) {
+  ASSERT_TRUE(crash_episode());
+  model->protocol_failure = true;
+  model->close_failure = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  ASSERT_TRUE(context->diagnostics().cleanup);
+  EXPECT_EQ(context->diagnostics().cleanup->operation, operation_t::close);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  const auto retained = context;
+  model->protocol_failure = false;
+  model->close_failure = false;
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 2u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, ThrowingHeartbeatCreationRemainsStickyEvenIfFailurePathEstablishesAWorker) {
+  reject_heartbeat_creation(1);
+}
+
+TEST_F(OwnedReconstructionTest, RepeatedThrowingHeartbeatCreationCannotAdvanceTheSameRetainedContext) {
+  reject_heartbeat_creation(2);
+}
+
+TEST_F(OwnedReconstructionTest, DisabledWatchdogNeedsNoHeartbeatWorkerAndStillReconstructs) {
+  model->watchdog_timeout = 0;
+  ASSERT_TRUE(crash_episode());
+  model->heartbeat_creation_throws = 2;
+  model->api_unavailable = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_FALSE(context->status().heartbeat_failed);
+  EXPECT_FALSE(context->diagnostics().liveness);
+  EXPECT_EQ(model->heartbeat_creations, 0u);
+  EXPECT_FALSE(model->tick);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, ChangedMonitorPathAfterSuccessfulBindRefusesBeforeAnyFurtherSettingsMutation) {
+  reject_changed_binding(0);
+}
+
+TEST_F(OwnedReconstructionTest, ChangedTargetAfterSuccessfulBindRefusesBeforeAnyFurtherSettingsMutation) {
+  reject_changed_binding(1);
+}
+
+TEST_F(OwnedReconstructionTest, ChangedLibraryIdentityAfterSuccessfulBindRefusesBeforeAnyFurtherSettingsMutation) {
+  reject_changed_binding(2);
+}
+
+TEST_F(OwnedReconstructionTest, AmbiguousWindowsIdentityAfterSuccessfulBindRefusesBeforeAnyFurtherSettingsMutation) {
+  reject_changed_binding(3);
+}
+
+TEST_F(OwnedReconstructionTest, DriverAbsenceCannotOverrideStillPresentWindowsMappingOnRetry) {
+  reject_changed_binding(4);
+}
+
+TEST_F(OwnedReconstructionTest, AvailableInactiveMatchingPathRefusesBeforeAnyFurtherSettingsMutation) {
+  reject_changed_binding(4, false, true);
+}
+
+TEST_F(OwnedReconstructionTest, UnavailableInactiveMatchingPathDoesNotConflictWithActualDriverAbsence) {
+  accept_unavailable_retained_path(false);
+}
+
+TEST_F(OwnedReconstructionTest, UnavailableTransientActiveMatchingPathDoesNotConflictWithActualDriverAbsence) {
+  accept_unavailable_retained_path(true);
+}
+
+TEST_F(OwnedReconstructionTest, InitiallyAbsentRecoveryRejectsConflictingPresentMappingBeforeRestoration) {
+  reject_changed_binding(0, true);
+}
+
+TEST_F(OwnedReconstructionTest, ExactPresentAbsentPresentTransitionsKeepTheOriginalMappingAndResumeRestoration) {
+  ASSERT_TRUE(crash_episode());
+  model->api_unavailable = true;
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_TRUE(context->reconstructed());
+  const auto retained = context;
+  const auto mapping = journal_data().at("mapping");
+  ASSERT_TRUE(concrete_transaction->cancel(1));
+  {
+    std::lock_guard lock {model->mutex};
+    model->present.erase("virtual1");
+    model->active = {{"dock"}};
+    model->primary = "dock";
+  }
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(journal_data().at("mapping"), mapping);
+  ASSERT_TRUE(concrete_transaction->cancel(1));
+  const auto mutations = model->settings_mutations;
+  {
+    std::lock_guard lock {model->mutex};
+    model->present.insert("virtual1");
+    model->active = {{"virtual1"}};
+    model->primary = "virtual1";
+    model->api_unavailable = false;
+  }
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(journal_data().at("mapping"), mapping);
+  EXPECT_GT(model->settings_mutations, mutations);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(OwnedReconstructionTest, InterruptedBeforeFirstBindRecoveryPersistsOnlyItsFirstExactMapping) {
+  ASSERT_TRUE(begin());
+  const auto baseline = source->journal()->record().baseline;
+  const request_t request {first_identity, display_adapter, 1920, 1080, 60, 1, "Miranda", "fixture", true, 1, 0ms};
+  auto acquired = lease_t::acquire_owned(std::make_unique<model_system_t>(model), request, source->journal(), authority);
+  ASSERT_FALSE(acquired.failure);
+  ASSERT_TRUE(acquired.lease);
+  ASSERT_FALSE(source->journal()->mapping());
+  ASSERT_TRUE(source->cancel(1));
+  acquired.lease.reset();
+  source.reset();
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_TRUE(context->reconstructed());
+  const auto data = journal_data();
+  ASSERT_TRUE(data.at("mapping").is_object());
+  EXPECT_EQ(data.at("mapping").at("generation"), 1);
+  EXPECT_EQ(data.at("mapping").at("identity"), data.at("identity"));
+  EXPECT_EQ(data.at("mapping").at("device_id"), "virtual1");
+  EXPECT_EQ(data.at("baseline"), baseline);
+  EXPECT_EQ(model->additions, 1u);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+}
+
+TEST_F(OwnedReconstructionTest, ChangedBytesInsideCheckedLoadRefuseThenRetryExactOriginalEpisode) {
+  ASSERT_TRUE(crash_episode(false));
+  const auto original = journal_bytes();
+  make_startup();
+  before_b = [&]() {
+    write_bytes(original + " ");
+  };
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  const auto retained = context;
+  before_b = {};
+  write_bytes(original);
+  EXPECT_EQ(reconstruct(), retained);
+  EXPECT_TRUE(context->reconstructed());
+  EXPECT_EQ(context->generation(), 1u);
+  EXPECT_EQ(verifier->calls, 1u);
+  EXPECT_EQ(b_calls, 2u);
+  EXPECT_EQ(driver_calls, 0u);
+}
+
+TEST_F(OwnedReconstructionTest, IndependentDeploymentMismatchCannotOpenDriverOrReplacePendingIntent) {
+  ASSERT_TRUE(crash_episode(false));
+  const auto original = journal_bytes();
+  verifier->deployment = "independent-other-deployment";
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  EXPECT_FALSE(context->reconstructed());
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_EQ(journal_bytes(), original);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_FALSE(startup->release_for_ordinary());
+}
 
 TEST_F(OwnedDisplayTest, StartupExclusionSurvivesFailedConstructionAndExactJournalRecovery) {
   auto owned_path = std::filesystem::absolute(path).lexically_normal();

@@ -274,6 +274,92 @@ TEST_F(SourceStartupTest, ValidOwnedJournalNeverConfersAuthorityOrReleasesOrdina
   EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
 }
 
+TEST_F(SourceStartupTest, ExpectedOwnedPendingIsDistinctFromPriorUncertainty) {
+  input.owned = encoded(pending_owned().dump());
+  auto coordinator = make();
+  const auto first = coordinator->inspect();
+  EXPECT_TRUE(first.recovery_proof_required);
+  EXPECT_FALSE(first.prior_uncertainty);
+  EXPECT_FALSE(coordinator->inspect().prior_uncertainty);
+  input.owned = {store_state_e::absent, {}};
+  EXPECT_TRUE(coordinator->inspect().recovery_proof_required);
+  EXPECT_FALSE(coordinator->release_for_ordinary());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
+TEST_F(SourceStartupTest, MissingAndDefaultDeniedRecoveryAuthorityEnterNeitherBNorDriver) {
+  class fresh_only_verifier_t final: public platf::source_backend::authority_verifier_t {
+  public:
+    std::expected<platf::sudovda::recovery_authority_t, platf::sudovda::failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
+      ADD_FAILURE() << "A fresh-source verifier does not grant recovery authority";
+      return platf::sudovda::recovery_authority_t {"startup-fixture", true, true};
+    }
+  };
+
+  for (bool supplied : {false, true}) {
+    test_reset_display_device();
+    input.owned = encoded(pending_owned().dump());
+    unsigned int calls {};
+    platf::source_backend::test_dependencies_t dependencies;
+    dependencies.make_system = [&]() -> std::unique_ptr<platf::sudovda::system_t> {
+      ++calls;
+      return {};
+    };
+    dependencies.recover_owned = [&](const auto &, const auto &, const auto &) -> std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> {
+      ++calls;
+      return std::unexpected(platf::sudovda::failure_t {platf::sudovda::errc_t::journal_failed, platf::sudovda::operation_t::journal});
+    };
+    auto coordinator = coordinator_t::test_make({}, [&]() {
+      return input;
+    },
+                                                std::move(dependencies));
+    std::shared_ptr<platf::source_backend::authority_verifier_t> verifier;
+    if (supplied) {
+      verifier = std::make_shared<fresh_only_verifier_t>();
+    }
+    auto recovery = coordinator->reconstruct({{}, verifier});
+    ASSERT_TRUE(recovery);
+    EXPECT_FALSE(recovery->reconstructed());
+    EXPECT_EQ(recovery->generation(), 17u);
+    EXPECT_EQ(recovery->status().generation, 17u);
+    EXPECT_FALSE(recovery->status().source);
+    EXPECT_EQ(calls, 0u);
+    EXPECT_TRUE(recovery->diagnostics().acquisition);
+    EXPECT_EQ(coordinator->reconstruct({{}, verifier}), recovery);
+    EXPECT_FALSE(coordinator->release_for_ordinary());
+    EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  }
+}
+
+TEST_F(SourceStartupTest, PriorUncertaintyResidueOrConflictCannotBeReplacedByOwnedPending) {
+  for (unsigned int kind = 0; kind < 5; ++kind) {
+    test_reset_display_device();
+    input = {};
+    input.owned = kind == 0 ? coordinator_t::test_file_t {store_state_e::unreadable, {}} :
+                  kind == 1 ? coordinator_t::test_file_t {store_state_e::unsafe_path, {}} :
+                              encoded(pending_owned().dump());
+    input.transaction_residue = kind == 2;
+    if (kind == 3) {
+      input.ordinary = encoded(toJson(pending_state()));
+    }
+    auto coordinator = make();
+    const auto first = coordinator->inspect();
+    if (kind == 4) {
+      EXPECT_FALSE(first.prior_uncertainty);
+      input.owned.bytes += " ";
+    } else {
+      EXPECT_TRUE(first.prior_uncertainty);
+      input = {encoded(pending_owned().dump()), {}, false};
+    }
+    EXPECT_TRUE(coordinator->inspect().prior_uncertainty);
+    EXPECT_FALSE(coordinator->reconstruct({}));
+    input = {};
+    EXPECT_FALSE(coordinator->release_for_ordinary());
+    EXPECT_TRUE(coordinator->status().prior_uncertainty);
+    EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  }
+}
+
 TEST_F(SourceStartupTest, BothPendingStoresAreConflictingAndNeverMerged) {
   input.owned = encoded(pending_owned().dump());
   input.ordinary = encoded(toJson(pending_state()));

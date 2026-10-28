@@ -1,6 +1,6 @@
 /**
  * @file src/platform/windows/source_startup.h
- * @brief Inactive Windows startup inspection and ordinary-display exclusion.
+ * @brief Inactive Windows startup inspection, exact owned reconstruction and ordinary exclusion.
  */
 #pragma once
 
@@ -23,6 +23,7 @@
 #include <display_device/windows/types.h>
 
 // local includes
+#include "source_backend.h"
 #include "src/display_device.h"
 
 namespace platf::source_startup {
@@ -65,15 +66,16 @@ namespace platf::source_startup {
     bool exclusion_held {};  ///< Ordinary mutation remains excluded across refusal and failed future reconstruction.
     bool ordinary_released {};  ///< A fresh checked-safe transition released this coordinator's gate.
     bool recovery_proof_required {};  ///< Earlier owned/uncertain state cannot be discharged by later deletion or empty bytes.
+    bool prior_uncertainty {};  ///< Earlier unsafe/unreadable/conflicting or changed pending bytes forbid reconstruction.
   };
 
   /**
    * @brief Inspect startup state on the operation lane before initializing ordinary display management.
    * @details Construction and status are inert. Inspection acquires a sticky ordinary-only exclusion;
    * neither refusal nor destruction releases it. B recovery retains its own independent reservation.
-   * Owned pending state remains unavailable until a later stage supplies independent provisioning
-   * and reconstructs the actual episode. This component never initializes either settings manager,
-   * repairs/deletes storage, manufactures authority or registers a production backend.
+   * Owned pending state requires independently held authorization and explicit reconstruction of
+   * its actual B episode. This component never initializes ordinary display management, creates a
+   * source, manufactures authority, completes the startup gate or registers a production backend.
    */
   class coordinator_t {
   public:
@@ -94,6 +96,14 @@ namespace platf::source_startup {
      * this stage. Cached inspection, deletion, a caller Boolean or missing provisioning permits none.
      */
     bool release_for_ordinary();
+    /**
+     * @brief Reconstruct the exact pending owned episode on the operation lane under held authority.
+     * @details Retains one context before any fallible qualification/B/driver work. Repeated calls
+     * retry that same context; competing inputs, prior uncertainty, changed bytes and ordinary
+     * recovery refuse advancement. Inspection handles are released before B opens its checked
+     * byte transaction. Failure never releases ordinary exclusion or replaces partial recovery.
+     */
+    std::shared_ptr<source_backend::recovery_context_t> reconstruct(source_backend::options_t options);
     /** @brief Copy the last result without storage, scheduler or native access. */
     status_t status() const;
 
@@ -111,8 +121,8 @@ namespace platf::source_startup {
       bool transaction_residue {};  ///< Retained owned .tmp-* or .backup-* material.
     };
 
-    /** @brief Create an inert coordinator with a deterministic storage boundary and the real classifier. */
-    static std::unique_ptr<coordinator_t> test_make(paths_t paths, std::function<test_storage_t()> read);
+    /** @brief Inject storage and recovery primitives; an empty reader retains real checked storage reads. */
+    static std::unique_ptr<coordinator_t> test_make(paths_t paths, std::function<test_storage_t()> read, source_backend::test_dependencies_t dependencies = {});
 #endif
 
   private:

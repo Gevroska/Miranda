@@ -1,6 +1,6 @@
 /**
  * @file src/platform/windows/source_startup.cpp
- * @brief Checked startup reads without initializing a display settings manager.
+ * @brief Checked startup reads and explicit recovery without ordinary display initialization.
  */
 // header include
 #include "source_startup.h"
@@ -326,10 +326,15 @@ namespace platf::source_startup {
     mutable std::mutex publication;  ///< Protect copied status only.
     status_t published;
     bool recovery_proof_required {};  ///< A missing/empty destination cannot discharge previously observed uncertainty or owned intent.
+    bool prior_uncertainty {};  ///< Expected owned intent is distinct from an unsafe/conflicting observation.
+    std::optional<std::string> pending_bytes;  ///< Exact initial episode, never replaced by a later external observation.
+    std::shared_ptr<source_backend::recovery_context_t> recovery;  ///< Retained before fallible authorization/B/lease reconstruction.
+    std::shared_ptr<source_backend::authority_verifier_t> recovery_verifier;  ///< Refuse competing reconstruction inputs.
     std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion;  ///< Shared handoff retains ordinary exclusion across B failures.
     std::optional<storage_t> inspection;  ///< Guards live only through the explicit inspection/release operation.
 #ifdef SUNSHINE_TESTS
     std::function<test_storage_t()> test_read;
+    std::optional<source_backend::test_dependencies_t> test_dependencies;
 #endif
   };
 
@@ -350,6 +355,9 @@ namespace platf::source_startup {
         state_->exclusion = display_device::ordinary_startup_exclusion_t::acquire();
       }
       if (state_->exclusion) {
+        if (state_->recovery && !state_->recovery->fence()) {
+          throw std::runtime_error {"Retained owned recovery could not be fenced for inspection"};
+        }
 #ifdef SUNSHINE_TESTS
         if (state_->test_read) {
           const auto input = state_->test_read();
@@ -363,6 +371,15 @@ namespace platf::source_startup {
           state_->inspection = read_storage(state_->paths);
         }
         result = classify(*state_->inspection);
+        state_->prior_uncertainty = state_->prior_uncertainty || result.disposition == disposition_e::blocked || result.disposition == disposition_e::conflicting_recovery;
+        if (result.disposition == disposition_e::owned_requires_authority && !state_->recovery) {
+          const auto &bytes = state_->inspection->owned.bytes;
+          if (state_->pending_bytes && *state_->pending_bytes != bytes) {
+            state_->prior_uncertainty = true;
+          } else if (!state_->pending_bytes) {
+            state_->pending_bytes = bytes;
+          }
+        }
         state_->recovery_proof_required = state_->recovery_proof_required || !clear(result.owned) ||
                                           (!clear(result.ordinary) && result.ordinary != store_state_e::pending);
       } else {
@@ -372,8 +389,10 @@ namespace platf::source_startup {
       result.owned = result.ordinary = store_state_e::unreadable;
       result.exclusion_held = display_device::ordinary_startup_recovery().mutation_excluded;
       state_->recovery_proof_required = true;
+      state_->prior_uncertainty = true;
     }
     result.recovery_proof_required = state_->recovery_proof_required;
+    result.prior_uncertainty = state_->prior_uncertainty;
     if (result.recovery_proof_required && (result.disposition == disposition_e::ordinary_clear || result.disposition == disposition_e::ordinary_recovery)) {
       result.disposition = disposition_e::recovery_proof_required;
     }
@@ -405,10 +424,43 @@ namespace platf::source_startup {
     return released;
   }
 
+  std::shared_ptr<source_backend::recovery_context_t> coordinator_t::reconstruct(source_backend::options_t options) {
+    std::lock_guard operation {state_->operation};
+    if (options.journal_path != state_->paths.owned_journal || (state_->recovery && options.authority != state_->recovery_verifier)) {
+      return {};
+    }
+    const auto observed = inspect_locked();
+    const bool allowed = state_->exclusion && !observed.prior_uncertainty && observed.disposition == disposition_e::owned_requires_authority;
+    if (!allowed) {
+      state_->inspection.reset();
+      return {};
+    }
+    if (!state_->recovery) {
+      std::shared_ptr<rtsp_stream::source_backend_t> backend;
 #ifdef SUNSHINE_TESTS
-  std::unique_ptr<coordinator_t> coordinator_t::test_make(paths_t paths, std::function<test_storage_t()> read) {
+      if (state_->test_dependencies) {
+        backend = source_backend::test_make_backend(options, *state_->test_dependencies);
+      } else
+#endif
+      {
+        backend = source_backend::make_backend(options);
+      }
+      auto retained = std::shared_ptr<source_backend::recovery_context_t> {new source_backend::recovery_context_t(options, std::move(backend), state_->inspection->owned.bytes, observed.owned_generation, state_->exclusion)};
+      state_->recovery_verifier = options.authority;
+      state_->recovery = std::move(retained);
+    }
+    // Checked inspection deliberately denies writer sharing. Close those handles before B's
+    // transaction opens; its expected-byte comparison refuses a change in this narrow window.
+    state_->inspection.reset();
+    std::ignore = state_->recovery->reconstruct();
+    return state_->recovery;
+  }
+
+#ifdef SUNSHINE_TESTS
+  std::unique_ptr<coordinator_t> coordinator_t::test_make(paths_t paths, std::function<test_storage_t()> read, source_backend::test_dependencies_t dependencies) {
     auto result = std::make_unique<coordinator_t>(std::move(paths));
     result->state_->test_read = std::move(read);
+    result->state_->test_dependencies = std::move(dependencies);
     return result;
   }
 #endif
