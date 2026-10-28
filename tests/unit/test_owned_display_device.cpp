@@ -971,8 +971,29 @@ namespace {
     }
 
     std::string journal_bytes() {
-      std::ifstream input {path, std::ios::binary};
-      return {std::istreambuf_iterator<char> {input}, std::istreambuf_iterator<char> {}};
+      std::optional<std::string> bytes;
+      bool absent = false;
+      const bool read = http::update_state_file_bytes(path.string(), [&](const std::string &current) -> std::optional<std::string> {
+        std::error_code error;
+        absent = !std::filesystem::exists(path, error);
+        if (error) {
+          throw std::runtime_error {"Fixture journal presence check failed"};
+        }
+        if (!absent) {
+          bytes = current;
+        }
+        return std::nullopt;
+      });
+      if (!read) {
+        throw std::runtime_error {"Fixture journal checked read failed"};
+      }
+      if (absent) {
+        throw std::runtime_error {"Fixture journal is absent"};
+      }
+      if (!bytes) {
+        throw std::runtime_error {"Fixture journal snapshot was not captured"};
+      }
+      return std::move(*bytes);
     }
 
     nlohmann::json journal_data() {
@@ -2027,6 +2048,93 @@ TEST_F(OwnedReconstructionTest, ThrowingHeartbeatCreationRemainsStickyEvenIfFail
 
 TEST_F(OwnedReconstructionTest, RepeatedThrowingHeartbeatCreationCannotAdvanceTheSameRetainedContext) {
   reject_heartbeat_creation(2);
+}
+
+TEST_F(OwnedReconstructionTest, CheckedJournalReadWaitsForProtectedCommitAndReturnsItsCompleteBytes) {
+  ASSERT_TRUE(crash_episode(false));
+  const auto original = journal_bytes();
+  const auto replacement = original + " ";
+  std::promise<void> writer_entered, reader_entered, release_writer;
+  const auto gate = release_writer.get_future().share();
+  std::future<bool> writer;
+  std::future<std::string> reader;
+  bool released = false;
+  std::atomic_bool pause_writer {true};
+  auto cleanup = util::fail_guard([&]() {
+    if (!released) {
+      release_writer.set_value();
+    }
+    if (writer.valid()) {
+      writer.wait();
+    }
+    if (reader.valid()) {
+      reader.wait();
+    }
+    http::test_support::set_state_update_hook({});
+  });
+  http::test_support::set_state_update_hook([&]() {
+    if (pause_writer.exchange(false)) {
+      writer_entered.set_value();
+      gate.wait();
+    }
+  });
+  writer = std::async(std::launch::async, [&]() {
+    return http::update_state_file_bytes(path.string(), [&](const std::string &current) -> std::optional<std::string> {
+      EXPECT_EQ(current, original);
+      return replacement;
+    });
+  });
+  ASSERT_EQ(writer_entered.get_future().wait_for(1s), std::future_status::ready);
+  reader = std::async(std::launch::async, [&]() {
+    reader_entered.set_value();
+    return journal_bytes();
+  });
+  ASSERT_EQ(reader_entered.get_future().wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(reader.wait_for(20ms), std::future_status::timeout);
+  release_writer.set_value();
+  released = true;
+  ASSERT_EQ(writer.wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(reader.wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(writer.get());
+  EXPECT_EQ(reader.get(), replacement);
+  EXPECT_EQ(journal_data().at("generation"), 1u);
+}
+
+TEST_F(OwnedReconstructionTest, CheckedJournalReadReportsPermanentDenialInsteadOfEmptyJson) {
+  ASSERT_TRUE(crash_episode(false));
+  const auto original = journal_bytes();
+  const auto locked = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_NE(locked, INVALID_HANDLE_VALUE);
+  auto close = util::fail_guard([&]() {
+    CloseHandle(locked);
+  });
+  try {
+    std::ignore = journal_data();
+    FAIL() << "A denied checked read must fail before JSON parsing";
+  } catch (const std::runtime_error &error) {
+    EXPECT_EQ(std::string {error.what()}, "Fixture journal checked read failed");
+  }
+  const bool closed = CloseHandle(locked);
+  if (closed) {
+    close.disable();
+  }
+  ASSERT_TRUE(closed);
+  EXPECT_EQ(journal_bytes(), original);
+}
+
+TEST_F(OwnedReconstructionTest, CheckedJournalReadDistinguishesAbsentEmptyAndMalformedStorage) {
+  try {
+    std::ignore = journal_bytes();
+    FAIL() << "An absent fixture journal must remain distinct from a completed empty file";
+  } catch (const std::runtime_error &error) {
+    EXPECT_EQ(std::string {error.what()}, "Fixture journal is absent");
+  }
+  write_bytes("");
+  EXPECT_TRUE(journal_bytes().empty());
+  EXPECT_THROW(journal_data(), nlohmann::json::parse_error);
+  write_bytes("malformed journal");
+  EXPECT_EQ(journal_bytes(), "malformed journal");
+  EXPECT_THROW(journal_data(), nlohmann::json::parse_error);
 }
 
 TEST_F(OwnedReconstructionTest, DisabledWatchdogNeedsNoHeartbeatWorkerAndStillReconstructs) {
