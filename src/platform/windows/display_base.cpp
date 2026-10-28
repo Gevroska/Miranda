@@ -17,6 +17,7 @@
 
 // lib includes
 #include <boost/algorithm/string/join.hpp>
+#include <display_device/windows/win_api_layer.h>
 #include <MinHook.h>
 
 // local includes
@@ -43,6 +44,7 @@ enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE : DWORD {
 
 using D3DKMT_GPU_PREFERENCE_QUERY_STATE = _D3DKMT_GPU_PREFERENCE_QUERY_STATE;  ///< GPU preference query state reported by D3DKMT.
 
+#include "capture_binding.h"
 #include "display.h"
 #include "misc.h"
 #include "src/config.h"
@@ -255,9 +257,13 @@ namespace platf::dxgi {
     // capture, best case is that capture stops until it powers back on. However,
     // worst case it will trigger us to reinit DD, waking the display back up in
     // a neverending cycle of waking and sleeping the display of an idle machine.
-    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
-    auto clear_display_required = util::fail_guard([]() {
-      SetThreadExecutionState(ES_CONTINUOUS);
+    if (keep_display_awake) {
+      SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+    }
+    auto clear_display_required = util::fail_guard([this]() {
+      if (keep_display_awake) {
+        SetThreadExecutionState(ES_CONTINUOUS);
+      }
     });
 
     sleep_overshoot_logger.reset();
@@ -461,6 +467,18 @@ namespace platf::dxgi {
   }
 
   int display_base_t::init(const ::video::config_t &config, const std::string &display_name) {
+    keep_display_awake = !config.source || config.source->kind == rtsp_stream::capture_source_t::kind_e::native;
+    std::optional<capture_binding::observation_t> binding;
+    if (config.source) {
+      if (!config.source_pin || display_name != config.source->selector) {
+        return -1;
+      }
+      binding = capture_binding::verify(*config.source, display_device::WinApiLayer {});
+      if (!binding) {
+        BOOST_LOG(error) << "Managed capture target is unavailable or its identity changed";
+        return -1;
+      }
+    }
     std::once_flag windows_cpp_once_flag;
 
     std::call_once(windows_cpp_once_flag, []() {
@@ -509,7 +527,7 @@ namespace platf::dxgi {
         DXGI_ADAPTER_DESC1 adapter_desc;
         adapter_tmp->GetDesc1(&adapter_desc);
 
-        if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
+        if (binding ? capture_binding::luid(adapter_desc.AdapterLuid) != binding->source_adapter : (!adapter_name.empty() && adapter_desc.Description != adapter_name)) {
           continue;
         }
 
@@ -561,7 +579,7 @@ namespace platf::dxgi {
       }
 
       // If we made it here without finding an output, try to power on the display and retry.
-      if (tries == 0) {
+      if (tries == 0 && keep_display_awake) {
         SetThreadExecutionState(ES_DISPLAY_REQUIRED);
         Sleep(500);
       }
@@ -737,6 +755,10 @@ namespace platf::dxgi {
     }
 
     client_frame_rate = config.framerate;
+    if (binding) {
+      display_refresh_rate = {binding->rate_numerator, binding->rate_denominator};
+      display_refresh_rate_rounded = lround(static_cast<double>(binding->rate_numerator) / binding->rate_denominator);
+    }
     client_frame_rate_strict = {0, 0};
     if (config.framerateX100 > 0) {
       const AVRational fps = ::video::framerate_to_rational(config);
@@ -1027,34 +1049,55 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    std::optional<capture_binding::observation_t> binding;
+    if (config.source) {
+      if (!config.source_pin || display_name != config.source->selector) {
+        return nullptr;
+      }
+      binding = capture_binding::verify(*config.source, display_device::WinApiLayer {});
+      if (!binding) {
+        return nullptr;
+      }
+    }
+    auto publish = [&](auto disp) -> std::shared_ptr<display_t> {
+      if (binding) {
+        DXGI_ADAPTER_DESC1 adapter {};
+        DXGI_OUTPUT_DESC output {};
+        if (FAILED(disp->adapter->GetDesc1(&adapter)) || FAILED(disp->output->GetDesc(&output)) || !capture_binding::verify_opened(*config.source, *binding, display_device::WinApiLayer {}, capture_binding::luid(adapter.AdapterLuid), utf_utils::to_utf8(output.DeviceName), output.AttachedToDesktop, disp->width, disp->height)) {
+          BOOST_LOG(error) << "Managed capture binding changed during initialization";
+          return nullptr;
+        }
+      }
+      return disp;
+    };
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
-        auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
+        auto disp = video::make_capture_resource<dxgi::display_ddup_vram_t>(config.source_pin);
 
         if (!disp->init(config, display_name)) {
-          return disp;
+          return publish(std::move(disp));
         }
       } else if (hwdevice_type == mem_type_e::system) {
-        auto disp = std::make_shared<dxgi::display_ddup_ram_t>();
+        auto disp = video::make_capture_resource<dxgi::display_ddup_ram_t>(config.source_pin);
 
         if (!disp->init(config, display_name)) {
-          return disp;
+          return publish(std::move(disp));
         }
       }
     }
 
     if (config::video.capture == "wgc" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
-        auto disp = std::make_shared<dxgi::display_wgc_vram_t>();
+        auto disp = video::make_capture_resource<dxgi::display_wgc_vram_t>(config.source_pin);
 
         if (!disp->init(config, display_name)) {
-          return disp;
+          return publish(std::move(disp));
         }
       } else if (hwdevice_type == mem_type_e::system) {
-        auto disp = std::make_shared<dxgi::display_wgc_ram_t>();
+        auto disp = video::make_capture_resource<dxgi::display_wgc_ram_t>(config.source_pin);
 
         if (!disp->init(config, display_name)) {
-          return disp;
+          return publish(std::move(disp));
         }
       }
     }

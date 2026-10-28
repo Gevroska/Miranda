@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -33,6 +34,7 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
+#include "stream.h"
 #include "sync.h"
 #include "video.h"
 
@@ -47,11 +49,60 @@ using namespace std::literals;
 namespace video {
 
   namespace {
+#ifdef SUNSHINE_TESTS
+    std::mutex capture_hooks_mutex;
+    std::shared_ptr<const test_support::capture_hooks_t> capture_hooks;
+
+    /** @brief Copy a test boundary without holding the guard while calling it. */
+    std::shared_ptr<const test_support::capture_hooks_t> current_capture_hooks() {
+      std::lock_guard lock {capture_hooks_mutex};
+      return capture_hooks;
+    }
+#endif
+    /** @brief Compare the full immutable binding, including owner generation and probe epoch. */
+    bool same_source(const std::shared_ptr<const rtsp_stream::capture_source_t> &left, const std::shared_ptr<const rtsp_stream::capture_source_t> &right) {
+      return left == right || (left && right && *left == *right);
+    }
+
+    /** @brief Freeze one shared worker's source before any producer can use its display. */
+    class capture_source_admission_t {
+    public:
+      /** @brief Accept only the first binding or an equal join; never replace the active source. */
+      bool accept(const config_t &config) {
+        std::lock_guard lock {mutex_};
+        if (!initialized_) {
+          source_ = config.source;
+          pin_ = config.source_pin;
+          initialized_ = true;
+          return true;
+        }
+        return same_source(source_, config.source);
+      }
+
+    private:
+      std::mutex mutex_;  ///< Serializes simultaneous first producers.
+      bool initialized_ = false;  ///< A legacy null source is also a frozen selection.
+      std::shared_ptr<const rtsp_stream::capture_source_t> source_;  ///< Metadata only; contexts retain the tickets.
+      std::shared_ptr<rtsp_stream::capture_pin_t> pin_;  ///< Retains the first ticket until the final shared worker context is destroyed.
+    };
+
+    /** @brief Use the immutable selector for initial capture and every reopen. */
+    std::string capture_selector(const config_t &config, const std::string &legacy_selector) {
+      return config.source ? config.source->selector : legacy_selector;
+    }
+  }  // namespace
+
+  namespace {
     /**
      * @brief Check if we can allow probing for the encoders.
      * @return True if there should be no issues with the probing, false if we should prevent it.
      */
     bool allow_encoder_probing() {
+#ifdef SUNSHINE_TESTS
+      if (const auto hooks = current_capture_hooks(); hooks && hooks->allow_probe) {
+        return hooks->allow_probe();
+      }
+#endif
       const auto devices {display_device::enumerate_devices()};
 
       // If there are no devices, then either the API is not working correctly or OS does not support the lib.
@@ -663,6 +714,7 @@ namespace video {
    * @brief Asynchronous capture thread state.
    */
   struct capture_thread_async_ctx_t {
+    capture_source_admission_t admission;  ///< Exact source accepted before producers can inspect the shared display.
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue;  ///< Capture ctx queue.
     std::jthread capture_thread;  ///< Capture thread.
 
@@ -675,8 +727,58 @@ namespace video {
    * @brief Synchronous capture thread state.
    */
   struct capture_thread_sync_ctx_t {
-    encode_session_ctx_queue_t encode_session_ctx_queue {30};  ///< Encode session ctx queue.
+    capture_source_admission_t admission;  ///< Exact source shared by the synchronous queue.
+    encode_session_ctx_queue_t encode_session_ctx_queue {30, encode_session_ctx_queue_t::overflow_policy_e::reject};  ///< Encode session ctx queue.
   };
+
+  /** @brief Release a caller's join signal exactly once; resource tickets may outlive that signal. */
+  void finish_sync_context(sync_session_ctx_t &ctx) {
+    const auto joined = std::exchange(ctx.join_event, nullptr);
+    ctx.shutdown_event->raise(true);
+    if (joined) {
+      joined->raise(true);
+    }
+  }
+
+  /** @brief Apply the actual asynchronous producer fence and clean up every rejected context. */
+  bool enqueue_capture_context(capture_thread_async_ctx_t &worker, capture_ctx_t ctx) {
+    if (!worker.admission.accept(ctx.config) || !worker.capture_ctx_queue->raise(std::move(ctx))) {
+      ctx.images->stop();
+      return false;
+    }
+    return true;
+  }
+
+  /** @brief Apply the actual synchronous producer fence without losing an older join signal. */
+  bool enqueue_sync_context(capture_thread_sync_ctx_t &worker, sync_session_ctx_t ctx) {
+    if (!worker.admission.accept(ctx.config) || !worker.encode_session_ctx_queue.raise(std::move(ctx))) {
+      finish_sync_context(ctx);
+      return false;
+    }
+    return true;
+  }
+
+  /** @brief Final asynchronous worker cleanup, including contexts that never reached capture. */
+  void finish_capture_worker(safe::queue_t<capture_ctx_t> &queue, std::vector<capture_ctx_t> &contexts) {
+    queue.stop();
+    for (auto &ctx : contexts) {
+      ctx.images->stop();
+    }
+    for (auto &ctx : queue.unsafe()) {
+      ctx.images->stop();
+    }
+  }
+
+  /** @brief Final synchronous worker cleanup before the last shared worker reference is released. */
+  void finish_sync_worker(encode_session_ctx_queue_t &queue, std::vector<std::unique_ptr<sync_session_ctx_t>> &contexts) {
+    queue.stop();
+    for (const auto &ctx : contexts) {
+      finish_sync_context(*ctx);
+    }
+    for (auto &ctx : queue.unsafe()) {
+      finish_sync_context(ctx);
+    }
+  }
 
   /**
    * @brief Start the synchronous multi-client capture thread.
@@ -1469,12 +1571,47 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+  static std::shared_ptr<const rtsp_stream::capture_source_t> chosen_encoder_source;  ///< Binding that produced the selected capabilities; no resource ticket.
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
   std::array<bool, 3> last_encoder_probe_supported_dynamic_range_for_codec = {};  ///< 10-bit 4:2:0 support discovered for each probed codec.
   std::array<bool, 3> last_encoder_probe_supported_dynamic_range_yuv444_for_codec = {};  ///< 10-bit YUV444 support discovered for each probed codec.
+
+  /** @brief A fresh managed attempt retires older advertisements before any early rejection. */
+  void invalidate_fresh_managed_probe(const rtsp_stream::capture_source_t &source) {
+    if (!chosen_encoder_source || *chosen_encoder_source != source) {
+      chosen_encoder = nullptr;
+      chosen_encoder_source.reset();
+      active_hevc_mode = 1;
+      active_av1_mode = 1;
+      reset_encoder_probe_results();
+    }
+  }
+
+  /** @brief Read the device-change boundary without invoking the platform in inert probe cases. */
+  bool encoder_needs_reenumeration(bool check_displays) {
+    if (!check_displays) {
+      return false;
+    }
+#ifdef SUNSHINE_TESTS
+    if (const auto hooks = current_capture_hooks(); hooks && hooks->needs_reenumeration) {
+      return hooks->needs_reenumeration();
+    }
+#endif
+    return platf::needs_encoder_reenumeration();
+  }
+
+  /** @brief Open the platform display through the sole inert boundary used by capture tests. */
+  std::shared_ptr<platf::display_t> open_capture_display(platf::mem_type_e type, const std::string &name, const config_t &config) {
+#ifdef SUNSHINE_TESTS
+    if (const auto hooks = current_capture_hooks(); hooks && hooks->open_display) {
+      return hooks->open_display(type, name, config);
+    }
+#endif
+    return platf::display(type, name, config);
+  }
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -1488,12 +1625,18 @@ namespace video {
     // We try this twice, in case we still get an error on reinitialization
     for (int x = 0; x < 2; ++x) {
       disp.reset();
-      disp = platf::display(type, display_name, config);
+      disp = open_capture_display(type, capture_selector(config, display_name), config);
       if (disp) {
         break;
       }
 
       // The capture code depends on us to sleep between failures
+#ifdef SUNSHINE_TESTS
+      if (const auto hooks = current_capture_hooks(); hooks && hooks->retry_wait) {
+        hooks->retry_wait(200ms);
+        continue;
+      }
+#endif
       std::this_thread::sleep_for(200ms);
     }
   }
@@ -1517,7 +1660,12 @@ namespace video {
 
     // Refresh the display names
     auto old_display_names = std::move(display_names);
+#ifdef SUNSHINE_TESTS
+    const auto hooks = current_capture_hooks();
+    display_names = hooks && hooks->enumerate_displays ? hooks->enumerate_displays(dev_type) : platf::display_names(dev_type);
+#else
     display_names = platf::display_names(dev_type);
+#endif
 
     // If we now have no displays, let's put the old display array back and fail
     if (display_names.empty() && !old_display_names.empty()) {
@@ -1552,6 +1700,45 @@ namespace video {
     }
   }
 
+  /** @brief Refresh legacy enumeration or retain the sole immutable managed selector. */
+  void refresh_capture_displays(const config_t &config, platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
+    if (config.source) {
+      display_names = {capture_selector(config, {})};
+      current_display_index = 0;
+      return;
+    }
+    refresh_displays(dev_type, display_names, current_display_index);
+  }
+
+  /** @brief Consume managed switch requests while leaving legacy requests pending for reenumeration. */
+  bool capture_switch_requires_reinit(const config_t &config, const safe::mail_raw_t::event_t<int> &event) {
+    if (!event->peek()) {
+      return false;
+    }
+    if (config.source) {
+      event->pop();
+      return false;
+    }
+    return true;
+  }
+
+  /** @brief Shared initial/reopen decision used by both capture modes, with no managed fallback. */
+  bool prepare_capture_display(std::shared_ptr<platf::display_t> &display, const config_t &config, platf::mem_type_e type, std::vector<std::string> &names, int &index, const safe::mail_raw_t::event_t<int> &switch_event, bool reopen) {
+    refresh_capture_displays(config, type, names, index);
+    if (reopen && switch_event->peek()) {
+      const auto requested = *switch_event->pop();
+      if (!config.source) {
+        index = std::clamp(requested, 0, static_cast<int>(names.size()) - 1);
+      }
+    }
+    if (reopen) {
+      reset_display(display, type, names[index], config);
+    } else {
+      display = open_capture_display(type, capture_selector(config, names[index]), config);
+    }
+    return static_cast<bool>(display);
+  }
+
   /**
    * @brief Run the shared display capture thread for asynchronous encoding.
    * @details Capture callbacks share this thread's session queues and reusable image pool.
@@ -1570,15 +1757,7 @@ namespace video {
     std::vector<capture_ctx_t> capture_ctxs;
 
     auto fg = util::fail_guard([&capture_ctx_queue, &capture_ctxs]() {
-      capture_ctx_queue->stop();
-
-      // Stop all sessions listening to this thread
-      for (auto &capture_ctx : capture_ctxs) {
-        capture_ctx.images->stop();
-      }
-      for (auto &capture_ctx : capture_ctx_queue->unsafe()) {
-        capture_ctx.images->stop();
-      }
+      finish_capture_worker(*capture_ctx_queue, capture_ctxs);
     });
 
     auto switch_display_event = mail::man->event<int>(mail::switch_display);
@@ -1589,14 +1768,14 @@ namespace video {
       return;
     }
     capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
+    const auto capture_config = capture_ctxs.front().config;
 
     // Get all the monitor names now, rather than at boot, to
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-    auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
-    if (!disp) {
+    std::shared_ptr<platf::display_t> disp;
+    if (!prepare_capture_display(disp, capture_config, encoder.platform_formats->dev_type, display_names, display_p, switch_display_event, false)) {
       return;
     }
     display_wp = disp;
@@ -1705,7 +1884,7 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
-      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
+      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit, &capture_config](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -1725,10 +1904,18 @@ namespace video {
         }
 
         while (capture_ctx_queue->peek()) {
-          capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
+          auto pending = capture_ctx_queue->pop();
+          if (!pending) {
+            return false;
+          }
+          if (!same_source(capture_config.source, pending->config.source)) {
+            pending->images->stop();
+            continue;
+          }
+          capture_ctxs.emplace_back(std::move(*pending));
         }
 
-        if (switch_display_event->peek()) {
+        if (capture_switch_requires_reinit(capture_config, switch_display_event)) {
           artificial_reinit = true;
           return false;
         }
@@ -1782,17 +1969,10 @@ namespace video {
               // only support a single display session per device/application.
               disp.reset();
 
-              // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-
-              // Process any pending display switch with the new list of displays
-              if (switch_display_event->peek()) {
-                display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
-              }
-
               // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
-              if (disp) {
+              const auto &reopen_config = capture_config.source || capture_ctxs.empty() ? capture_config : capture_ctxs.front().config;
+              prepare_capture_display(disp, reopen_config, encoder.platform_formats->dev_type, display_names, display_p, switch_display_event, true);
+              if (disp || capture_config.source) {
                 break;
               }
             }
@@ -2388,6 +2568,17 @@ namespace video {
     return nullptr;
   }
 
+  /** @brief Keep the preissued ticket in the actual detached encoder destruction closure. */
+  void detach_encoder_teardown(std::unique_ptr<encode_session_t> session, std::shared_ptr<rtsp_stream::capture_pin_t> pin) {
+    std::jthread teardown {[pin = std::move(pin), session = std::move(session)]() mutable {
+      BOOST_LOG(info) << "Starting async encoder teardown";
+      session.reset();
+      BOOST_LOG(info) << "Async encoder teardown complete";
+      pin.reset();
+    }};
+    teardown.detach();
+  }
+
   /**
    * @brief Run one encode loop for a display capture stream.
    *
@@ -2423,14 +2614,9 @@ namespace video {
     // to restart encoding as soon as possible. For cases where the NVENC driver
     // hang occurs, this thread may probably never exit, but it will allow
     // streaming to continue without requiring a full restart of Sunshine.
-    auto fail_guard = util::fail_guard([&encoder, &session] {
+    auto fail_guard = util::fail_guard([&encoder, &session, pin = config.source_pin] {
       if (encoder.flags & ASYNC_TEARDOWN) {
-        std::jthread encoder_teardown_thread {[session = std::move(session)]() mutable {
-          BOOST_LOG(info) << "Starting async encoder teardown";
-          session.reset();
-          BOOST_LOG(info) << "Async encoder teardown complete";
-        }};
-        encoder_teardown_thread.detach();
+        detach_encoder_teardown(std::move(session), pin);
       }
     });
 
@@ -2690,8 +2876,6 @@ namespace video {
   ) {
     const auto &encoder = *chosen_encoder;
 
-    std::shared_ptr<platf::display_t> disp;
-
     auto switch_display_event = mail::man->event<int>(mail::switch_display);
 
     if (synced_session_ctxs.empty()) {
@@ -2703,18 +2887,20 @@ namespace video {
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
 
+    const auto capture_config = synced_session_ctxs.front()->config;
+#ifdef SUNSHINE_TESTS
+    if (const auto hooks = current_capture_hooks(); hooks && hooks->sync_encode_session) {
+      auto inert_session = hooks->sync_encode_session();
+      finish_sync_context(*synced_session_ctxs.front());
+      return encode_e::ok;
+    }
+#endif
+    std::shared_ptr<platf::display_t> disp;
+
     while (encode_session_ctx_queue.running()) {
-      // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-
-      // Process any pending display switch with the new list of displays
-      if (switch_display_event->peek()) {
-        display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
-      }
-
       // reset_display() will sleep between retries
-      reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], synced_session_ctxs.front()->config);
-      if (disp) {
+      prepare_capture_display(disp, capture_config, encoder.platform_formats->dev_type, display_names, display_p, switch_display_event, true);
+      if (disp || capture_config.source) {
         break;
       }
     }
@@ -2745,6 +2931,11 @@ namespace video {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
             return false;
+          }
+
+          if (!same_source(capture_config.source, encode_session_ctx->config.source)) {
+            finish_sync_context(*encode_session_ctx);
+            continue;
           }
 
           synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
@@ -2805,7 +2996,7 @@ namespace video {
           ++pos;
         })
 
-        if (switch_display_event->peek()) {
+        if (capture_switch_requires_reinit(capture_config, switch_display_event)) {
           ec = platf::capture_e::reinit;
           return false;
         }
@@ -2838,22 +3029,19 @@ namespace video {
    */
   void captureThreadSync() {
     auto ref = capture_thread_sync.ref();
+#ifdef SUNSHINE_TESTS
+    auto final_release = util::fail_guard([] {
+      if (const auto hooks = current_capture_hooks(); hooks && hooks->before_sync_worker_release) {
+        hooks->before_sync_worker_release();
+      }
+    });
+#endif
 
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
     auto &ctx = ref->encode_session_ctx_queue;
     auto lg = util::fail_guard([&ctx, &synced_session_ctxs]() {
-      ctx.stop();
-
-      for (const auto &session_ctx : synced_session_ctxs) {
-        session_ctx->shutdown_event->raise(true);
-        session_ctx->join_event->raise(true);
-      }
-
-      for (auto &pending_ctx : ctx.unsafe()) {
-        pending_ctx.shutdown_event->raise(true);
-        pending_ctx.join_event->raise(true);
-      }
+      finish_sync_worker(ctx, synced_session_ctxs);
     });
 
     // Encoding and capture takes place on this thread
@@ -2890,7 +3078,9 @@ namespace video {
       return;
     }
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config});
+    if (!enqueue_capture_context(*ref.get(), capture_ctx_t {images, config})) {
+      return;
+    }
 
     if (!ref->capture_ctx_queue->running()) {
       return;
@@ -2968,6 +3158,15 @@ namespace video {
     config_t config,
     stream::session_t *channel_data
   ) {
+    // A stream already carries the owner-issued ticket; capture workers must never ask the owner.
+    if (channel_data) {
+      config.source = stream::session::source(*channel_data);
+      config.source_pin = stream::session::source_pin(*channel_data);
+    }
+    if (!chosen_encoder || (config.source && (!config.source_pin || !same_source(chosen_encoder_source, config.source))) || (!config.source && chosen_encoder_source)) {
+      mail->event<bool>(mail::shutdown)->raise(true);
+      return;
+    }
     config = resolve_dynamic_range(*chosen_encoder, config);
 
     auto idr_events = mail->event<bool>(mail::idr);
@@ -2978,17 +3177,24 @@ namespace video {
     } else {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
-      ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
-        &join_event,
-        mail->event<bool>(mail::shutdown),
-        mail::man->queue<packet_t>(mail::video_packets),
-        std::move(idr_events),
-        mail->event<hdr_info_t>(mail::hdr),
-        mail->event<input::touch_port_t>(mail::touch_port),
-        config,
-        1,
-        channel_data,
-      });
+      if (!ref) {
+        mail->event<bool>(mail::shutdown)->raise(true);
+        return;
+      }
+      if (!enqueue_sync_context(*ref.get(), sync_session_ctx_t {
+                                              &join_event,
+                                              mail->event<bool>(mail::shutdown),
+                                              mail::man->queue<packet_t>(mail::video_packets),
+                                              std::move(idr_events),
+                                              mail->event<hdr_info_t>(mail::hdr),
+                                              mail->event<input::touch_port_t>(mail::touch_port),
+                                              config,
+                                              1,
+                                              channel_data,
+                                            })) {
+        mail->event<bool>(mail::shutdown)->raise(true);
+        return;
+      }
 
       // Wait for join signal
       join_event.view();
@@ -3065,9 +3271,15 @@ namespace video {
   /**
    * @brief Validate encoder before it is used.
    */
-  bool validate_encoder(encoder_t &encoder, bool expect_failure) {
-    const auto output_name {display_device::map_output_name(config::video.output_name)};
+  bool validate_encoder_for_source(encoder_t &encoder, bool expect_failure, const config_t &source_config) {
+    const auto output_name = source_config.source ? source_config.source->selector : display_device::map_output_name(config::video.output_name);
     std::shared_ptr<platf::display_t> disp;
+    bool managed_display_failed = false;
+    auto bind_config = [&source_config](config_t config) {
+      config.source = source_config.source;
+      config.source_pin = source_config.source_pin;
+      return config;
+    };
 
     BOOST_LOG(info) << "Trying encoder ["sv << encoder.name << ']';
     auto fg = util::fail_guard([&]() {
@@ -3082,8 +3294,8 @@ namespace video {
     encoder.av1.capabilities.set();
 
     // First, test encoder viability
-    config_t config_max_ref_frames {1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0, 0};
-    config_t config_autoselect {1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0, 0};
+    config_t config_max_ref_frames = bind_config({1920, 1080, 60, 6000, 1000, 1, 1, 1, 0, 0, 0, 0, {}, {}});
+    config_t config_autoselect = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 1, 0, 0, 0, 0, {}, {}});
 
     // If the encoder isn't supported at all (not even H.264), bail early
     reset_display(disp, encoder.platform_formats->dev_type, output_name, config_autoselect);
@@ -3177,10 +3389,11 @@ namespace video {
     // Test HDR and YUV444 support
     {
       auto test_yuv444 = [&](auto &flag_map, auto video_format) {
-        const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 1, video_format, 0, 1, 0};
+        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 1, video_format, 0, 1, 0, {}, {}});
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          managed_display_failed = static_cast<bool>(source_config.source);
           return;
         }
         if (!flag_map[encoder_t::PASSED]) {
@@ -3197,10 +3410,11 @@ namespace video {
       };
 
       auto test_yuv420_hdr = [&](auto &flag_map, auto video_format) {
-        const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0, 0};
+        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0, 0, {}, {}});
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          managed_display_failed = static_cast<bool>(source_config.source);
           return;
         }
         if (!flag_map[encoder_t::PASSED]) {
@@ -3217,10 +3431,11 @@ namespace video {
       };
 
       auto test_yuv444_hdr = [&](auto &flag_map, auto video_format) {
-        const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 1, 0};
+        const config_t config = bind_config({1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 1, 0, {}, {}});
 
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
         if (!disp) {
+          managed_display_failed = static_cast<bool>(source_config.source);
           return;
         }
         if (!flag_map[encoder_t::PASSED]) {
@@ -3249,6 +3464,10 @@ namespace video {
       test_yuv444_hdr(encoder.av1, 2);
     }
 
+    if (managed_display_failed) {
+      return false;
+    }
+
     encoder.h264[encoder_t::VUI_PARAMETERS] = encoder.h264[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
     encoder.hevc[encoder_t::VUI_PARAMETERS] = encoder.hevc[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
 
@@ -3261,6 +3480,10 @@ namespace video {
 
     fg.disable();
     return true;
+  }
+
+  bool validate_encoder(encoder_t &encoder, bool expect_failure) {
+    return validate_encoder_for_source(encoder, expect_failure, {});
   }
 
   void reset_encoder_probe_results() {
@@ -3292,8 +3515,12 @@ namespace video {
                                                                      encoder.av1[encoder_t::DYNAMIC_RANGE_YUV444];
   }
 
-  int probe_encoders() {
-    if (!allow_encoder_probing()) {
+  /** @brief Select encoders using source-fenced cache state and the supplied validation boundary. */
+  int probe_encoders_impl(const config_t &source_config, const std::function<bool(encoder_t &, bool, const config_t &)> &validate, bool check_displays) {
+    if (source_config.source) {
+      invalidate_fresh_managed_probe(*source_config.source);
+    }
+    if (check_displays && !allow_encoder_probing()) {
       // Error already logged
       return -1;
     }
@@ -3301,16 +3528,25 @@ namespace video {
     auto encoder_list = encoders;
 
     // If we already have a good encoder, check to see if another probe is required
-    if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
+    if (chosen_encoder && same_source(chosen_encoder_source, source_config.source) && !(chosen_encoder->flags & ALWAYS_REPROBE) && !encoder_needs_reenumeration(check_displays)) {
       return 0;
     }
 
     // Restart encoder selection
     auto previous_encoder = chosen_encoder;
     chosen_encoder = nullptr;
+    chosen_encoder_source.reset();
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
     reset_encoder_probe_results();
+    auto validate_candidate = [&](encoder_t &encoder, bool expect_failure) {
+#ifdef SUNSHINE_TESTS
+      if (const auto hooks = current_capture_hooks(); hooks && hooks->validate_encoder) {
+        return hooks->validate_encoder(encoder, expect_failure, source_config);
+      }
+#endif
+      return validate(encoder, expect_failure, source_config);
+    };
 
     auto adjust_encoder_constraints_hevc = [&](encoder_t *encoder) {
       // If we can't satisfy both the encoder and codec requirement, prefer the encoder over codec support
@@ -3353,7 +3589,7 @@ namespace video {
 
         if (encoder->name == config::video.encoder) {
           // Remove the encoder from the list entirely if it fails validation
-          if (!validate_encoder(*encoder, previous_encoder && previous_encoder != encoder)) {
+          if (!validate_candidate(*encoder, previous_encoder && previous_encoder != encoder)) {
             pos = encoder_list.erase(pos);
             break;
           }
@@ -3382,7 +3618,7 @@ namespace video {
         auto encoder = *pos;
 
         // Remove the encoder from the list entirely if it fails validation
-        if (!validate_encoder(*encoder, previous_encoder && previous_encoder != encoder)) {
+        if (!validate_candidate(*encoder, previous_encoder && previous_encoder != encoder)) {
           pos = encoder_list.erase(pos);
           continue;
         }
@@ -3429,7 +3665,7 @@ namespace video {
         // If we've used a previous encoder and it's not this one, we expect this encoder to
         // fail to validate. It will use a slightly different order of checks to more quickly
         // eliminate failing encoders.
-        if (!validate_encoder(*encoder, previous_encoder && previous_encoder != encoder)) {
+        if (!validate_candidate(*encoder, previous_encoder && previous_encoder != encoder)) {
           pos = encoder_list.erase(pos);
           continue;
         }
@@ -3444,7 +3680,12 @@ namespace video {
     }
 
     if (chosen_encoder == nullptr) {
-      const auto output_name {display_device::map_output_name(config::video.output_name)};
+      if (source_config.source) {
+        active_hevc_mode = 1;
+        active_av1_mode = 1;
+        reset_encoder_probe_results();
+      }
+      const auto output_name = source_config.source ? source_config.source->selector : display_device::map_output_name(config::video.output_name);
       BOOST_LOG(fatal) << "Unable to find display or encoder during startup."sv;
       if (!config::video.adapter_name.empty() || !output_name.empty()) {
         BOOST_LOG(fatal) << "Please ensure your manually chosen GPU and monitor are connected and powered on."sv;
@@ -3460,6 +3701,7 @@ namespace video {
 
     auto &encoder = *chosen_encoder;
 
+    chosen_encoder_source = source_config.source;
     record_encoder_probe_results(encoder);
 
     BOOST_LOG(debug) << "------  h264 ------"sv;
@@ -3527,6 +3769,148 @@ namespace video {
 
     return 0;
   }
+
+  int probe_encoders() {
+    return probe_encoders_impl({}, validate_encoder_for_source, true);
+  }
+
+  int probe_encoders(const rtsp_stream::capture_source_t &source, std::shared_ptr<rtsp_stream::capture_pin_t> pin) {
+    invalidate_fresh_managed_probe(source);
+    if (!pin || source.generation == 0 || source.epoch == 0 || source.selector.empty() || source.device_id.empty() || source.width == 0 || source.height == 0 || source.rate_numerator == 0 || source.rate_denominator == 0) {
+      return -1;
+    }
+    config_t config {};
+    config.source = std::make_shared<const rtsp_stream::capture_source_t>(source);
+    config.source_pin = std::move(pin);
+    return probe_encoders_impl(config, validate_encoder_for_source, true);
+  }
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    void set_capture_hooks(std::shared_ptr<const capture_hooks_t> hooks) {
+      std::lock_guard lock {capture_hooks_mutex};
+      capture_hooks = std::move(hooks);
+    }
+
+    struct capture_queue_t::impl_t {
+      explicit impl_t(bool synchronous):
+          synchronous {synchronous} {
+        if (synchronous) {
+          sync = std::make_unique<capture_thread_sync_ctx_t>();
+        } else {
+          async = std::make_unique<capture_thread_async_ctx_t>();
+          async->capture_ctx_queue = std::make_shared<safe::queue_t<capture_ctx_t>>(30, safe::queue_t<capture_ctx_t>::overflow_policy_e::reject);
+        }
+      }
+
+      bool synchronous;
+      std::unique_ptr<capture_thread_sync_ctx_t> sync;
+      std::unique_ptr<capture_thread_async_ctx_t> async;
+    };
+
+    capture_queue_t::capture_queue_t(bool synchronous):
+        impl_ {std::make_unique<impl_t>(synchronous)} {}
+
+    capture_queue_t::~capture_queue_t() {
+      finish();
+    }
+
+    bool capture_queue_t::submit(config_t config, safe::mail_t mailbox, safe::signal_t *joined, img_event_t *images) {
+      if (impl_->synchronous) {
+        return enqueue_sync_context(*impl_->sync, sync_session_ctx_t {joined, mailbox->event<bool>(mail::shutdown), mailbox->queue<packet_t>(mail::video_packets), mailbox->event<bool>(mail::idr), mailbox->event<hdr_info_t>(mail::hdr), mailbox->event<input::touch_port_t>(mail::touch_port), std::move(config), 1, nullptr});
+      }
+      auto event = std::make_shared<img_event_t::element_type>();
+      if (images) {
+        *images = event;
+      }
+      return enqueue_capture_context(*impl_->async, capture_ctx_t {std::move(event), std::move(config)});
+    }
+
+    void capture_queue_t::stop() {
+      if (impl_->synchronous) {
+        impl_->sync->encode_session_ctx_queue.stop();
+      } else {
+        impl_->async->capture_ctx_queue->stop();
+      }
+    }
+
+    void capture_queue_t::finish() {
+      if (impl_->synchronous) {
+        std::vector<std::unique_ptr<sync_session_ctx_t>> contexts;
+        finish_sync_worker(impl_->sync->encode_session_ctx_queue, contexts);
+      } else {
+        std::vector<capture_ctx_t> contexts;
+        finish_capture_worker(*impl_->async->capture_ctx_queue, contexts);
+      }
+    }
+
+    std::size_t capture_queue_t::pending() const {
+      return impl_->synchronous ? impl_->sync->encode_session_ctx_queue.unsafe().size() : impl_->async->capture_ctx_queue->unsafe().size();
+    }
+
+    std::vector<std::shared_ptr<const rtsp_stream::capture_source_t>> capture_queue_t::sources() const {
+      std::vector<std::shared_ptr<const rtsp_stream::capture_source_t>> result;
+      if (impl_->synchronous) {
+        for (const auto &ctx : impl_->sync->encode_session_ctx_queue.unsafe()) {
+          result.emplace_back(ctx.config.source);
+        }
+      } else {
+        for (const auto &ctx : impl_->async->capture_ctx_queue->unsafe()) {
+          result.emplace_back(ctx.config.source);
+        }
+      }
+      return result;
+    }
+
+    display_cycle_t capture_display_cycle(const config_t &config, bool synchronous, int switch_request) {
+      display_cycle_t result;
+      auto mailbox = std::make_shared<safe::mail_raw_t>();
+      auto switch_event = mailbox->event<int>(mail::switch_display);
+      std::shared_ptr<platf::display_t> display;
+      std::vector<std::string> names;
+      int index = -1;
+      result.initial_open = prepare_capture_display(display, config, platf::mem_type_e::system, names, index, switch_event, synchronous);
+      switch_event->raise(switch_request);
+      result.switch_reinit = capture_switch_requires_reinit(config, switch_event);
+      if (result.switch_reinit) {
+        prepare_capture_display(display, config, platf::mem_type_e::system, names, index, switch_event, true);
+      }
+      result.switch_consumed = !switch_event->peek();
+      display.reset();
+      result.reopened = prepare_capture_display(display, config, platf::mem_type_e::system, names, index, switch_event, true);
+      return result;
+    }
+
+    void detach_encoder_teardown(std::unique_ptr<encode_session_t> session, std::shared_ptr<rtsp_stream::capture_pin_t> pin) {
+      video::detach_encoder_teardown(std::move(session), std::move(pin));
+    }
+
+    bool encoder_selected(const std::shared_ptr<const rtsp_stream::capture_source_t> &source) {
+      return chosen_encoder && same_source(chosen_encoder_source, source);
+    }
+
+    bool capture_queue_accepts(const config_t &first, const config_t &next, bool synchronous) {
+      safe::signal_t first_joined, next_joined;
+      capture_queue_t worker {synchronous};
+      return worker.submit(first, std::make_shared<safe::mail_raw_t>(), &first_joined) &&
+             worker.submit(next, std::make_shared<safe::mail_raw_t>(), &next_joined);
+    }
+
+    std::string capture_selector(const config_t &config, const std::string &legacy_selector) {
+      return video::capture_selector(config, legacy_selector);
+    }
+
+    int probe_encoders(const config_t &config, const std::function<bool(encoder_t &, bool, const config_t &)> &validate) {
+      return probe_encoders_impl(config, validate, false);
+    }
+
+    void reset_encoder_selection() {
+      chosen_encoder = nullptr;
+      chosen_encoder_source.reset();
+      reset_encoder_probe_results();
+    }
+  }  // namespace test_support
+#endif
 
   /**
    * @brief Initialize AVCodec hardware input buffers for VA-API.
@@ -3669,7 +4053,7 @@ namespace video {
     capture_thread_ctx.encoder_p = chosen_encoder;
     capture_thread_ctx.reinit_event.reset();
 
-    capture_thread_ctx.capture_ctx_queue = std::make_shared<safe::queue_t<capture_ctx_t>>(30);
+    capture_thread_ctx.capture_ctx_queue = std::make_shared<safe::queue_t<capture_ctx_t>>(30, safe::queue_t<capture_ctx_t>::overflow_policy_e::reject);
 
     capture_thread_ctx.capture_thread = std::jthread {
       captureThread,

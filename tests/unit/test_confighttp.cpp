@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <thread>
@@ -33,6 +34,8 @@
 #include <src/httpcommon.h>
 #include <src/network.h>
 #include <src/nvhttp.h>
+#include <src/process.h>
+#include <src/rtsp.h>
 #include <src/utility.h>
 
 #ifdef SUNSHINE_BUILD_PORTAL
@@ -40,6 +43,10 @@
 #endif
 
 namespace confighttp {
+  void getApps(const resp_https_t &response, const req_https_t &request);
+  void saveApp(const resp_https_t &response, const req_https_t &request);
+  void closeApp(const resp_https_t &response, const req_https_t &request);
+  void deleteApp(const resp_https_t &response, const req_https_t &request);
   /**
    * @brief Production device-administration route exercised by the existing HTTPS fixture.
    * @param response Response object.
@@ -198,6 +205,10 @@ protected:
     server->config.timeout_content = 300;
 
     server->resource["^/client-update-test$"]["POST"] = confighttp::updateClient;
+    server->resource["^/api/apps$"]["GET"] = confighttp::getApps;
+    server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
+    server->resource["^/api/apps/close$"]["POST"] = confighttp::closeApp;
+    server->resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = confighttp::deleteApp;
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -2154,4 +2165,147 @@ TEST_F(DevicePermissionApiTest, FailedPersistenceReturnsFailureAndLeavesPrevious
   EXPECT_FALSE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
   EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
   config::nvhttp.file_state = valid_file;
+}
+
+TEST_F(DevicePermissionApiTest, OnlyAuthenticatedCsrfProtectedAdministrationCanSaveDisplayPreferences) {
+  const nlohmann::json display = {{"force_virtual", true}, {"resolution", {{"width", 2560}, {"height", 1440}}}, {"refresh_rate", {{"numerator", 120000}, {"denominator", 2002}}}};
+  const auto body = nlohmann::json {{"uuid", uuid}, {"display", display}}.dump();
+  SimpleWeb::CaseInsensitiveMultimap headers {{"Content-Type", "application/json"}};
+  EXPECT_EQ(client->request("POST", "/client-update-test", body, headers)->status_code, "401 Unauthorized");
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Origin", "https://example.invalid");
+  const auto missing_token = client->request("POST", "/client-update-test", body, headers);
+  EXPECT_EQ(missing_token->status_code, "400 Bad Request");
+  EXPECT_NE(missing_token->content.string().find("Missing CSRF token"), std::string::npos);
+  EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+  headers.emplace("X-CSRF-Token", "invalid_token_12345678901234567890");
+  const auto invalid_token = client->request("POST", "/client-update-test", body, headers);
+  EXPECT_EQ(invalid_token->status_code, "400 Bad Request");
+  EXPECT_NE(invalid_token->content.string().find("Invalid CSRF token"), std::string::npos);
+  EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+  const auto response = update({{"uuid", uuid}, {"display", display}});
+  ASSERT_EQ(response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(response->content.string())["status"].get<bool>());
+  const auto device = nvhttp::get_all_clients()[0];
+  EXPECT_TRUE(device["display"]["force_virtual"].get<bool>());
+  EXPECT_EQ(device["display"]["refresh_rate"]["numerator"], 60000);
+  EXPECT_EQ(device["display"]["refresh_rate"]["denominator"], 1001);
+  EXPECT_EQ(device["permissions"], 0U);
+}
+
+TEST_F(DevicePermissionApiTest, MalformedDisplayEditsCannotPublishCombinedGrant) {
+  for (const auto &display : {
+         nlohmann::json::parse(R"({"force_virtual":"true"})"),
+         nlohmann::json::parse(R"({"resolution":{"width":1920}})"),
+         nlohmann::json::parse(R"({"refresh_rate":{"numerator":60000,"denominator":0}})"),
+       }) {
+    const auto response = update({{"uuid", uuid}, {"permissions", permissions::launch}, {"display", display}});
+    EXPECT_EQ(response->status_code, "400 Bad Request");
+    EXPECT_EQ(nvhttp::get_all_clients()[0]["permissions"], 0U);
+    EXPECT_FALSE(nvhttp::get_all_clients()[0]["display"]["force_virtual"].get<bool>());
+  }
+}
+
+/**
+ * @brief Real authenticated editor endpoints share content preconditions and UUID selectors.
+ */
+class AppCatalogApiTest: public ConfigHttpTest {
+protected:
+  std::string previous_file;
+  proc::proc_t previous_proc;
+
+  void SetUp() override {
+    ConfigHttpTest::SetUp();
+    previous_file = config::stream.file_apps;
+    previous_proc = std::move(proc::proc);
+    proc::proc = proc::proc_t {};
+    config::stream.file_apps = (test_web_dir / "apps.json").string();
+    std::ofstream {config::stream.file_apps} << R"({"env":{},"apps":[{"name":"A","foreign":{"enabled":false}}]})";
+  }
+
+  void TearDown() override {
+    proc::proc.terminate();
+    proc::proc = std::move(previous_proc);
+    config::stream.file_apps = previous_file;
+    ConfigHttpTest::TearDown();
+  }
+
+  SimpleWeb::CaseInsensitiveMultimap headers(bool csrf = true) {
+    SimpleWeb::CaseInsensitiveMultimap result {{"Authorization", create_auth_header("testuser", "testpass")}, {"Content-Type", "application/json"}};
+    if (csrf) {
+      const auto token = client->request("GET", "/csrf-token-test", "", result);
+      result.emplace("Origin", "https://example.invalid");
+      result.emplace("X-CSRF-Token", nlohmann::json::parse(token->content.string())["csrf_token"].get<std::string>());
+    }
+    return result;
+  }
+};
+
+TEST_F(AppCatalogApiTest, RevisionAndUuidPreconditionsRejectStaleTabsAndKeepUnknownFields) {
+  const auto fetched = client->request("GET", "/api/apps", "", headers(false));
+  ASSERT_EQ(fetched->status_code, "200 OK");
+  const auto catalog = nlohmann::json::parse(fetched->content.string());
+  auto app = catalog["apps"][0];
+  app["name"] = "Renamed";
+  auto request_headers = headers();
+  EXPECT_TRUE(client->request("POST", "/api/apps", app.dump(), request_headers)->status_code.starts_with("428"));
+  request_headers.emplace("If-Match", catalog["revision"].get<std::string>());
+  const auto saved = client->request("POST", "/api/apps", app.dump(), request_headers);
+  ASSERT_EQ(saved->status_code, "200 OK");
+  const auto result = nlohmann::json::parse(saved->content.string());
+  EXPECT_EQ(result["apps"][0]["id"], app["id"]);
+  EXPECT_EQ(result["apps"][0]["foreign"]["enabled"], false);
+  EXPECT_TRUE(client->request("POST", "/api/apps", app.dump(), request_headers)->status_code.starts_with("409"));
+  const auto path = "/api/apps/" + app["uuid"].get<std::string>();
+  EXPECT_TRUE(client->request("DELETE", path, "", request_headers)->status_code.starts_with("409"));
+}
+
+TEST_F(AppCatalogApiTest, AuthenticationAndCsrfStillDenyMutations) {
+  EXPECT_TRUE(client->request("POST", "/api/apps", R"({"name":"new","index":-1})", {{"Content-Type", "application/json"}})->status_code.starts_with("401"));
+  auto request_headers = headers(false);
+  request_headers.emplace("Origin", "https://example.invalid");
+  EXPECT_TRUE(client->request("POST", "/api/apps", R"({"name":"new","index":-1})", request_headers)->status_code.starts_with("400"));
+  EXPECT_TRUE(client->request("POST", "/api/apps/close", "", {{"Content-Type", "application/json"}})->status_code.starts_with("401"));
+  EXPECT_TRUE(client->request("POST", "/api/apps/close", "", request_headers)->status_code.starts_with("400"));
+}
+
+TEST_F(AppCatalogApiTest, AuthorizedStopQueuesProcessCleanupWhileOwnerContinuesDispatching) {
+  const auto fetched = client->request("GET", "/api/apps", "", headers(false));
+  ASSERT_EQ(fetched->status_code, "200 OK");
+  const auto app = nlohmann::json::parse(fetched->content.string())["apps"][0];
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(proc::proc.execute(std::stoi(app["id"].get<std::string>()), launch), 0);
+  auto owner = rtsp_stream::test_support::start_owner();
+  auto reached = std::make_shared<std::promise<void>>();
+  auto release = std::make_shared<std::promise<void>>();
+  const auto gate = release->get_future().share();
+  auto blocking = rtsp_stream::process_operation([reached, gate]() {
+    const auto state = proc::proc.lock_state();
+    reached->set_value();
+    gate.wait_for(2s);
+  });
+  ASSERT_EQ(reached->get_future().wait_for(1s), std::future_status::ready);
+  const auto request_headers = headers();
+  auto queued = std::make_shared<std::promise<void>>();
+  rtsp_stream::test_support::set_owner_hook([queued](std::string_view event) {
+    if (event == "application_stop_queued") {
+      queued->set_value();
+    }
+  });
+  auto stopped = std::async(std::launch::async, [this, request_headers]() {
+    return client->request("POST", "/api/apps/close", "", request_headers);
+  });
+  ASSERT_EQ(queued->get_future().wait_for(1s), std::future_status::ready);
+  auto snapshot = std::async(std::launch::async, []() {
+    return rtsp_stream::source_snapshot();
+  });
+  EXPECT_EQ(snapshot.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(stopped.wait_for(0ms), std::future_status::timeout);
+  release->set_value();
+  blocking.get();
+  EXPECT_EQ(stopped.get()->status_code, "200 OK");
+  EXPECT_EQ(proc::proc.running(), 0);
+  rtsp_stream::test_support::set_owner_hook({});
 }

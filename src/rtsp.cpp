@@ -12,10 +12,12 @@ extern "C" {
 // standard includes
 #include <array>
 #include <cctype>
+#include <deque>
 #include <format>
 #include <future>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -25,15 +27,21 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "process.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
+
+#ifdef _WIN32
+  #include "platform/windows/source_backend.h"
+#endif
 
 namespace asio = boost::asio;
 
@@ -43,6 +51,8 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace rtsp_stream {
+  thread_local bool process_worker_context = false;  ///< The process lane never waits for this owner's executor.
+
   /**
    * @brief Release msg resources.
    *
@@ -423,8 +433,1286 @@ namespace rtsp_stream {
    */
   class rtsp_server_t {
   public:
+    rtsp_server_t() {
+      source_emitter->owner = this;
+    }
+    /** @brief Owner-only source phases; in-flight work always drains before rollback or replacement. */
+    enum class source_phase_e {
+      preparing,
+      applying,
+      probing,
+      executing,
+      ready,
+      retained,
+      checking,
+      draining,
+      restoring,
+      cleanup_pending
+    };
+    enum class source_work_e {
+      claim,
+      unclaim,
+      release_claim,
+      liveness,
+      begin,
+      validate,
+      probe,
+      execute,
+      rollback,
+      restore,
+      cleanup,
+      complete,
+      progress
+    };
+
+    struct admission_t {
+      std::shared_ptr<launch_session_t> launch;  ///< Strong token retention is explicit prepared accounting.
+      std::shared_ptr<std::promise<int>> result;  ///< Awaited by HTTPS outside this owner.
+      std::function<int()> execute;  ///< Copied-input application operation.
+      std::function<void()> rollback;  ///< Copied-input rollback after worker completion.
+      bool answered = false;  ///< Cancellation answers immediately even while an operation drains.
+      bool executed = false;  ///< Failed/partial application execution also requires rollback.
+    };
+
+    struct preflight_t {
+      std::shared_ptr<launch_session_t> launch;
+      std::function<std::pair<int, std::shared_ptr<const display_policy::source_request_t>>(const source_snapshot_t &)> plan;
+      std::function<int()> execute;
+      std::function<void()> rollback;
+      std::shared_ptr<std::promise<int>> result;
+      std::future<void> work;
+      bool answered = false;
+    };
+
+    struct source_work_result_t {
+      std::uint64_t generation;  ///< Source fence copied before dispatch.
+      std::uint64_t revision;  ///< Operation fence copied before dispatch.
+      source_work_e kind;  ///< Completion continuation.
+      int status;  ///< Explicit operation result, including caught exceptions.
+      bool entered = false;  ///< False proves the operation was rejected before any backend/process effect.
+    };
+
+    struct source_record_t {
+      std::uint64_t generation {};  ///< Monotonic source identity.
+      std::uint64_t revision {};  ///< Monotonic operation identity within this source.
+      std::uint64_t epoch {};  ///< Fresh or retained-reconnect capture incarnation.
+      std::uint64_t application_instance {};  ///< Genuine process lifetime, distinct from catalog UUID.
+      int appid {};  ///< Selected protocol application.
+      std::string app_uuid;  ///< Selected immutable application identity.
+      std::shared_ptr<const display_policy::source_request_t> request;  ///< Frozen P3a policy.
+      std::shared_ptr<const capture_source_t> metadata;  ///< Never owns a capture pin.
+      std::shared_ptr<source_backend_t> backend;  ///< Holds lease and recovery proof through cleanup failures.
+      source_phase_e phase = source_phase_e::preparing;
+      std::unordered_map<std::uint32_t, std::shared_ptr<launch_session_t>> prepared;  ///< Released by explicit owner transitions.
+      std::unordered_map<std::uint32_t, std::shared_ptr<launch_session_t>> media;  ///< Removed only after stop/join and slot erasure.
+      std::set<std::uint64_t> capture;  ///< Actual-resource pins, never inferred from stream joins.
+      std::shared_ptr<admission_t> admission;  ///< Sole staged first/reconnect admission.
+      std::optional<std::future<source_work_result_t>> work;  ///< Owner polls ready state; it never waits on backend work.
+      bool failed = false;  ///< Sticky heartbeat/source failure prohibits retention or joins.
+      bool cleanup_blocked = false;  ///< A failed native cleanup requires an explicit retry, not a polling loop.
+      bool completion_pending = false;  ///< Retirement succeeded but recovery completion still needs retry.
+      bool backend_unentered = false;
+      bool retire_requested = false;  ///< Explicit Stop, shutdown and heartbeat failure never turn back into retention.
+      std::chrono::steady_clock::time_point next_liveness {};
+      std::chrono::steady_clock::time_point next_backend_progress {};  ///< Bound native readback polling without blocking the owner.
+      std::vector<std::shared_future<void>> stops;  ///< Restoration waits for deferred Stop work.
+      std::shared_ptr<std::optional<proc::source_claim_t>> process_claim = std::make_shared<std::optional<proc::source_claim_t>>();  ///< Written only by the drained operation worker.
+    };
+
+    enum class recovery_stage_e {
+      restoring,
+      removal_ready,
+      retired,
+      awaiting_completion
+    };
+    enum class recovery_operation_e {
+      observe,
+      restore,
+      retire,
+      retry_retired,
+      complete
+    };
+    enum class recovery_outcome_e {
+      pending,
+      removal_ready,
+      restored,
+      completed,
+      blocked
+    };
+
+    struct recovery_result_t {
+      std::uint64_t generation;  ///< Exact episode fence, never a newly allocated source generation.
+      std::uint64_t revision;  ///< Checked operation fence.
+      recovery_operation_e operation;  ///< Only the sole matching future may advance custody.
+      recovery_outcome_e outcome;
+    };
+
+    /** @brief Sole retained recovery, including failed and completion-withheld startup custody. */
+    struct recovery_record_t {
+#ifdef _WIN32
+      std::shared_ptr<platf::source_backend::recovery_context_t> startup;  ///< Exact startup proof outlives operation-lane ownership.
+#endif
+      std::shared_ptr<source_backend_t> backend;  ///< Actual retained B/lease, never reconstructed during transfer.
+      std::uint64_t generation {}, revision {};  ///< Exact generation and checked operation revision.
+      recovery_stage_e stage = recovery_stage_e::retired;  ///< Outstanding restoration, retirement or completion boundary.
+      recovery_operation_e operation = recovery_operation_e::observe;  ///< Tag required when consuming the sole future.
+      bool adopted = false;  ///< Adopted episodes can neither roll over nor complete in this slice.
+      bool blocked = false, retry_requested = false;  ///< Explicit retry coalesces while one operation is in flight.
+      std::optional<std::future<recovery_result_t>> work;  ///< Never destroyed while an operation is still running.
+      std::chrono::steady_clock::time_point next_progress {};  ///< Polling deadline advances after work finishes.
+    };
+
+    /** @brief A capture destructor may only post while this owner's event emitter is alive. */
+    struct source_emitter_t {
+      std::mutex mutex;
+      rtsp_server_t *owner = nullptr;  ///< Protected pointer; no resource owns the source record.
+    };
+
     ~rtsp_server_t() {
+      {
+        std::lock_guard lock {source_emitter->mutex};
+        source_emitter->owner = nullptr;
+      }
       clear();
+    }
+
+    /** @brief Return copied source state at the admission ordering point. */
+    source_snapshot_t snapshot() const {
+      if (!source) {
+        return {.busy = recovery && (recovery->adopted || recovery->work || recovery->retry_requested), .cleanup_blocked = recovery && recovery->blocked, .recovery_pending = static_cast<bool>(recovery), .awaiting_completion = recovery && recovery->stage == recovery_stage_e::awaiting_completion};
+      }
+      return {true, source->phase != source_phase_e::ready && source->phase != source_phase_e::retained, source->phase == source_phase_e::retained, source->appid, source->app_uuid, source->application_instance, source->request, source->metadata, source->prepared.size(), source->media.size(), source->capture.size(), source->cleanup_blocked};
+    }
+
+    /** @brief All blocking source operations have copied ownership and a tagged completion. */
+    void dispatch_source(source_work_e kind, std::function<int()> operation) {
+      const auto generation = source->generation;
+      const auto revision = ++source->revision;
+      const bool guarded = kind == source_work_e::claim || kind == source_work_e::begin || kind == source_work_e::validate || kind == source_work_e::probe || kind == source_work_e::execute;
+      const auto launch = guarded && source->admission ? source->admission->launch : nullptr;
+      const auto deadline = raised_timer.expiry();
+      auto task = [
+#ifdef SUNSHINE_TESTS
+                    this,
+#endif
+                    generation,
+                    revision,
+                    kind,
+                    launch,
+                    deadline,
+                    operation = std::move(operation)]() {
+        int status = 503;
+        bool entered = false;
+        try {
+#ifdef SUNSHINE_TESTS
+          if (kind == source_work_e::begin)
+            notify_owner("source_before_entry");
+          if (kind == source_work_e::validate)
+            notify_owner("source_validate_before_entry");
+#endif
+          if (launch) {
+            const auto client = nvhttp::current_client(launch->client_uuid, launch->client_cert);
+            if (!client || client->revision != launch->authorization_revision || !permissions::allows(client->permissions, permissions::view) || launch->source_cancel->load()) {
+              return source_work_result_t {generation, revision, kind, 403};
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+              return source_work_result_t {generation, revision, kind, 503};
+            }
+          }
+          entered = true;
+          status = operation();
+          if (process_worker_context)
+            proc::proc.refresh_published();
+        } catch (...) {
+          BOOST_LOG(error) << "Managed source operation failed";
+        }
+        return source_work_result_t {generation, revision, kind, status, entered};
+      };
+      if (kind == source_work_e::claim || kind == source_work_e::unclaim || kind == source_work_e::release_claim || kind == source_work_e::liveness || kind == source_work_e::execute || kind == source_work_e::rollback) {
+        auto packaged = std::make_shared<std::packaged_task<source_work_result_t()>>(std::move(task));
+        source->work.emplace(packaged->get_future());
+        queue_process([packaged]() {
+          (*packaged)();
+        });
+      } else {
+        source->work.emplace(std::async(std::launch::async, std::move(task)));
+      }
+      arm_source_timer();
+    }
+
+    /** @brief Ensure retained-app exit and backend progress are observed even without media workers. */
+    void arm_source_timer() {
+      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty() && !(recovery && recovery->work) && (!recovery || stopping || recovery->blocked || recovery->stage == recovery_stage_e::awaiting_completion))) {
+        return;
+      }
+      try {
+        source_timer.expires_after(10ms);
+        source_timer_armed = true;
+#ifdef SUNSHINE_TESTS
+        if (recovery && recovery->adopted && (recovery->work || process_work)) {
+          notify_owner("adopted_work_timer_before_registration");
+        }
+#endif
+        source_timer.async_wait([this](const boost::system::error_code &error) {
+          source_timer_armed = false;
+          if (!error) {
+            poll_process();
+            poll_preflight();
+            poll_source();
+            poll_retired_recovery();
+            if (source || preflight || process_work || !process_jobs.empty() || (recovery && !stopping && !recovery->blocked && recovery->stage != recovery_stage_e::awaiting_completion) || (recovery && recovery->work)) {
+              arm_source_timer();
+            }
+          }
+        });
+        source_timer_failed = false;
+      } catch (...) {
+        source_timer_armed = false;
+        if (recovery && recovery->adopted) {
+          source_timer_failed = true;
+          recovery->blocked = true;
+          recovery->retry_requested = false;
+          return;
+        }
+        throw;
+      }
+    }
+
+    /** @brief Finish an HTTPS result exactly once; cancellation must not await native cancellation. */
+    void answer_admission(int status) {
+      if (source && source->admission && !source->admission->answered) {
+        source->admission->answered = true;
+        source->admission->result->set_value(status);
+      }
+    }
+
+    /**
+     * @brief Idempotent release shared by timeout, revocation, handshake clear and slot removal.
+     * @param media_release True only after successful media stop/join and slot erasure.
+     */
+    void release_source_pin(launch_session_t &launch, bool media_release = false, int status = 403) {
+      if (preflight && preflight->launch->id == launch.id && !preflight->answered) {
+        preflight->answered = true;
+        launch.cancelled = true;
+        launch.source_cancel->store(true);
+        preflight->result->set_value(status);
+      }
+      if (!source || launch.source_generation != source->generation) {
+        return;
+      }
+      if (launch.source_media) {
+        if (!media_release) {
+          return;
+        }
+        source->media.erase(launch.id);
+        launch.source_media = false;
+      } else {
+        source->prepared.erase(launch.id);
+      }
+      if (source->admission && source->admission->launch->id == launch.id) {
+        launch.cancelled = true;
+        if (launch.source_cancel) {
+          launch.source_cancel->store(true);
+        }
+        answer_admission(status);
+      }
+      arm_source_timer();
+    }
+
+    /** @brief A start claim is not media ownership until all start operations succeed. */
+    bool source_started(launch_session_t &launch, bool success) {
+      if (!launch.source_generation) {
+        return success;
+      }
+      if (!source || source->generation != launch.source_generation) {
+        return false;
+      }
+      if (!success || !authorized(launch) || !source->prepared.contains(launch.id)) {
+        launch.cancelled = true;
+        release_source_pin(launch);
+        return false;
+      }
+      const auto token = source->prepared.at(launch.id);
+      source->prepared.erase(launch.id);
+      source->media.emplace(launch.id, token);
+      launch.source_media = true;
+      return true;
+    }
+
+    /** @brief Route every slot erasure through the same explicit pin-release transition. */
+    void release_source_slot(std::uint32_t id) {
+      if (!source) {
+        return;
+      }
+      if (const auto it = source->media.find(id); it != source->media.end()) {
+        const auto token = it->second;
+        release_source_pin(*token, true);
+      }
+    }
+
+    /** @brief Reject stale, incomplete or differently mapped backend descriptors. */
+    bool valid_source(const std::shared_ptr<const capture_source_t> &metadata) const {
+      if (!source || !metadata) {
+        return false;
+      }
+      const auto &request = *source->request;
+      if (metadata->generation != source->generation || metadata->epoch != source->epoch || metadata->requested_hdr != request.requested_hdr || metadata->selector.empty() || metadata->device_id.empty() || !metadata->width || !metadata->height || !metadata->rate_numerator || !metadata->rate_denominator) {
+        return false;
+      }
+#ifdef _WIN32
+      if (!metadata->windows_output || metadata->windows_output->monitor_path_utf8.empty()) {
+        return false;
+      }
+#endif
+      if (!request.virtual_display) {
+        return metadata->kind == capture_source_t::kind_e::native && metadata->monitor_uuid.empty();
+      }
+      const auto canonical = display_policy::canonical_client_uuid(metadata->monitor_uuid);
+      return metadata->kind == capture_source_t::kind_e::owned_virtual && canonical && *canonical == metadata->monitor_uuid && metadata->monitor_uuid == request.monitor_uuid &&
+             metadata->width == request.mode.resolution.width && metadata->height == request.mode.resolution.height &&
+             static_cast<std::uint64_t>(metadata->rate_numerator) * request.mode.refresh_rate.denominator == static_cast<std::uint64_t>(request.mode.refresh_rate.numerator) * metadata->rate_denominator &&
+             (!request.requested_hdr || metadata->observed_hdr == request.requested_hdr);
+    }
+
+    /** @brief Cancel admissions now; rollback and restoration wait for the current operation to drain. */
+    void fail_source(int status) {
+      if (!source) {
+        return;
+      }
+      source->failed = true;
+      source->phase = source_phase_e::draining;
+      if (source->admission) {
+        auto token = source->admission->launch;
+        token->cancelled = true;
+        release_source_pin(*token, false, status);
+      }
+      arm_source_timer();
+    }
+
+    /** @brief Start a first-source or retained-source admission while holding its reservation. */
+    void prepare_source(std::shared_ptr<launch_session_t> launch, std::function<std::pair<int, std::shared_ptr<const display_policy::source_request_t>>(const source_snapshot_t &)> plan, std::function<int()> execute, std::function<void()> rollback, std::shared_ptr<std::promise<int>> result, std::function<void()> refresh) {
+      if (!backend_factory || !running || stopping || !authorized(*launch, false)) {
+        result->set_value(backend_factory && !stopping ? 403 : 503);
+        return;
+      }
+      if (preflight || (recovery && (recovery->adopted || recovery->work || recovery->retry_requested)) || (source && snapshot().busy) || !session_raise(launch)) {
+        result->set_value(503);
+        return;
+      }
+      if (source) {
+        launch->source_generation = source->generation;
+        source->prepared.emplace(launch->id, launch);
+        if (source->phase == source_phase_e::retained && !refresh) {
+          refresh = []() {
+            proc::proc.running();
+            proc::proc.refresh_published();
+          };
+        }
+      }
+      if (refresh) {
+        launch->source_cancel = std::make_shared<std::atomic_bool>(false);
+        auto task = std::make_shared<std::packaged_task<void()>>(std::move(refresh));
+        preflight = std::make_shared<preflight_t>(preflight_t {launch, std::move(plan), std::move(execute), std::move(rollback), result, task->get_future()});
+        queue_process([task]() {
+          (*task)();
+        });
+        arm_source_timer();
+        return;
+      }
+      complete_preflight(std::move(launch), std::move(plan), std::move(execute), std::move(rollback), std::move(result));
+    }
+
+    void poll_preflight() {
+      if (!preflight) {
+        return;
+      }
+      if (!authorized(*preflight->launch, false)) {
+        release_source_pin(*preflight->launch, false, 403);
+      }
+      if (preflight->work.wait_for(0ms) != std::future_status::ready) {
+        return;
+      }
+      const auto current = std::exchange(preflight, nullptr);
+      int status = 200;
+      try {
+        current->work.get();
+      } catch (...) {
+        status = 503;
+      }
+      if (current->answered || status != 200 || !authorized(*current->launch, false)) {
+        const auto permitted = authorized(*current->launch, false);
+        current->launch->cancelled = true;
+        session_clear(current->launch->id);
+        if (!current->answered) {
+          current->result->set_value(permitted ? status : 403);
+        }
+      } else {
+        complete_preflight(current->launch, std::move(current->plan), std::move(current->execute), std::move(current->rollback), current->result);
+      }
+      finish_stop();
+    }
+
+    void complete_preflight(std::shared_ptr<launch_session_t> launch, std::function<std::pair<int, std::shared_ptr<const display_policy::source_request_t>>(const source_snapshot_t &)> plan, std::function<int()> execute, std::function<void()> rollback, std::shared_ptr<std::promise<int>> result) {
+      std::pair<int, std::shared_ptr<const display_policy::source_request_t>> planned;
+      try {
+        planned = plan(snapshot());
+      } catch (...) {
+        planned.first = 503;
+      }
+      const auto permitted = authorized(*launch, false);
+      if (planned.first != 200 || !planned.second || !permitted) {
+        launch->cancelled = true;
+        session_clear(launch->id);
+        result->set_value(!permitted ? 403 : planned.first == 200 ? 503 :
+                                                                    planned.first);
+        return;
+      }
+      if (source && source->phase == source_phase_e::retained) {
+        const auto observed = proc::proc.published_snapshot()->lifetime;
+        if (!observed.tracked || observed.instance != source->application_instance || observed.app_uuid != source->app_uuid) {
+          launch->cancelled = true;
+          session_clear(launch->id);
+          source->phase = source_phase_e::draining;
+          result->set_value(503);
+          arm_source_timer();
+          return;
+        }
+      }
+      if (source && (source->appid != launch->appid || source->app_uuid != launch->app_uuid)) {
+        launch->cancelled = true;
+        session_clear(launch->id);
+        result->set_value(503);
+        return;
+      }
+      if (source && source->phase == source_phase_e::ready) {
+        launch->source_generation = source->generation;
+        launch->application_instance = source->application_instance;
+        launch->source = source->metadata;
+        launch->joining = true;
+        source->prepared.emplace(launch->id, launch);
+        launch->ready = true;
+        result->set_value(200);
+        return;
+      }
+      const bool retained = source.has_value();
+      if (!retained) {
+        std::shared_ptr<source_backend_t> candidate;
+        try {
+          candidate = recovery ? recovery->backend : backend_factory();
+          if (!candidate || (recovery && (recovery->adopted || recovery->work || recovery->retry_requested)) || !candidate->admits(*planned.second) || next_source_generation == UINT64_MAX) {
+            candidate.reset();
+          }
+        } catch (...) {
+          candidate.reset();
+        }
+        if (!candidate) {
+          launch->cancelled = true;
+          session_clear(launch->id);
+          result->set_value(503);
+          return;
+        }
+        source.emplace();
+        source->generation = ++next_source_generation;
+        source->appid = launch->appid;
+        source->app_uuid = launch->app_uuid;
+        source->request = std::move(planned.second);
+        source->backend = std::move(candidate);
+        if (!source->backend) {
+          source.reset();
+          launch->cancelled = true;
+          session_clear(launch->id);
+          result->set_value(503);
+          return;
+        }
+      }
+      source->phase = source_phase_e::preparing;
+      source->epoch = ++next_capture_epoch;
+      source->admission = std::make_shared<admission_t>(admission_t {launch, result, std::move(execute), std::move(rollback)});
+      source->prepared.emplace(launch->id, launch);
+      launch->source_generation = source->generation;
+      launch->source_cancel = std::make_shared<std::atomic_bool>(false);
+      launch->joining = retained;
+      const auto backend = source->backend;
+      const auto epoch = source->epoch;
+      if (retained) {
+        const auto metadata = source->metadata;
+        dispatch_source(source_work_e::validate, [backend, metadata, epoch]() {
+          return backend->validate_retained(*metadata, epoch) ? 200 : 503;
+        });
+      } else {
+        const auto generation = source->generation;
+        const auto app_uuid = source->app_uuid;
+        const auto claim = source->process_claim;
+        dispatch_source(source_work_e::claim, [generation, app_uuid, claim]() {
+          const auto app = proc::proc.lifetime_snapshot();
+          if (app.tracked && app.app_uuid == app_uuid) {
+            *claim = proc::proc.claim_source(app.instance, generation);
+          }
+          return 200;
+        });
+      }
+    }
+
+    /** @brief Read the progress clock; test-only virtual time changes no admission deadline. */
+    std::chrono::steady_clock::time_point source_progress_now() const {
+#ifdef SUNSHINE_TESTS
+      if (source_progress_clock) {
+        return source_progress_clock();
+      }
+#endif
+      return std::chrono::steady_clock::now();
+    }
+
+    /** @brief Continue staged backend work without sleeping or waiting for apply, restore or probe. */
+    void poll_source() {
+      if (!source) {
+        return;
+      }
+      if (source->admission && !authorized(*source->admission->launch, false)) {
+        fail_source(403);
+      }
+      if (source->metadata && !source->failed) {
+        const auto observed = source->backend->status();
+        if (observed.generation == source->generation && observed.heartbeat_failed) {
+          source->retire_requested = true;
+          fail_source(503);
+          invalidate_launches();
+          clear();
+        }
+      }
+      if (source->work) {
+        if (source->work->wait_for(0ms) != std::future_status::ready) {
+          return;
+        }
+        const auto result = source->work->get();
+        source->work.reset();
+        if (result.generation != source->generation || result.revision != source->revision) {
+          fail_source(503);
+        } else if (result.kind == source_work_e::validate && !result.entered && !source->retire_requested) {
+          const auto launch = source->admission->launch;
+          release_source_pin(*launch, false, result.status);
+          session_clear(launch->id);
+          source->admission.reset();
+          source->epoch = source->metadata->epoch;
+          source->failed = false;
+          source->phase = source_phase_e::retained;
+          source->next_liveness = std::chrono::steady_clock::now();
+          return;
+        } else if (((result.kind == source_work_e::begin || result.kind == source_work_e::claim) && !result.entered) || (result.kind == source_work_e::claim && result.status != 200)) {
+          fail_source(result.status);
+          source->backend_unentered = true;
+          const auto claim = source->process_claim;
+          if (*claim) {
+            dispatch_source(source_work_e::unclaim, [claim]() {
+              proc::proc.restore_source_claim(**claim);
+              return 200;
+            });
+            return;
+          }
+          const auto launch = source->admission->launch;
+          session_clear(launch->id);
+          source->admission.reset();
+          source.reset();
+          finish_stop();
+          return;
+        } else if (result.kind == source_work_e::unclaim) {
+          if (result.status != 200) {
+            source->cleanup_blocked = true;
+            source->phase = source_phase_e::cleanup_pending;
+            return;
+          }
+          const auto launch = source->admission->launch;
+          session_clear(launch->id);
+          source.reset();
+          finish_stop();
+          return;
+        } else if (result.kind == source_work_e::release_claim) {
+          if (result.status != 200) {
+            source->cleanup_blocked = true;
+            source->phase = source_phase_e::cleanup_pending;
+            return;
+          }
+          finish_retirement();
+          return;
+        } else if (result.kind == source_work_e::claim) {
+          const auto backend = source->backend;
+          const auto request = source->request;
+          const auto generation = source->generation;
+          const auto epoch = source->epoch;
+          dispatch_source(source_work_e::begin, [backend, request, generation, epoch]() {
+            return backend->begin(*request, generation, epoch) ? 200 : 503;
+          });
+          return;
+        } else if (result.kind == source_work_e::liveness) {
+          const auto app = proc::proc.published_snapshot()->lifetime;
+          if (!stopping && !source->failed && source->request->retain_while_app_running && app.tracked && app.instance == source->application_instance && app.app_uuid == source->app_uuid) {
+            source->phase = source_phase_e::retained;
+            source->next_liveness = std::chrono::steady_clock::now() + 500ms;
+          } else {
+            source->phase = source_phase_e::draining;
+          }
+        } else if (result.kind == source_work_e::rollback) {
+          source->admission.reset();
+          source->phase = source_phase_e::draining;
+        } else if (result.kind == source_work_e::cleanup) {
+          source->phase = source_phase_e::cleanup_pending;
+          source->cleanup_blocked = result.status != 200;
+          if (result.status == 200) {
+            const auto status = source->backend->status();
+            if (status.generation == source->generation && status.source_released) {
+              const auto claim = source->process_claim;
+              if (*claim) {
+                dispatch_source(source_work_e::release_claim, [claim]() {
+                  proc::proc.restore_source_claim(**claim);
+                  return 200;
+                });
+              } else {
+                finish_retirement();
+              }
+              return;
+            }
+            source->cleanup_blocked = true;
+          }
+        } else if (result.kind == source_work_e::complete) {
+          if (result.status == 200) {
+            recovery.reset();
+            published_recovery_generation = 0;
+            source.reset();
+            finish_stop();
+            return;
+          }
+          source->phase = source_phase_e::cleanup_pending;
+          source->cleanup_blocked = true;
+          source->completion_pending = true;
+        } else if (result.kind == source_work_e::restore) {
+          source->phase = result.status == 200 ? source_phase_e::restoring : source_phase_e::cleanup_pending;
+          source->cleanup_blocked = result.status != 200;
+        } else if (result.kind == source_work_e::progress) {
+          source->next_backend_progress = source_progress_now() + 100ms;
+          if (result.status != 200) {
+            if (source->phase == source_phase_e::applying) {
+              fail_source(503);
+            } else {
+              source->phase = source_phase_e::cleanup_pending;
+              source->cleanup_blocked = true;
+            }
+          }
+        } else if (source->failed || (source->admission && source->admission->answered)) {
+          source->phase = source_phase_e::draining;
+        } else if (result.status != 200) {
+          fail_source(result.status);
+        } else if (result.kind == source_work_e::begin || result.kind == source_work_e::validate) {
+          source->phase = source_phase_e::applying;
+        } else if (result.kind == source_work_e::probe) {
+          if (!authorized(*source->admission->launch, false)) {
+            fail_source(403);
+          } else if (source->admission->execute && !source->admission->launch->joining) {
+            source->phase = source_phase_e::executing;
+            source->admission->executed = true;
+            dispatch_source(source_work_e::execute, source->admission->execute);
+            return;
+          } else {
+            publish_source_ready();
+          }
+        } else if (result.kind == source_work_e::execute) {
+          publish_source_ready();
+        }
+      }
+      if (!source || source->work) {
+        return;
+      }
+      std::erase_if(source->stops, [](auto &stop) {
+        return stop.wait_for(0ms) == std::future_status::ready;
+      });
+      if (!source->stops.empty()) {
+        return;
+      }
+      if (source->backend_unentered) {
+        return;
+      }
+      const auto status = source->backend->status();
+      if (status.generation != source->generation) {
+        fail_source(503);
+        source->phase = source_phase_e::cleanup_pending;
+        source->cleanup_blocked = true;
+        return;
+      } else if (status.heartbeat_failed && !source->failed) {
+        source->retire_requested = true;
+        fail_source(503);
+        invalidate_launches();
+        clear();
+      }
+      if (source->phase == source_phase_e::applying) {
+        std::shared_ptr<const capture_source_t> candidate;
+        if (status.phase == source_backend_status_t::phase_e::ready && status.source) {
+          auto metadata = std::make_shared<capture_source_t>(*status.source);
+          // The admission owns this policy constraint; backend observations cannot replace it.
+          metadata->requested_hdr = source->request->requested_hdr;
+          candidate = std::move(metadata);
+        }
+        if (candidate && valid_source(candidate)) {
+          source->metadata = candidate;
+          source->admission->launch->source = candidate;
+          source->phase = source_phase_e::probing;
+          const auto backend = source->backend;
+          const auto metadata = source->metadata;
+          const auto pin = pin_capture(metadata);
+          if (!pin) {
+            fail_source(503);
+            return;
+          }
+          dispatch_source(source_work_e::probe, [backend, metadata, pin]() {
+            return backend->probe(*metadata, pin);
+          });
+          return;
+        }
+        if (status.phase == source_backend_status_t::phase_e::failed || status.phase == source_backend_status_t::phase_e::ready) {
+          fail_source(503);
+        }
+      }
+      // Consume completed ready/failure/removal observations before another refresh. Its
+      // polling deadline is measured from completion, never from a potentially slow dispatch.
+      if (!source->cleanup_blocked && source_progress_now() >= source->next_backend_progress && ((source->phase == source_phase_e::applying && status.phase == source_backend_status_t::phase_e::preparing) || (source->phase == source_phase_e::restoring && status.phase == source_backend_status_t::phase_e::reverting))) {
+        const auto backend = source->backend;
+        const auto generation = source->generation;
+        dispatch_source(source_work_e::progress, [backend, generation]() {
+          backend->progress(generation);
+          return 200;
+        });
+        return;
+      }
+      if (source->phase == source_phase_e::draining && source->admission) {
+        const auto admission = source->admission;
+        if (admission->executed && admission->rollback) {
+          admission->executed = false;
+          dispatch_source(source_work_e::rollback, [admission]() {
+            admission->rollback();
+            return 200;
+          });
+          return;
+        }
+        source->admission.reset();
+      }
+      if (!source->prepared.empty() || !source->media.empty() || !source->capture.empty()) {
+        return;
+      }
+      if (source->phase == source_phase_e::ready || source->phase == source_phase_e::retained) {
+        if (source->phase == source_phase_e::retained && std::chrono::steady_clock::now() < source->next_liveness) {
+          return;
+        }
+        if (!stopping && !source->failed && source->request->retain_while_app_running && source->application_instance) {
+          source->phase = source_phase_e::checking;
+          dispatch_source(source_work_e::liveness, []() {
+            proc::proc.running();
+            proc::proc.refresh_published();
+            return 200;
+          });
+          return;
+        }
+        source->phase = source_phase_e::draining;
+      }
+      if (source->phase == source_phase_e::draining) {
+        const auto backend = source->backend;
+        const auto generation = source->generation;
+        const auto delay = source->request->restore_delay;
+        source->phase = source_phase_e::restoring;
+        dispatch_source(source_work_e::restore, [backend, generation, delay]() {
+          return backend->restore(generation, delay) ? 200 : 503;
+        });
+      } else if (!source->cleanup_blocked && source->completion_pending) {
+        const auto backend = source->backend;
+        const auto generation = source->generation;
+        dispatch_source(source_work_e::complete, [backend, generation]() {
+          return backend->complete(generation) ? 200 : 503;
+        });
+      } else if (!source->cleanup_blocked && (source->phase == source_phase_e::restoring || source->phase == source_phase_e::cleanup_pending) && (status.phase == source_backend_status_t::phase_e::removal_ready || status.phase == source_backend_status_t::phase_e::restored || status.phase == source_backend_status_t::phase_e::cleanup_pending)) {
+        const auto backend = source->backend;
+        const auto generation = source->generation;
+        dispatch_source(source_work_e::cleanup, [backend, generation]() {
+          if (!backend->cleanup_and_retire(generation)) {
+            return 503;
+          }
+          return 200;
+        });
+      }
+    }
+
+    void finish_retirement() {
+      const auto status = source->backend->status();
+      if (status.generation != source->generation || !status.source_released) {
+        source->cleanup_blocked = true;
+        return;
+      }
+      auto retained = std::make_unique<recovery_record_t>();
+      retained->backend = source->backend;
+      retained->generation = source->generation;
+      recovery = std::move(retained);
+      published_recovery_generation = source->generation;
+      if (status.recovery_pending) {
+        source.reset();
+        finish_stop();
+        return;
+      }
+      const auto backend = source->backend;
+      const auto generation = source->generation;
+      dispatch_source(source_work_e::complete, [backend, generation]() {
+        return backend->complete(generation) ? 200 : 503;
+      });
+    }
+
+    /** @brief Serialize tagged recovery work off-owner; startup custody stops before B completion. */
+    void poll_retired_recovery() {
+      if (recovery && recovery->work) {
+        if (recovery->work->wait_for(0ms) != std::future_status::ready) {
+          return;
+        }
+        const auto result = recovery->work->get();
+        recovery->work.reset();
+        if (result.generation != recovery->generation || result.revision != recovery->revision || result.operation != recovery->operation) {
+          recovery->blocked = true;
+          finish_stop();
+          return;
+        }
+        recovery->next_progress = source_progress_now() + 100ms;
+        if (result.outcome == recovery_outcome_e::completed && !recovery->adopted) {
+          recovery.reset();
+          published_recovery_generation = 0;
+        } else if (result.outcome == recovery_outcome_e::blocked) {
+          recovery->blocked = !recovery->retry_requested;
+        } else if (result.outcome == recovery_outcome_e::restored) {
+          recovery->stage = recovery->adopted ? recovery_stage_e::awaiting_completion : recovery_stage_e::retired;
+          if (recovery->adopted) {
+            recovery->retry_requested = false;
+          }
+        } else if (result.outcome == recovery_outcome_e::removal_ready) {
+          recovery->stage = recovery_stage_e::removal_ready;
+          recovery->next_progress = {};
+        }
+        finish_stop();
+        if (stopped) {
+          return;
+        }
+      }
+      if (source || preflight || stopping || !recovery || recovery->blocked || recovery->stage == recovery_stage_e::awaiting_completion || source_progress_now() < recovery->next_progress) {
+        return;
+      }
+      if (recovery->revision == UINT64_MAX) {
+        recovery->blocked = true;
+        recovery->retry_requested = false;
+        return;
+      }
+      const auto backend = recovery->backend;
+      const auto generation = recovery->generation;
+      const auto adopted = recovery->adopted;
+      const auto state = backend->status();
+      if (state.generation != generation || state.heartbeat_failed) {
+        recovery->blocked = true;
+        return;
+      }
+      auto operation = recovery_operation_e::observe;
+      if (std::exchange(recovery->retry_requested, false)) {
+        operation = state.source_released ? recovery_operation_e::retry_retired : recovery->stage == recovery_stage_e::removal_ready ? recovery_operation_e::retire :
+                                                                                                                                       recovery_operation_e::restore;
+      } else if (adopted && recovery->stage == recovery_stage_e::removal_ready) {
+        operation = recovery_operation_e::retire;
+      } else if (!adopted && state.source_released && !state.recovery_pending && !state.recovery_retry_required) {
+        operation = recovery_operation_e::complete;
+      }
+      const auto revision = ++recovery->revision;
+      recovery->operation = operation;
+      try {
+#ifdef SUNSHINE_TESTS
+        notify_owner("recovery_before_dispatch");
+#endif
+        recovery->work.emplace(std::async(std::launch::async, [backend, generation, revision, operation, adopted
+#ifdef SUNSHINE_TESTS
+                                                               ,
+                                                               this
+#endif
+        ]() {
+          auto outcome = recovery_outcome_e::blocked;
+          try {
+            bool ok = true;
+            if (operation == recovery_operation_e::restore)
+              ok = backend->restore(generation, 0ms);
+            else if (operation == recovery_operation_e::retire)
+              ok = backend->cleanup_and_retire(generation);
+            else if (operation == recovery_operation_e::retry_retired)
+              ok = backend->retry_recovery(generation);
+            else if (operation == recovery_operation_e::complete)
+              ok = !adopted && backend->complete(generation);
+            if (ok && operation == recovery_operation_e::complete) {
+              outcome = recovery_outcome_e::completed;
+            } else if (ok) {
+#ifdef SUNSHINE_TESTS
+              if (operation == recovery_operation_e::observe)
+                notify_owner("recovery_observation_before_progress");
+#endif
+              backend->progress(generation);
+              const auto current = backend->status();
+              if (current.generation == generation && !current.heartbeat_failed && !current.recovery_retry_required && current.phase != source_backend_status_t::phase_e::failed) {
+                if (adopted && current.source_released && current.restoration_ready)
+                  outcome = recovery_outcome_e::restored;
+                else if (adopted && !current.source_released && current.phase == source_backend_status_t::phase_e::removal_ready)
+                  outcome = recovery_outcome_e::removal_ready;
+                else if (adopted || current.source_released)
+                  outcome = recovery_outcome_e::pending;
+              }
+            }
+          } catch (...) {}
+          return recovery_result_t {generation, revision, operation, outcome};
+        }));
+      } catch (...) {
+        // Custody is already committed. Dispatch failure retains the actual context and gate.
+        recovery->blocked = true;
+      }
+    }
+
+    /** @brief Recheck authorization before publishing ready; only a tracked app may extend source lifetime. */
+    void publish_source_ready() {
+      auto admission = source->admission;
+      if (!authorized(*admission->launch, false)) {
+        fail_source(403);
+        return;
+      }
+      const auto app = proc::proc.published_snapshot()->lifetime;
+      source->application_instance = app.tracked && app.app_uuid == source->app_uuid ? app.instance : 0;
+      admission->launch->application_instance = source->application_instance;
+      admission->launch->ready = true;
+      source->phase = source_phase_e::ready;
+      answer_admission(200);
+      source->admission.reset();
+    }
+
+    /** @brief Publish a process event without acquiring its state lock or waiting for the owner. */
+    void post_application_exit(std::uint64_t instance) {
+      asio::post(io_context, [this, instance]() {
+        if (source && source->application_instance == instance) {
+          source->application_instance = 0;
+          arm_source_timer();
+        }
+      });
+    }
+
+    /** @brief Each capture-resource lifetime explicitly increments the owner table. */
+    std::shared_ptr<capture_pin_t> pin_capture(const std::shared_ptr<const capture_source_t> &metadata) {
+      if (!source || !metadata || source->metadata != metadata || (source->phase != source_phase_e::ready && source->phase != source_phase_e::probing) || source->failed) {
+        return {};
+      }
+      const auto id = ++next_capture_pin;
+      const auto generation = source->generation;
+      const auto epoch = source->epoch;
+      source->capture.emplace(id);
+      const std::weak_ptr<source_emitter_t> emitter = source_emitter;
+      return std::shared_ptr<capture_pin_t>(new capture_pin_t([emitter, id, generation, epoch]() {
+        if (const auto gate = emitter.lock()) {
+          std::lock_guard lock {gate->mutex};
+          if (auto owner = gate->owner) {
+            asio::post(owner->io_context, [owner, id, generation, epoch]() {
+              if (owner->source && owner->source->generation == generation && owner->source->epoch == epoch) {
+                owner->source->capture.erase(id);
+                owner->arm_source_timer();
+              }
+            });
+          }
+        }
+      }));
+    }
+
+    /** @brief Configure the injection seam only while no source or operation owns the backend. */
+    bool set_backend(std::function<std::shared_ptr<source_backend_t>()> factory) {
+      if (source || preflight || recovery || session_count() || launch_event.view(0s)) {
+        return false;
+      }
+      backend_factory = std::move(factory);
+      return true;
+    }
+
+#ifdef _WIN32
+    /** @brief Commit only preallocated state at the live owner's single admission ordering point. */
+    bool adopt_recovery(std::unique_ptr<recovery_record_t> &candidate) {
+      if (!running || stopping || source || preflight || recovery || process_work || !process_jobs.empty() || pending_process_posts || pending_admissions || liveness_queued || session_count() || launch_event.view(0s)) {
+        return false;
+      }
+      for (const auto &weak : tokens) {
+        const auto token = weak.lock();
+        if (token && !token->cancelled && !token->admitted) {
+          return false;
+        }
+      }
+      const auto application = proc::proc.published_snapshot();
+      if (application->operation_in_progress || application->lifetime.appid > 0 || application->lifetime.tracked || application->lifetime.placeholder || application->managed_source_instance || application->managed_source_generation) {
+        return false;
+      }
+      const auto generation = candidate->generation;
+      const auto state = candidate->backend->status();
+      if (!candidate->startup->reconstructed() || !generation || generation == UINT64_MAX || generation <= next_source_generation || state.generation != generation || state.source || !candidate->startup->adopt_offer()) {
+        return false;
+      }
+      // These nonthrowing moves commit custody and the used-generation floor together.
+      next_source_generation = generation;
+      published_recovery_generation = generation;
+      recovery = std::move(candidate);
+      try {
+  #ifdef SUNSHINE_TESTS
+        notify_owner("recovery_after_commit");
+  #endif
+        arm_source_timer();
+      } catch (...) {
+        recovery->blocked = true;
+      }
+      return true;
+    }
+
+    bool dispatch_adoption(std::unique_ptr<recovery_record_t> candidate) {
+      if (on_owner()) {
+        return false;
+      }
+      auto task = std::make_shared<std::packaged_task<bool()>>([this, candidate = std::move(candidate)]() mutable {
+        return adopt_recovery(candidate);
+      });
+      auto result = task->get_future();
+      {
+        std::lock_guard lock {lifecycle_mutex};
+        if (!running || stopping) {
+          return false;
+        }
+        asio::post(io_context, [task]() {
+          (*task)();
+        });
+      }
+  #ifdef SUNSHINE_TESTS
+      // A posted offer must always await its custody result, even if a fixture observer fails.
+      try {
+        notify_owner("recovery_adoption_posted");
+      } catch (...) {}
+  #endif
+      return result.get();
+    }
+#endif
+
+    bool has_backend() const {
+      return static_cast<bool>(backend_factory);
+    }
+
+    /** @brief Start one owned FIFO process job; its completion never calls back synchronously. */
+    void poll_process() {
+      if (process_work) {
+        if (process_work->wait_for(0ms) != std::future_status::ready) {
+          return;
+        }
+        try {
+          process_work->get();
+        } catch (...) {
+          BOOST_LOG(error) << "Process worker completion failed";
+        }
+        process_work.reset();
+      }
+      if (!process_jobs.empty()) {
+        auto job = std::move(process_jobs.front());
+        process_jobs.pop_front();
+        process_work.emplace(std::async(std::launch::async, [job = std::move(job)]() {
+          process_worker_context = true;
+          auto guard = util::fail_guard([]() {
+            process_worker_context = false;
+          });
+          try {
+            proc::proc.publish_operation(true);
+            job();
+            proc::proc.refresh_published();
+            proc::proc.publish_operation(false);
+          } catch (...) {
+            try {
+              proc::proc.publish_operation(false);
+            } catch (...) {}
+            BOOST_LOG(error) << "Process operation failed";
+          }
+        }));
+      }
+      finish_stop();
+    }
+
+    /** @brief Internal enqueue is owner-only and remains available to accepted work during shutdown. */
+    void queue_process(std::function<void()> operation) {
+      process_jobs.emplace_back(std::move(operation));
+      poll_process();
+      arm_source_timer();
+    }
+
+    std::future<void> post_process(std::function<void()> operation) {
+      auto task = std::make_shared<std::packaged_task<void()>>(std::move(operation));
+      auto result = task->get_future();
+      if (on_owner()) {
+        queue_process([task]() {
+          (*task)();
+        });
+        return result;
+      }
+      std::unique_lock lock {lifecycle_mutex};
+      if (stopping) {
+        auto denied = std::make_shared<std::packaged_task<void()>>([]() {
+          throw std::runtime_error {"Process lane is shutting down"};
+        });
+        auto rejected = denied->get_future();
+        (*denied)();
+        return rejected;
+      }
+      if (!running) {
+        lock.unlock();
+        const auto previous = process_worker_context;
+        process_worker_context = true;
+        auto guard = util::fail_guard([previous]() {
+          process_worker_context = previous;
+        });
+        (*task)();
+      } else {
+        ++pending_process_posts;
+        auto failed_post = util::fail_guard([&]() {
+          --pending_process_posts;
+        });
+        asio::post(io_context, [this, task]() {
+          --pending_process_posts;
+#ifdef SUNSHINE_TESTS
+          notify_owner("process_operation_queued");
+#endif
+          queue_process([task]() {
+            (*task)();
+          });
+        });
+        failed_post.disable();
+      }
+      return result;
+    }
+
+    bool on_owner() {
+      return io_context.get_executor().running_in_this_thread();
+    }
+
+    bool process_busy() const {
+      return process_work.has_value() || !process_jobs.empty();
+    }
+
+    std::future<void> queue_stop(std::function<void(bool, std::uint64_t, std::uint64_t)> operation) {
+      const auto managed = source.has_value();
+      const auto generation = managed ? source->generation : 0;
+      const auto instance = proc::proc.published_snapshot()->lifetime.instance;
+      if (source) {
+        source->retire_requested = true;
+      }
+      invalidate_launches();
+      clear(true);
+      fail_source(503);
+      input::terminate_gamepads();
+      auto task = std::make_shared<std::packaged_task<void()>>([operation = std::move(operation), managed, instance, generation]() {
+        operation(managed, instance, generation);
+      });
+      auto result = task->get_future();
+      if (!running) {
+        (*task)();
+        return result;
+      }
+      if (source) {
+        auto done = std::make_shared<std::promise<void>>();
+        source->stops.push_back(done->get_future().share());
+        queue_process([task, done]() {
+          (*task)();
+          done->set_value();
+        });
+      } else {
+        queue_process([task]() {
+          (*task)();
+        });
+      }
+#ifdef SUNSHINE_TESTS
+      notify_owner("application_stop_queued");
+#endif
+      return result;
+    }
+
+    void post_liveness() {
+      if (liveness_queued.exchange(true)) {
+        return;
+      }
+      asio::post(io_context, [this]() {
+        if (stopping) {
+          liveness_queued = false;
+          return;
+        }
+        queue_process([this]() {
+          proc::proc.running();
+          proc::proc.refresh_published();
+          liveness_queued = false;
+        });
+      });
+    }
+
+    void retry_cleanup() {
+      if (!source || source->work || source->phase != source_phase_e::cleanup_pending) {
+        return;
+      }
+      source->cleanup_blocked = false;
+      if (source->backend_unentered) {
+        const auto claim = source->process_claim;
+        dispatch_source(source_work_e::unclaim, [claim]() {
+          if (*claim) {
+            proc::proc.restore_source_claim(**claim);
+          }
+          return 200;
+        });
+        return;
+      }
+      const auto status = source->backend->status();
+      if (status.generation == source->generation && status.source_released && *source->process_claim && !source->completion_pending) {
+        const auto claim = source->process_claim;
+        dispatch_source(source_work_e::release_claim, [claim]() {
+          proc::proc.restore_source_claim(**claim);
+          return 200;
+        });
+        return;
+      }
+      if (!source->completion_pending && status.phase != source_backend_status_t::phase_e::removal_ready && status.phase != source_backend_status_t::phase_e::cleanup_pending && status.phase != source_backend_status_t::phase_e::restored) {
+        source->phase = source_phase_e::draining;
+      }
+      arm_source_timer();
+    }
+
+    /** @brief Recovery must remain postable while shutdown is draining, without waiting on its fence. */
+    void post_retry_cleanup() {
+      const auto generation = next_source_generation.load();
+      const auto retired_generation = published_recovery_generation.load();
+      asio::post(io_context, [this, generation, retired_generation]() {
+        if (source && source->generation == generation) {
+          retry_cleanup();
+        } else if (!source && recovery && recovery->generation == retired_generation && recovery->stage != recovery_stage_e::awaiting_completion && recovery->revision != UINT64_MAX) {
+          recovery->blocked = false;
+          recovery->retry_requested = true;
+          recovery->next_progress = {};
+          arm_source_timer();
+        }
+      });
+    }
+
+    /**
+     * @brief Drain accepted operations before stopping the executor, retaining adopted custody.
+     * @details An adopted record remains owned by this server after loop shutdown. Stopping is
+     * neither recovery completion nor gate release; the server object must outlive the episode.
+     */
+    void finish_stop() {
+      if (!stopping || source || preflight || process_work || !process_jobs.empty() || pending_process_posts || (recovery && recovery->work) || !shutdown_completion) {
+#ifdef SUNSHINE_TESTS
+        if (stopping && !source && !preflight && process_work) {
+          notify_owner("stop_process_work_pending");
+        }
+#endif
+        return;
+      }
+      {
+        std::lock_guard lock {lifecycle_mutex};
+        running = false;
+        stopped = true;
+      }
+      shutdown_completion->set_value();
+      shutdown_completion.reset();
     }
 
     /**
@@ -552,7 +1840,7 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
-      if (stopping || launch_event.view(0s) || !authorized(*launch_session, false)) {
+      if (stopping || (recovery && recovery->adopted) || launch_event.view(0s) || !authorized(*launch_session, false)) {
         return false;
       }
       tokens.emplace_back(launch_session);
@@ -565,7 +1853,11 @@ namespace rtsp_stream {
         if (!ec) {
           auto discarded = launch_event.pop(0s);
           if (discarded && !discarded->admitted) {
+#ifdef SUNSHINE_TESTS
+            notify_owner("launch_expired");
+#endif
             discarded->cancelled = true;
+            release_source_pin(*discarded, false, 503);
           }
         }
       });
@@ -581,6 +1873,7 @@ namespace rtsp_stream {
       if (pending && pending->id == launch_session_id) {
         if (!pending->admitted) {
           pending->cancelled = true;
+          release_source_pin(*pending);
         }
         raised_timer.cancel();
         launch_event.pop(0s);
@@ -605,7 +1898,7 @@ namespace rtsp_stream {
      * @return Whether this is its first currently authorized ANNOUNCE.
      */
     bool claim(launch_session_t &session) {
-      if (session.admitted || !authorized(session)) {
+      if ((recovery && recovery->adopted) || session.admitted || !authorized(session)) {
         return false;
       }
       session.admitted = true;
@@ -675,6 +1968,7 @@ namespace rtsp_stream {
       for (auto &weak : tokens) {
         if (auto token = weak.lock(); token && token->client_uuid == uuid) {
           token->cancelled = true;
+          release_source_pin(*token);
           session_clear(token->id);
         }
       }
@@ -687,7 +1981,9 @@ namespace rtsp_stream {
         } else if (!client || !permissions::allows(client->permissions, permissions::view)) {
           stream::session::stop(session);
           stream::session::join(session);
+          const auto id = stream::session::launch_id(session);
           it = _session_slots->erase(it);
+          release_source_slot(id);
         } else {
           stream::session::update_permissions(session, client->permissions);
           ++it;
@@ -705,6 +2001,7 @@ namespace rtsp_stream {
       for (auto &weak : tokens) {
         if (auto token = weak.lock()) {
           token->cancelled = true;
+          release_source_pin(*token);
         }
       }
       raised_timer.cancel();
@@ -737,8 +2034,9 @@ namespace rtsp_stream {
         if (all || stream::session::state(slot) == stream::session::state_e::STOPPING) {
           stream::session::stop(slot);
           stream::session::join(slot);
-
+          const auto id = stream::session::launch_id(slot);
           i = _session_slots->erase(i);
+          release_source_slot(id);
         } else {
           i++;
         }
@@ -754,6 +2052,7 @@ namespace rtsp_stream {
       for (auto &weak : tokens) {
         if (auto token = weak.lock(); token && token->client_cert == cert) {
           token->cancelled = true;
+          release_source_pin(*token);
           session_clear(token->id);
         }
       }
@@ -764,7 +2063,9 @@ namespace rtsp_stream {
         if (stream::session::client_cert(slot) == cert) {
           stream::session::stop(slot);
           stream::session::join(slot);
+          const auto id = stream::session::launch_id(slot);
           i = _session_slots->erase(i);
+          release_source_slot(id);
         } else {
           i++;
         }
@@ -778,6 +2079,7 @@ namespace rtsp_stream {
     void remove(const std::shared_ptr<stream::session_t> &session) {
       auto lg = _session_slots.lock();
       _session_slots->erase(session);
+      release_source_slot(stream::session::launch_id(*session));
     }
 
     /**
@@ -794,6 +2096,25 @@ namespace rtsp_stream {
      * @brief Runs an iteration of the RTSP server loop
      */
     void iterate() {
+      if (recovery && recovery->adopted && (source_timer_failed || stopping) && (recovery->work || process_work || !process_jobs.empty() || pending_process_posts)) {
+        // The owner loop itself drains accepted futures if timer registration remains unavailable.
+        // Keep executor work alive through Stop closing the listener; the finite wait is only for
+        // event dispatch, and the existing polls never wait for backend or process completion.
+        if (io_context.stopped()) {
+          io_context.restart();
+        }
+        auto drain_guard = asio::make_work_guard(io_context);
+        io_context.run_one_for(10ms);
+        if (stopped) {
+          return;
+        }
+        poll_process();
+        if (stopped) {
+          return;
+        }
+        poll_retired_recovery();
+        return;
+      }
       // If we have a session, we will return to the server loop every
       // 500ms to allow session cleanup to happen.
       if (session_count() > 0) {
@@ -818,6 +2139,7 @@ namespace rtsp_stream {
       }
       stopping = true;
       auto completion = std::make_shared<std::promise<void>>();
+      shutdown_completion = completion;
       shutdown_done = completion->get_future().share();
       const auto finish = [this, completion]() {
 #ifdef SUNSHINE_TESTS
@@ -827,12 +2149,12 @@ namespace rtsp_stream {
         boost::system::error_code error;
         acceptor.close(error);
         clear();
-        {
-          std::lock_guard lock {lifecycle_mutex};
-          running = false;
-          stopped = true;
+        if (source) {
+          source->retire_requested = true;
+          fail_source(503);
+          poll_source();
         }
-        completion->set_value();
+        finish_stop();
       };
       if (running) {
         asio::post(io_context, finish);
@@ -860,6 +2182,7 @@ namespace rtsp_stream {
 
 #ifdef SUNSHINE_TESTS
     std::function<void(std::string_view)> owner_hook;  ///< Deterministic lifecycle boundaries for tests.
+    std::function<std::chrono::steady_clock::time_point()> source_progress_clock;  ///< Virtual progress time; admission deadlines retain their real clock.
     std::mutex owner_hook_mutex;  ///< Protects test observer publication across the owner and posting threads.
 
     void notify_owner(std::string_view event) {
@@ -880,6 +2203,33 @@ namespace rtsp_stream {
       shutdown_done = {};
       std::lock_guard observer {owner_hook_mutex};
       owner_hook = {};
+      source_progress_clock = {};
+      source_timer_failed = false;
+    }
+
+    bool test_pending_owner_work() const {
+      return (recovery && recovery->work) || process_work || !process_jobs.empty() || pending_process_posts;
+    }
+
+    std::uint64_t test_generation_floor() const {
+      return next_source_generation;
+    }
+
+    bool test_recovery_revision(std::uint64_t revision) {
+      if (!recovery || recovery->work) {
+        return false;
+      }
+      recovery->revision = revision;
+      return true;
+    }
+
+    bool test_discard_recovery() {
+      if (running || (recovery && recovery->work)) {
+        return false;
+      }
+      recovery.reset();
+      published_recovery_generation = 0;
+      return true;
     }
 
     auto test_work_guard() {
@@ -887,6 +2237,7 @@ namespace rtsp_stream {
     }
 #endif
 
+    std::atomic_uint pending_admissions {0};  ///< Includes requests queued before their owner admission callback.
     std::atomic_bool stopping {false};
     std::atomic_bool stopped {false};  ///< Owner loop termination follows the serialized stop operation.
 
@@ -898,20 +2249,117 @@ namespace rtsp_stream {
     boost::asio::io_context io_context;
     tcp::acceptor acceptor {io_context};
     boost::asio::steady_timer raised_timer {io_context};
+    boost::asio::steady_timer source_timer {io_context};  ///< Staged backend polling and retained-app liveness.
+    bool source_timer_armed = false;
+    bool source_timer_failed = false;  ///< Independent owner-loop draining survives persistent timer-registration failure.
+    std::optional<source_record_t> source;  ///< The sole owner of source accounting; metadata owns no capture pin.
+    std::shared_ptr<preflight_t> preflight;  ///< Reservation and owned refresh continuation; no backend effect yet.
+    std::deque<std::function<void()>> process_jobs;  ///< Owner-ordered process/catalog mutations and observations.
+    std::optional<std::future<void>> process_work;  ///< Sole in-flight process operation, always polled.
+    std::atomic_bool liveness_queued {false};
+    std::unique_ptr<recovery_record_t> recovery;  ///< Exact backend and optional startup proof remain owned across blocked states.
+    std::atomic_uint64_t published_recovery_generation {0};  ///< Inert retry fence; the record owns its authoritative generation.
+    std::atomic_uint pending_process_posts {0};  ///< Requests accepted before their owner enqueue callback.
+    std::function<std::shared_ptr<source_backend_t>()> backend_factory;  ///< Empty until explicitly integrated and qualified.
+    std::shared_ptr<source_emitter_t> source_emitter = std::make_shared<source_emitter_t>();
+    std::atomic_uint64_t next_source_generation {0};
+    std::uint64_t next_capture_epoch = 0;
+    std::uint64_t next_capture_pin = 0;
 
     std::shared_ptr<socket_t> next_socket;
     std::vector<std::weak_ptr<launch_session_t>> tokens;  ///< Accepted-socket tokens that a global Stop must invalidate.
     std::recursive_mutex lifecycle_mutex;  ///< Protects offline direct execution versus owner dispatch.
     bool running = false;  ///< A live RTSP owner will drain posted operations.
     std::shared_future<void> shutdown_done;  ///< Completes all accepted work before offline calls may proceed.
+    std::shared_ptr<std::promise<void>> shutdown_completion;  ///< Source drain keeps the owner runnable through shutdown.
   };
 
   rtsp_server_t server {};  ///< Singleton RTSP server used by GameStream launch sessions.
+
+  bool set_source_backend(std::function<std::shared_ptr<source_backend_t>()> factory) {
+    return server.sync([factory = std::move(factory)]() mutable {
+      return server.set_backend(std::move(factory));
+    });
+  }
+
+#ifdef _WIN32
+  bool adopt_source_recovery(std::shared_ptr<platf::source_backend::recovery_context_t> &context) {
+    if (!context || server.on_owner() || !context->offer()) {
+      return false;
+    }
+    const auto retained = context;
+    auto withdraw = util::fail_guard([&]() {
+      retained->withdraw_offer();
+    });
+    try {
+  #ifdef SUNSHINE_TESTS
+      server.notify_owner("recovery_offer_reserved");
+  #endif
+      auto candidate = std::make_unique<rtsp_server_t::recovery_record_t>();
+      candidate->startup = retained;
+      candidate->backend = retained->offered_backend();
+      candidate->generation = retained->generation();
+      candidate->adopted = true;
+      candidate->stage = rtsp_server_t::recovery_stage_e::restoring;
+      if (!candidate->backend || !server.dispatch_adoption(std::move(candidate))) {
+        return false;
+      }
+      context.reset();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+#endif
+
+  bool has_source_backend() {
+    return server.sync([]() {
+      return server.has_backend();
+    });
+  }
+
+  void retry_source_cleanup() {
+    server.post_retry_cleanup();
+  }
+
+  source_snapshot_t source_snapshot() {
+    return server.sync([]() {
+      return server.snapshot();
+    });
+  }
+
+  int prepare_source_launch(std::shared_ptr<launch_session_t> launch, std::function<std::pair<int, std::shared_ptr<const display_policy::source_request_t>>(const source_snapshot_t &)> plan, std::function<int()> execute, std::function<void()> rollback, std::function<void()> refresh) {
+    ++server.pending_admissions;
+    auto admission_done = util::fail_guard([]() {
+      --server.pending_admissions;
+    });
+    if (server.on_owner()) {
+      return 503;
+    }
+    auto result = std::make_shared<std::promise<int>>();
+    auto future = result->get_future();
+    server.sync([launch = std::move(launch), plan = std::move(plan), execute = std::move(execute), rollback = std::move(rollback), refresh = std::move(refresh), result]() mutable {
+      server.prepare_source(std::move(launch), std::move(plan), std::move(execute), std::move(rollback), result, std::move(refresh));
+    });
+    return future.get();
+  }
+
+  std::shared_ptr<capture_pin_t> acquire_capture_pin(const std::shared_ptr<const capture_source_t> &source) {
+    return server.on_owner() ? server.pin_capture(source) : nullptr;
+  }
+
+  void application_exited(std::uint64_t instance) {
+    server.post_application_exit(instance);
+  }
 
   /**
    * @brief Queue a launch session until the RTSP client connects.
    */
   bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    ++server.pending_admissions;
+    auto admission_done = util::fail_guard([]() {
+      --server.pending_admissions;
+    });
     return server.sync([&]() {
       launch_session->ready = true;
       return server.session_raise(launch_session);
@@ -919,7 +2367,14 @@ namespace rtsp_stream {
   }
 
   int prepare_launch(std::shared_ptr<launch_session_t> launch_session, std::function<int()> prepare, std::function<void()> rollback) {
+    ++server.pending_admissions;
+    auto admission_done = util::fail_guard([]() {
+      --server.pending_admissions;
+    });
     return server.sync([&]() {
+      if (server.process_busy()) {
+        return 503;
+      }
       if (!server.authorized(*launch_session, false)) {
         return 403;
       }
@@ -960,6 +2415,37 @@ namespace rtsp_stream {
     });
   }
 
+  void catalog_operation(std::function<void()> operation) {
+    if (process_worker_context) {
+      operation();
+      return;
+    }
+    if (server.on_owner()) {
+      if (server.process_busy()) {
+        throw std::logic_error {"Owner must use a process continuation"};
+      }
+      operation();
+      return;
+    }
+    process_operation(std::move(operation)).get();
+  }
+
+  std::future<void> process_operation(std::function<void()> operation) {
+    return server.post_process(std::move(operation));
+  }
+
+  bool on_process_worker() {
+    return process_worker_context;
+  }
+
+  bool on_owner_thread() {
+    return server.on_owner();
+  }
+
+  void refresh_process_liveness() {
+    server.post_liveness();
+  }
+
   void reconcile_client(std::string_view uuid, std::string_view cert, bool destroy) {
     server.sync([&]() {
       server.reconcile(uuid, cert, destroy);
@@ -982,14 +2468,56 @@ namespace rtsp_stream {
   }
 
   void stop_application(std::function<void()> stop) {
-    server.sync([&]() {
-      server.invalidate_launches();
-      server.clear(true);
-      input::terminate_gamepads();
-      if (stop) {
-        stop();
-      }
+    auto completion = server.sync([stop = std::move(stop)]() mutable {
+      return server.queue_stop([stop = std::move(stop)](bool, std::uint64_t, std::uint64_t) {
+        if (stop) {
+          stop();
+        }
+      });
     });
+    if (!server.on_owner()) {
+      completion.get();
+    }
+  }
+
+  bool stop_process_application(std::optional<process_authority_t> authority) {
+    if (server.on_owner()) {
+      throw std::logic_error {"Stop completion must be awaited outside the owner"};
+    }
+    auto allowed = std::make_shared<std::atomic_bool>(true);
+    auto completion = server.sync([authority, allowed]() {
+      if (authority) {
+        const auto current = nvhttp::current_client(authority->uuid, authority->cert);
+        if (!current || current->revision != authority->revision || !permissions::allows(current->permissions, authority->required)) {
+          allowed->store(false);
+          std::promise<void> done;
+          done.set_value();
+          return done.get_future();
+        }
+      }
+      return server.queue_stop([authority, allowed](bool managed, std::uint64_t instance, std::uint64_t generation) {
+        const auto state = proc::proc.lock_state();
+        if (authority) {
+          const auto current = nvhttp::current_client(authority->uuid, authority->cert);
+          if (!current || current->revision != authority->revision || !permissions::allows(current->permissions, authority->required)) {
+            allowed->store(false);
+            return;
+          }
+        }
+        proc::proc.terminate_source(instance, generation);
+        if (!managed) {
+          display_device::revert_configuration();
+        }
+      });
+    });
+    completion.get();
+    if (authority) {
+      const auto current = nvhttp::current_client(authority->uuid, authority->cert);
+      if (!current || current->revision != authority->revision || !permissions::allows(current->permissions, authority->required)) {
+        return false;
+      }
+    }
+    return allowed->load();
   }
 
   void terminate_sessions_by_cert(std::string_view cert) {
@@ -1001,6 +2529,13 @@ namespace rtsp_stream {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    void owner_operation(std::function<void()> operation) {
+      server.sync([operation = std::move(operation)]() {
+        assert(on_owner_thread());
+        operation();
+      });
+    }
+
     /**
      * @brief Own only the production admission executor, without network or media initialization.
      */
@@ -1040,6 +2575,12 @@ namespace rtsp_stream {
       });
     }
 
+    void set_source_progress_clock(std::function<std::chrono::steady_clock::time_point()> clock) {
+      server.sync([&]() {
+        server.source_progress_clock = std::move(clock);
+      });
+    }
+
     bool token_authorized(const std::shared_ptr<launch_session_t> &launch) {
       return server.sync([&]() {
         return server.authorized(*launch);
@@ -1049,6 +2590,61 @@ namespace rtsp_stream {
     bool claim_launch(const std::shared_ptr<launch_session_t> &launch) {
       return server.sync([&]() {
         return server.claim(*launch);
+      });
+    }
+
+    std::shared_ptr<launch_session_t> pending_launch() {
+      return server.sync([&]() {
+        return server.launch_event.view(0s);
+      });
+    }
+
+    bool start_media(const std::shared_ptr<launch_session_t> &launch, bool success) {
+      return server.sync([launch, success]() {
+        return server.source_started(*launch, success);
+      });
+    }
+
+    void release_media(const std::shared_ptr<launch_session_t> &launch) {
+      server.sync([launch]() {
+        server.release_source_pin(*launch, true);
+      });
+    }
+
+    std::uint64_t source_generation_floor() {
+      return server.sync([]() {
+        return server.test_generation_floor();
+      });
+    }
+
+    bool set_recovery_revision(std::uint64_t revision) {
+      return server.sync([revision]() {
+        return server.test_recovery_revision(revision);
+      });
+    }
+
+    bool pending_owner_work() {
+      return server.sync([]() {
+        return server.test_pending_owner_work();
+      });
+    }
+
+    bool discard_source_recovery() {
+      return server.sync([]() {
+        return server.test_discard_recovery();
+      });
+    }
+
+    void poll_source() {
+      server.sync([]() {
+        server.poll_source();
+        server.poll_retired_recovery();
+      });
+    }
+
+    std::shared_ptr<capture_pin_t> pin_capture(const std::shared_ptr<const capture_source_t> &source) {
+      return server.sync([source]() {
+        return server.pin_capture(source);
       });
     }
   }  // namespace test_support
@@ -1355,6 +2951,13 @@ namespace rtsp_stream {
    * @param req Parsed RTSP request being handled.
    */
   void cmd_announce(rtsp_server_t *rtsp_server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    auto admission_guard = util::fail_guard([&]() {
+      if (!session.source_media) {
+        session.cancelled = true;
+        rtsp_server->release_source_pin(session);
+        rtsp_server->session_clear(session.id);
+      }
+    });
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
@@ -1587,19 +3190,23 @@ namespace rtsp_stream {
       return;
     }
 
-    auto stream_session = stream::session::alloc(config, session);
-    rtsp_server->insert(stream_session);
-
-    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
-      BOOST_LOG(error) << "Failed to start a streaming session"sv;
-
-      rtsp_server->remove(stream_session);
-      session.cancelled = true;
-      rtsp_server->session_clear(session.id);
+    std::shared_ptr<stream::session_t> stream_session;
+    try {
+      stream_session = stream::session::alloc(config, session);
+      rtsp_server->insert(stream_session);
+      if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string()) || !rtsp_server->source_started(session, true)) {
+        throw std::runtime_error {"Stream start failed"};
+      }
+    } catch (...) {
+      if (stream_session) {
+        stream::session::abort_start(*stream_session);
+        rtsp_server->remove(stream_session);
+      }
+      rtsp_server->source_started(session, false);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
-
+    admission_guard.disable();
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
 

@@ -25,6 +25,7 @@
 
 // local includes
 #include "crypto.h"
+#include "display_policy.h"
 #include "permissions.h"
 
 namespace rtsp_stream {
@@ -102,6 +103,8 @@ namespace nvhttp {
     std::string name;  ///< Friendly client name recorded during pairing.
     permissions::mask_t permissions = 0;  ///< Current explicit grants; never an enduring authorization cache.
     std::uint64_t revision = 0;  ///< Authorization revision observed when this identity was resolved.
+    display_policy::device_preferences_t display;  ///< Current administrator-owned fresh-source preferences.
+    bool display_valid = true;  ///< False requires explicit repair before fresh-source preparation.
   };
 
   /**
@@ -117,9 +120,10 @@ namespace nvhttp {
    * @param uuid Paired identity to update.
    * @param enabled Optional enable gate; omission preserves its value.
    * @param permissions Optional complete grant; omission preserves its value.
+   * @param display Optional complete known display preferences; omission preserves their values and typed metadata.
    * @return Whether the update was saved and revocation cleanup completed.
    */
-  bool update_client(std::string_view uuid, std::optional<bool> enabled, std::optional<permissions::mask_t> permissions);
+  bool update_client(std::string_view uuid, std::optional<bool> enabled, std::optional<permissions::mask_t> permissions, std::optional<display_policy::device_preferences_t> display = std::nullopt);
 
   /**
    * @brief Simple-Web-Server HTTPS backend configured for Sunshine certificate handling.
@@ -483,6 +487,18 @@ namespace nvhttp {
    * @brief Test-only accessors for paired-client authorization state.
    */
   namespace test_support {
+    /**
+     * @brief Observe a durable authorization update immediately before its real revocation barrier.
+     * @param hook Callback copied under a test-only mutex and invoked after the auth lock is released.
+     * @note Empty restores ordinary execution; callback failures do not skip reconciliation.
+     */
+    void set_client_pre_reconcile_hook(std::function<void()> hook = {});
+
+    /**
+     * @brief Substitute fresh-source setup and rollback for protocol fixtures without media hardware.
+     * @note Optional session count supplies an explicitly fake existing-viewer scenario, never real display/capture proof.
+     */
+    void set_source_preparation_hooks(std::function<void(const rtsp_stream::launch_session_t &)> configure = {}, std::function<int()> probe = {}, std::function<void()> rollback = {}, std::function<int()> sessions = {}, std::function<std::optional<bool>()> availability = {});
     /**
      * @brief Install the actual protected GameStream routes on a loopback test listener.
      * @param server Production HTTPS specialization.

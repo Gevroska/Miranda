@@ -22,10 +22,23 @@
 namespace http {
 
   /**
+   * @brief Serialize a secured byte read/prepare/replace transaction.
+   * @param file Destination whose native authority must be preserved.
+   * @param prepare Prepare once from complete captured bytes while holding the state-file lock. Nullopt performs a read-only transaction without temporary/backup creation; an engaged empty string replaces the file with zero bytes.
+   * @note Windows byte preparation can inspect the exact READONLY attribute; a requested replacement is refused before backup/temp creation. Other unsupported metadata/provider objects remain refused.
+   * @return Whether preparation and any requested replacement succeeded. Standard preparation exceptions return false. Windows verifies read-only snapshots before success and reports successful commits even if secured cleanup is deferred; uncertain recovery blocks further writes in this process.
+   * @note Catalog callers use owner -> state-file order. Permission mutations retain mutation -> authorization -> state-file order,
+   * releasing authorization/state locks before owner reconciliation. Preparation must never acquire authorization,
+   * await the owner, or recursively enter a state-file transaction.
+   */
+  bool update_state_file_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare);
+
+  /**
    * @brief Serialize a shared JSON read/modify/verified-replacement transaction.
    * @param file State or credentials file; separate configured paths are supported.
    * @param update Mutation preserving all unrelated JSON fields.
-   * @return Whether replacement succeeded. Windows reports success after verified commit even if backup cleanup is deferred; uncertain recovery retains secured material and blocks further writes in this process.
+   * @note Windows write eligibility, including READONLY refusal, is checked before invoking this always-writing callback.
+   * @return Whether replacement succeeded. Existing empty or malformed JSON is rejected before update. An unrecoverable replacement failure retains secured recovery files and blocks further writes in this process.
    */
   bool update_state_file(const std::string &file, const std::function<void(boost::property_tree::ptree &)> &update);
 
@@ -73,8 +86,8 @@ namespace http {
       verify,  ///< Verify the committed candidate.
       restore,  ///< Restore a verified original backup.
       cleanup,  ///< Delete a known transaction-owned file.
-      guard_open,  ///< Observe the original guard before opening the verified backup guard.
-      guard_close  ///< Report checked original-guard closure after transferring ownership.
+      guard_open,  ///< Open a backup-path original guard before preparing the temporary.
+      guard_close  ///< Report checked closure of the superseded original guard.
     };
     /**
      * @brief Fault a real Windows transaction stage using only fixture-owned paths.

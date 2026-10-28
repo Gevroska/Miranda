@@ -1140,6 +1140,54 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### force_virtual_display
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Save a global preference requiring a virtual display for fresh sources. Global, application and device
+            opt-ins are additive; an existing shared source always keeps its identity, mode, HDR and topology.
+            @note{Applies to Windows only. Preferences are persisted in this build; virtual-source activation remains unavailable.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}disabled@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            force_virtual_display = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### virtual_display_identity
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Save the identity policy for future virtual-source preparation: `client`, `application`, or
+            `client_application`. Identities use the authenticated pairing UUID and stable application UUID;
+            protocol Desktop has its own reserved identity. Rename and application order never change monitor identity.
+            Unknown values use `client`. An existing shared source retains its current identity.
+            @note{Applies to Windows only. Virtual-source activation remains unavailable in this build.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}client@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            virtual_display_identity = client_application
+            @endcode</td>
+    </tr>
+</table>
+
 ### dd_configuration_option
 
 <table>
@@ -1393,6 +1441,9 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td colspan="2">
             When enabled, display configuration is reverted upon disconnect of all clients instead of app close or last session termination.
             This can be useful for returning to physical usage of the host machine without closing the active app.
+            Miranda's saved virtual-source policy also removes the virtual screen after restoration and the existing delay.
+            With this option disabled, it retains the virtual screen while a tracked application runs.
+            Virtual-source activation and these lifecycle transitions remain unavailable in this build.
             @warning{Some applications may not function properly when display configuration is changed while active.}
             @note{Applies to Windows only.}
         </td>

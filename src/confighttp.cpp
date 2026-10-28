@@ -906,25 +906,6 @@ namespace confighttp {
     return validate_stored_csrf_token(response, request, client_id, header_it->second);
   }
 
-  /**
-   * @brief Validates the application index and sends an error response if invalid.
-   */
-  bool check_app_index(const resp_https_t &response, int index) {
-    std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-    nlohmann::json file_tree = nlohmann::json::parse(file);
-    if (const auto &apps = file_tree["apps"]; index < 0 || index >= static_cast<int>(apps.size())) {
-      std::string error_message;
-      if (const int max_index = static_cast<int>(apps.size()) - 1; max_index < 0) {
-        error_message = "No applications found";
-      } else {
-        error_message = std::format("'index' {} out of range, max index is {}", index, max_index);
-      }
-      bad_request(response, error_message);
-      return false;
-    }
-    return true;
-  }
-
   void getPage(const resp_https_t &response, const req_https_t &request, const bool require_auth, const bool redirect_if_username) {
     // Special handling for welcome page: redirect if the username is already set
     if (redirect_if_username && !config::sunshine.username.empty()) {
@@ -1089,54 +1070,12 @@ namespace confighttp {
 
     print_req(request);
 
-    try {
-      std::string content = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(content);
-
-      // Legacy versions of Sunshine used strings for boolean and integers, let's convert them
-      // List of keys to convert to boolean
-      const std::vector<std::string> boolean_keys = {
-        "exclude-global-prep-cmd",
-        "elevated",
-        "auto-detach",
-        "wait-all"
-      };
-
-      // List of keys to convert to integers
-      std::vector<std::string> integer_keys = {
-        "exit-timeout"
-      };
-
-      // Walk fileTree and convert true/false strings to boolean or integer values
-      for (auto &app : file_tree["apps"]) {
-        for (const auto &key : boolean_keys) {
-          if (app.contains(key) && app[key].is_string()) {
-            app[key] = app[key] == "true";
-          }
-        }
-        for (const auto &key : integer_keys) {
-          if (app.contains(key) && app[key].is_string()) {
-            app[key] = std::stoi(app[key].get<std::string>());
-          }
-        }
-        if (app.contains("prep-cmd")) {
-          for (auto &prep : app["prep-cmd"]) {
-            if (prep.contains("elevated") && prep["elevated"].is_string()) {
-              prep["elevated"] = prep["elevated"] == "true";
-            }
-          }
-        }
-      }
-
-      send_response(response, file_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "GetApps: "sv << e.what();
-      bad_request(response, e.what());
-    }
+    const auto result = proc::read_catalog(config::stream.file_apps);
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), result.body, {{"Content-Type", "application/json"}});
   }
 
   /**
-   * @brief Save an application. To save a new application, the index must be `-1`. To update an existing application, you must provide the current index of the application.
+   * @brief Save an application using an If-Match content revision and immutable UUID; index=-1 creates a server-assigned identity.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    * The body for the post request should be JSON serialized in the following format:
@@ -1184,55 +1123,9 @@ namespace confighttp {
 
     std::stringstream ss;
     ss << request->content.rdbuf();
-    try {
-      // TODO: Input Validation
-      nlohmann::json output_tree;
-      nlohmann::json input_tree = nlohmann::json::parse(ss);
-      std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      BOOST_LOG(info) << file;
-      nlohmann::json file_tree = nlohmann::json::parse(file);
-
-      if (input_tree["prep-cmd"].empty()) {
-        input_tree.erase("prep-cmd");
-      }
-
-      if (input_tree["detached"].empty()) {
-        input_tree.erase("detached");
-      }
-
-      auto &apps_node = file_tree["apps"];
-      int index = input_tree["index"].get<int>();  // this will intentionally cause an exception if the provided value is the wrong type
-
-      input_tree.erase("index");
-
-      if (index == -1) {
-        apps_node.push_back(input_tree);
-      } else {
-        nlohmann::json newApps = nlohmann::json::array();
-        for (size_t i = 0; i < apps_node.size(); ++i) {
-          if (i == index) {
-            newApps.push_back(input_tree);
-          } else {
-            newApps.push_back(apps_node[i]);
-          }
-        }
-        file_tree["apps"] = newApps;
-      }
-
-      // Sort the apps array by name
-      std::sort(apps_node.begin(), apps_node.end(), [](const nlohmann::json &a, const nlohmann::json &b) {
-        return a["name"].get<std::string>() < b["name"].get<std::string>();
-      });
-
-      file_handler::write_file(config::stream.file_apps.c_str(), file_tree.dump(4));
-      proc::refresh(config::stream.file_apps);
-
-      output_tree["status"] = true;
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SaveApp: "sv << e.what();
-      bad_request(response, e.what());
-    }
+    const auto revision = request->header.find("If-Match");
+    const auto result = proc::save_catalog_app(config::stream.file_apps, revision == request->header.end() ? "" : revision->second, ss.str());
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), result.body, {{"Content-Type", "application/json"}});
   }
 
   /**
@@ -1254,10 +1147,7 @@ namespace confighttp {
 
     print_req(request);
 
-    rtsp_stream::stop_application([]() {
-      proc::proc.terminate();
-      display_device::revert_configuration();
-    });
+    rtsp_stream::stop_process_application();
 
     nlohmann::json output_tree;
     output_tree["status"] = true;
@@ -1269,7 +1159,7 @@ namespace confighttp {
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    *
-   * @api_examples{/api/apps/9999|:| DELETE|:| null}
+   * @api_examples{/api/apps/11111111-1111-1111-1111-111111111111|:| DELETE|:| null}
    */
   void deleteApp(const resp_https_t &response, const req_https_t &request) {
     if (!authenticate(response, request)) {
@@ -1283,36 +1173,9 @@ namespace confighttp {
 
     print_req(request);
 
-    try {
-      nlohmann::json output_tree;
-      nlohmann::json new_apps = nlohmann::json::array();
-      const int index = std::stoi(request->path_match[1]);
-
-      if (!check_app_index(response, index)) {
-        return;
-      }
-
-      std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(file);
-      auto &apps = file_tree["apps"];
-
-      for (size_t i = 0; i < apps.size(); ++i) {
-        if (i != index) {
-          new_apps.push_back(apps[i]);
-        }
-      }
-      file_tree["apps"] = new_apps;
-
-      file_handler::write_file(config::stream.file_apps.c_str(), file_tree.dump(4));
-      proc::refresh(config::stream.file_apps);
-
-      output_tree["status"] = true;
-      output_tree["result"] = std::format("application {} deleted", index);
-      send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "DeleteApp: "sv << e.what();
-      bad_request(response, e.what());
-    }
+    const auto revision = request->header.find("If-Match");
+    const auto result = proc::delete_catalog_app(config::stream.file_apps, revision == request->header.end() ? "" : revision->second, request->path_match[1]);
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), result.body, {{"Content-Type", "application/json"}});
   }
 
   /**
@@ -1373,6 +1236,7 @@ namespace confighttp {
       std::string uuid = input_tree.value("uuid", "");
       std::optional<bool> enabled;
       std::optional<permissions::mask_t> grant;
+      std::optional<display_policy::device_preferences_t> display;
       if (input_tree.contains("enabled")) {
         if (!input_tree["enabled"].is_boolean()) {
           bad_request(response, "enabled must be a boolean");
@@ -1388,13 +1252,21 @@ namespace confighttp {
         }
         grant = value.get<permissions::mask_t>();
       }
-      if (uuid.empty() || (!enabled && !grant)) {
+      if (input_tree.contains("display")) {
+        try {
+          display = display_policy::parse_device(input_tree["display"]);
+        } catch (const std::exception &error) {
+          bad_request(response, error.what());
+          return;
+        }
+      }
+      if (uuid.empty() || (!enabled && !grant && !display)) {
         bad_request(response, "A device UUID and at least one update field are required");
         return;
       }
-      output_tree["status"] = nvhttp::update_client(uuid, enabled, grant);
+      output_tree["status"] = nvhttp::update_client(uuid, enabled, grant, display);
       if (!output_tree["status"].get<bool>()) {
-        output_tree["error"] = "Device update was not saved; previous authorization remains in effect";
+        output_tree["error"] = "Device update was not saved; previous authorization and preferences remain in effect";
       }
 
       send_response(response, output_tree);
@@ -1595,13 +1467,17 @@ namespace confighttp {
 
     try {
       const int index = std::stoi(request->path_match[1]);
-      if (!check_app_index(response, index)) {
+      const auto catalog = proc::read_catalog(config::stream.file_apps);
+      if (catalog.status != 200) {
+        response->write(static_cast<SimpleWeb::StatusCode>(catalog.status), catalog.body, {{"Content-Type", "application/json"}});
         return;
       }
-
-      std::string file = file_handler::read_file(config::stream.file_apps.c_str());
-      nlohmann::json file_tree = nlohmann::json::parse(file);
+      auto file_tree = nlohmann::json::parse(catalog.body);
       auto &apps = file_tree["apps"];
+      if (index < 0 || static_cast<std::size_t>(index) >= apps.size()) {
+        bad_request(response, "Application cover index is out of range");
+        return;
+      }
 
       auto &app = apps[index];
 
@@ -2497,7 +2373,7 @@ namespace confighttp {
     server.resource["^/api/browse$"]["GET"] = browseDirectory;
     server.resource["^/api/apps$"]["GET"] = getApps;
     server.resource["^/api/apps$"]["POST"] = saveApp;
-    server.resource["^/api/apps/([0-9]+)$"]["DELETE"] = deleteApp;
+    server.resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = deleteApp;
     server.resource["^/api/apps/close$"]["POST"] = closeApp;
     server.resource["^/api/clients/list$"]["GET"] = getClients;
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;

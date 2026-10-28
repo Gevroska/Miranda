@@ -30,3 +30,5 @@ Templates: [work item](templates/WORK_ITEM.md), [architecture decision](template
 Establish the source/build baseline and current CI behavior. Qualify the selected driver interfaces and packages early. Design client identity, permissions and session ownership before integrating overlapping display/control features. Follow the dependencies in the [implementation plan](../planning/05-implementation-plan.md).
 
 The source is pinned to the analyzed Sunshine foundation, with the planning and contribution documents integrated into the development candidate. The [P0 work item](work-items/P0-baseline.md) records the baseline scope and evidence. Miranda feature implementation and release qualification remain separate milestones. Preserve upstream source, history, licensing and valid build conventions.
+
+The [P1c application identity work item](work-items/P1c-stable-application-identities.md) records the bounded source prerequisite and its pending validation.

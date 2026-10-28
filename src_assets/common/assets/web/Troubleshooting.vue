@@ -490,6 +490,10 @@
               {{ $t('troubleshooting.device_permissions_save') }}
             </button>
           </fieldset>
+          <DeviceDisplayPreferences v-if="platform === 'windows'" :device-id="client.uuid"
+                                    :preferences="client.display || { force_virtual: false, resolution: null, refresh_rate: null }"
+                                    :valid="client.display_valid !== false" :pending="clientUpdatePending === client.uuid"
+                                    @save="display => updateClient(client.uuid, { display })" />
         </li>
       </ul>
       <ul v-else class="list-group list-group-flush">
@@ -545,6 +549,7 @@
 
 <script>
     import Navbar from './Navbar.vue'
+    import DeviceDisplayPreferences from './DeviceDisplayPreferences.vue'
     import { apiFetch } from './fetch_utils'
     import {
       AlertCircle,
@@ -575,6 +580,7 @@
 
     export default {
       components: {
+        DeviceDisplayPreferences,
         Navbar,
         AlertCircle,
         AlertTriangle,
@@ -954,7 +960,13 @@
         },
         async updateClient(uuid, fields) {
           return this.mutateClient(uuid, './api/clients/update', fields, clients => clients.some(client =>
-            client.uuid === uuid && Object.entries(fields).every(([field, value]) => client[field] === value)));
+            client.uuid === uuid && Object.entries(fields).every(([field, value]) => field === 'display'
+              ? client.display_valid !== false && client.display?.force_virtual === value.force_virtual &&
+                (client.display?.resolution?.width ?? null) === (value.resolution?.width ?? null) &&
+                (client.display?.resolution?.height ?? null) === (value.resolution?.height ?? null) &&
+                (client.display?.refresh_rate?.numerator ?? null) === (value.refresh_rate?.numerator ?? null) &&
+                (client.display?.refresh_rate?.denominator ?? null) === (value.refresh_rate?.denominator ?? null)
+              : client[field] === value)));
         },
         /** Reconcile uncertain mutation outcomes with an awaited, checked device readback. */
         async mutateClient(uuid, endpoint, fields, matches) {

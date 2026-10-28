@@ -7,12 +7,15 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <regex>
+#include <set>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 // lib includes
@@ -30,6 +33,9 @@
 
 // platform-specific includes
 #ifdef _WIN32
+  #include "platform/windows/utf_utils.h"
+
+  #include <display_device/windows/json.h>
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
@@ -46,6 +52,18 @@ namespace display_device {
   namespace {
     constexpr std::chrono::milliseconds DEFAULT_RETRY_INTERVAL {5000};
 
+#ifdef _WIN32
+    std::atomic_bool startup_excluded {false};  ///< Copied gate, independent of native manager lifetime.
+    std::atomic_bool startup_legacy_tracked {false};  ///< Preserve default behavior until startup inspection participates.
+    std::atomic_bool startup_legacy_pending {false};  ///< Updated by the ordinary persistence authority after adoption.
+
+    void publish_ordinary_persistence(bool pending) {
+      if (startup_legacy_tracked.load()) {
+        startup_legacy_pending = pending;
+      }
+    }
+#endif
+
     /**
      * @brief Persistence wrapper that remembers whether a settings record is still stored.
      *
@@ -61,9 +79,14 @@ namespace display_device {
        */
       explicit watched_settings_persistence_t(std::shared_ptr<SettingsPersistenceInterface> inner):
           inner {std::move(inner)} {
-        if (const auto loaded {this->inner->load()}; loaded && !loaded->empty()) {
+        const auto loaded = this->inner->load();
+        pending_restores = loaded && !loaded->empty();
+#ifdef _WIN32
+        if (!loaded && startup_legacy_tracked.load()) {
           pending_restores = true;
         }
+        publish_ordinary_persistence(pending_restores.load());
+#endif
       }
 
       /**
@@ -75,6 +98,9 @@ namespace display_device {
         }
 
         pending_restores = !data.empty();
+#ifdef _WIN32
+        publish_ordinary_persistence(!data.empty());
+#endif
         return true;
       }
 
@@ -94,6 +120,9 @@ namespace display_device {
         }
 
         pending_restores = false;
+#ifdef _WIN32
+        publish_ordinary_persistence(false);
+#endif
         return true;
       }
 
@@ -107,7 +136,7 @@ namespace display_device {
 
     private:
       std::shared_ptr<SettingsPersistenceInterface> inner;  ///< Persistence implementation that owns the stored bytes.
-      bool pending_restores {false};  ///< True while a non-empty settings record is stored.
+      std::atomic_bool pending_restores {false};  ///< True while a non-empty settings record is stored.
     };
 
     /**
@@ -118,6 +147,11 @@ namespace display_device {
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
       std::shared_ptr<watched_settings_persistence_t> persistence_watch {};  ///< Observes whether revert left settings stored.
+#ifdef _WIN32
+      std::weak_ptr<int> owned_reservation;  ///< Excludes legacy mutation while a managed source is reserved.
+      std::shared_ptr<ordinary_startup_exclusion_t> startup_exclusion;  ///< Sticky across refused/failed reconstruction and coordinator destruction.
+      std::optional<std::filesystem::path> startup_ordinary_path;  ///< Bind ordinary initialization to the inspected persistence location.
+#endif
 #ifdef SUNSHINE_TESTS
       std::optional<std::chrono::milliseconds> test_retry_interval {};  ///< Override for the revert retry delay.
 #endif
@@ -865,10 +899,47 @@ namespace display_device {
       },
                                     scheduler_option);
     }
+
+    /** @brief Construct the ordinary DD lifetime guard without initializing a settings manager. */
+    std::unique_ptr<platf::deinit_t> make_deinit_guard() {
+      class deinit_t: public platf::deinit_t {
+      public:
+        ~deinit_t() override {
+          std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+          if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+            DD_DATA.sm_instance.reset();
+            return;
+          }
+#endif
+          try {
+            // This may throw if used incorrectly. At the moment this will not happen, however
+            // in case some unforeseen changes are made that could raise an exception,
+            // we definitely don't want this to happen in destructor. Especially in the
+            // deinit_t where the outcome does not really matter.
+            revert_configuration_unlocked(revert_option_e::try_once);
+          } catch (std::exception &err) {
+            BOOST_LOG(fatal) << err.what();
+          }
+
+          DD_DATA.sm_instance = nullptr;
+        }
+      };
+
+      return std::make_unique<deinit_t>();
+    }
   }  // namespace
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
     std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      return nullptr;
+    }
+    if (DD_DATA.startup_ordinary_path && persistence_filepath != *DD_DATA.startup_ordinary_path) {
+      return nullptr;
+    }
+#endif
     // We can support re-init without any issues, however we should make sure to clean up first!
     revert_configuration_unlocked(revert_option_e::try_once);
     DD_DATA.config_revert_delay = video_config.dd.config_revert_delay;
@@ -890,25 +961,7 @@ namespace display_device {
       revert_configuration_unlocked(revert_option_e::try_indefinitely);
     }
 
-    class deinit_t: public platf::deinit_t {
-    public:
-      ~deinit_t() override {
-        std::lock_guard lock {DD_DATA.mutex};
-        try {
-          // This may throw if used incorrectly. At the moment this will not happen, however
-          // in case some unforeseen changes are made that could raise an exception,
-          // we definitely don't want this to happen in destructor. Especially in the
-          // deinit_t where the outcome does not really matter.
-          revert_configuration_unlocked(revert_option_e::try_once);
-        } catch (std::exception &err) {
-          BOOST_LOG(fatal) << err.what();
-        }
-
-        DD_DATA.sm_instance = nullptr;
-      }
-    };
-
-    return std::make_unique<deinit_t>();
+    return make_deinit_guard();
   }
 
   bool wake_display(const std::string &display_name, std::chrono::milliseconds timeout) {
@@ -969,6 +1022,12 @@ namespace display_device {
 
   void configure_display(const SingleDisplayConfiguration &config) {
     std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      BOOST_LOG(warning) << "Ignoring unmanaged display configuration while display recovery excludes ordinary mutation.";
+      return;
+    }
+#endif
     if (!DD_DATA.sm_instance) {
       // Platform is not supported, nothing to do.
       return;
@@ -1000,11 +1059,21 @@ namespace display_device {
 
   void revert_configuration() {
     std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      return;
+    }
+#endif
     revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
   }
 
   bool reset_persistence() {
     std::lock_guard lock {DD_DATA.mutex};
+#ifdef _WIN32
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      return false;
+    }
+#endif
     if (!DD_DATA.sm_instance) {
       // Platform is not supported, assume success.
       return true;
@@ -1073,6 +1142,1159 @@ namespace display_device {
     return config;
   }
 
+#ifdef _WIN32
+  ordinary_startup_recovery_t ordinary_startup_recovery() {
+    return {startup_excluded.load(), startup_legacy_pending.load()};
+  }
+
+  std::shared_ptr<ordinary_startup_exclusion_t> ordinary_startup_exclusion_t::acquire() {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (DD_DATA.startup_exclusion) {
+      return nullptr;
+    }
+    auto exclusion = std::shared_ptr<ordinary_startup_exclusion_t> {new ordinary_startup_exclusion_t};
+    DD_DATA.startup_exclusion = exclusion;
+    startup_excluded = true;
+    if (DD_DATA.sm_instance) {
+      // Fence callbacks already scheduled before the gate. No further ordinary work can enter.
+      DD_DATA.sm_instance->stop();
+    }
+    return exclusion;
+  }
+
+  bool ordinary_startup_exclusion_t::release_to_ordinary(bool legacy_pending, const std::filesystem::path &ordinary_path) {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (DD_DATA.startup_exclusion.get() != this || !DD_DATA.owned_reservation.expired() || DD_DATA.sm_instance) {
+      return false;
+    }
+    // Publish the copied obligation before exposing any ordinary/native admission path.
+    DD_DATA.startup_ordinary_path = ordinary_path;
+    startup_legacy_tracked = true;
+    startup_legacy_pending = legacy_pending;
+    DD_DATA.startup_exclusion.reset();
+    startup_excluded = false;
+    return true;
+  }
+
+  struct native_display_configuration_t::state_t {
+    struct recovery_t {
+      explicit recovery_t(bool pending):
+          pending {pending} {}
+
+      std::atomic_bool pending;  ///< Ordinary persistence or scheduled work still requires restoration.
+      std::atomic_bool retry_required {false};  ///< Callback stopped on an exception and requires serialized rescheduling.
+    };
+
+    mutable std::mutex mutex;  ///< Protect copied progress only; never held during native work.
+    native_display_status_t status;  ///< Latest logical generation and tolerated apply observation.
+    std::shared_ptr<recovery_t> recovery = std::make_shared<recovery_t>(false);  ///< One scheduler episode; replacement fences old callback publication.
+  };
+
+  native_display_configuration_t::native_display_configuration_t():
+      state_ {std::make_shared<state_t>()} {}
+
+  native_display_status_t native_display_configuration_t::status() const {
+    std::lock_guard lock {state_->mutex};
+    auto result = state_->status;
+    result.recovery_retry_required = state_->recovery->retry_required.load();
+    result.recovery_pending = state_->recovery->pending.load() || result.recovery_retry_required;
+    return result;
+  }
+
+  bool native_display_configuration_t::begin(const std::optional<SingleDisplayConfiguration> &configuration, bool disabled, std::uint64_t generation, std::chrono::milliseconds delay) {
+    if (!generation) {
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->mutex};
+      if (generation <= state_->status.generation) {
+        return false;
+      }
+      state_->status = {.generation = generation};
+    }
+    if (disabled) {
+      return restore(generation, delay);
+    }
+    std::lock_guard command {DD_DATA.mutex};
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      return false;
+    }
+    if (!configuration || !DD_DATA.sm_instance) {
+      return true;
+    }
+    DD_DATA.sm_instance->schedule([state = state_, generation, configuration = *configuration](auto &manager, auto &stop) {
+      const auto result = manager.applySettings(configuration);
+      if (result == SettingsManagerInterface::ApplyResult::Ok) {
+        BOOST_LOG(info) << "Display device configuration applied successfully.";
+      } else if (result == SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable) {
+        BOOST_LOG(warning) << "Display device configuration API is temporarily unavailable. Will retry.";
+      } else {
+        BOOST_LOG(error) << "Display device configuration failed with result: " << apply_result_name(result);
+      }
+      {
+        std::lock_guard lock {state->mutex};
+        if (state->status.generation == generation) {
+          state->status.apply_result = result;
+        }
+      }
+      if (result != SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable) {
+        stop.requestStop();
+      }
+    },
+                                  {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+    return true;
+  }
+
+  bool native_display_configuration_t::restore(std::uint64_t generation, std::chrono::milliseconds delay) {
+    if (status().generation != generation || !generation || delay < std::chrono::milliseconds::zero()) {
+      return false;
+    }
+    std::lock_guard command {DD_DATA.mutex};
+    if (DD_DATA.startup_exclusion || !DD_DATA.owned_reservation.expired()) {
+      return false;
+    }
+    if (!DD_DATA.sm_instance) {
+      std::lock_guard lock {state_->mutex};
+      state_->status.source_released = true;
+      state_->recovery = std::make_shared<state_t::recovery_t>(false);
+      return true;
+    }
+    const auto recovery = std::make_shared<state_t::recovery_t>(true);
+    {
+      std::lock_guard lock {state_->mutex};
+      state_->recovery = recovery;
+    }
+  #ifdef SUNSHINE_TESTS
+    const auto interval = DD_DATA.test_retry_interval.value_or(DEFAULT_RETRY_INTERVAL);
+  #else
+    const auto interval = DEFAULT_RETRY_INTERVAL;
+  #endif
+    SchedulerOptions options {.m_sleep_durations = {interval}};
+    if (delay > std::chrono::milliseconds::zero()) {
+      options.m_sleep_durations = {delay, interval};
+      options.m_execution = SchedulerOptions::Execution::ScheduledOnly;
+    }
+    const auto persistence = DD_DATA.persistence_watch;
+    DD_DATA.sm_instance->schedule([recovery, persistence, tried = StringSet {}](auto &manager, auto &stop) mutable {
+      try {
+        try_revert_settings(false, tried, persistence, manager, stop);
+        recovery->pending = !stop.stopRequested() || (persistence && persistence->has_pending_restores());
+      } catch (const std::exception &failure) {
+        recovery->pending = true;
+        recovery->retry_required = true;
+        stop.requestStop();
+        BOOST_LOG(error) << "Native display restoration stopped: " << failure.what();
+      }
+    },
+                                  options);
+    std::lock_guard lock {state_->mutex};
+    state_->status.source_released = true;
+    return true;
+  }
+
+  bool native_display_configuration_t::complete(std::uint64_t generation) const {
+    const auto current = status();
+    return generation && current.generation == generation && current.source_released && !current.recovery_pending;
+  }
+
+  namespace {
+    StringSet recovery_references(const SingleDisplayConfigState &state) {
+      StringSet result {state.m_initial.m_primary_devices};
+      for (const auto *topology : {&state.m_initial.m_topology, &state.m_modified.m_topology}) {
+        for (const auto &group : *topology) {
+          result.insert(group.begin(), group.end());
+        }
+      }
+      for (const auto &[id, mode] : state.m_modified.m_original_modes) {
+        result.insert(id);
+      }
+      for (const auto &[id, hdr] : state.m_modified.m_original_hdr_states) {
+        result.insert(id);
+      }
+      for (const auto *primary : {&state.m_modified.m_original_primary_device, &state.m_modified.m_interim_primary_device}) {
+        if (!primary->empty()) {
+          result.insert(*primary);
+        }
+      }
+      return result;
+    }
+
+    /** @brief Keep library persistence inside the same atomic record as ownership intent. */
+    class owned_settings_persistence_t final: public SettingsPersistenceInterface {
+    public:
+      explicit owned_settings_persistence_t(std::shared_ptr<platf::sudovda::ownership_journal_t> journal):
+          journal_ {std::move(journal)} {}
+
+      bool store(const std::vector<std::uint8_t> &data) override {
+        SingleDisplayConfigState parsed;
+        const auto known {journal_->recovery_devices()};
+        if (!known || !fromJson(std::string {data.begin(), data.end()}, parsed)) {
+          return false;
+        }
+        const StringSet allowed {known->begin(), known->end()};
+        const auto references {recovery_references(parsed)};
+        if (!std::ranges::all_of(references, [&](const auto &id) {
+              return allowed.contains(id);
+            })) {
+          return false;
+        }
+        return journal_->store_settings(data);
+      }
+
+      std::optional<std::vector<std::uint8_t>> load() const override {
+        return journal_->settings();
+      }
+
+      bool clear() override {
+        return journal_->store_settings({});
+      }
+
+    private:
+      std::shared_ptr<platf::sudovda::ownership_journal_t> journal_;  ///< Journal owning all recovery bytes.
+    };
+
+    StringSet topology_devices(const ActiveTopology &topology) {
+      StringSet result;
+      for (const auto &group : topology) {
+        result.insert(group.begin(), group.end());
+      }
+      return result;
+    }
+
+    bool matching_target(const DISPLAYCONFIG_PATH_INFO &path, const platf::sudovda::display_t &display) {
+      return path.targetInfo.adapterId.HighPart == display.target.adapter.HighPart &&
+             path.targetInfo.adapterId.LowPart == display.target.adapter.LowPart &&
+             path.targetInfo.id == display.target.target;
+    }
+  }  // namespace
+
+  struct owned_display_configuration_t::state_t {
+    std::shared_ptr<int> reservation;
+    std::shared_ptr<platf::sudovda::ownership_journal_t> journal;
+    std::shared_ptr<WinApiLayerInterface> api;
+    std::shared_ptr<WinDisplayDeviceInterface> devices;
+    std::shared_ptr<AudioContextInterface> audio;
+    PersistentState *persistent_state {};
+    std::unique_ptr<RetryScheduler<SettingsManagerInterface>> scheduler;
+    SingleDisplayConfigState baseline;
+    std::optional<platf::sudovda::display_t> bound_display;
+    bool owned_absent {};
+    platf::sudovda::recovery_authority_t authority;
+    std::mutex command_mutex;
+    mutable std::mutex status_mutex;
+    owned_display_status_t status;
+    std::atomic_uint64_t revision {};
+    std::chrono::milliseconds retry_interval {DEFAULT_RETRY_INTERVAL};
+
+    bool valid_generation(std::uint64_t generation) const {
+      return reservation && generation == journal->record().generation;
+    }
+
+    std::vector<std::string> observed_devices() const {
+      std::vector<std::string> result;
+      for (const auto &device : devices->enumAvailableDevices()) {
+        result.push_back(device.m_device_id);
+      }
+      return result;
+    }
+
+    bool valid_library_state(const SingleDisplayConfigState &state) const {
+      const auto known {journal->recovery_devices()};
+      if (!known || !devices->isTopologyValid(state.m_initial.m_topology) || (!state.m_modified.m_topology.empty() && !devices->isTopologyValid(state.m_modified.m_topology)) || (state.m_modified.hasModifications() && state.m_modified.m_topology.empty())) {
+        return false;
+      }
+      const StringSet allowed {known->begin(), known->end()};
+      const auto references {recovery_references(state)};
+      return std::ranges::all_of(references, [&](const auto &id) {
+        return allowed.contains(id);
+      });
+    }
+
+    bool validated_settings(std::optional<SingleDisplayConfigState> &state) const {
+      if (!persistent_state || !journal->validate(authority)) {
+        return false;
+      }
+      const auto bytes {journal->settings()};
+      if (!bytes) {
+        return false;
+      }
+      const auto &cached {persistent_state->getState()};
+      if (bytes->empty()) {
+        state.reset();
+        return !cached;
+      }
+      SingleDisplayConfigState parsed;
+      if (!fromJson(std::string {bytes->begin(), bytes->end()}, parsed) || !cached || *cached != parsed || !valid_library_state(parsed)) {
+        return false;
+      }
+      state = std::move(parsed);
+      return true;
+    }
+
+    std::optional<platf::sudovda::ownership_record_t> snapshot(const GUID &identity, std::uint64_t generation) {
+      const auto raw {api->queryDisplayConfig(QueryType::Active)};
+      if (!raw || !devices->isApiAccessAvailable()) {
+        return std::nullopt;
+      }
+      platf::sudovda::ownership_record_t record {identity, generation, authority.deployment, raw->m_paths.empty(), {}};
+      SingleDisplayConfigState captured;
+      if (!record.initially_headless) {
+        captured.m_initial.m_topology = devices->getCurrentTopology();
+        if (!devices->isTopologyValid(captured.m_initial.m_topology)) {
+          return std::nullopt;
+        }
+        for (const auto &id : topology_devices(captured.m_initial.m_topology)) {
+          if (devices->isPrimary(id)) {
+            captured.m_initial.m_primary_devices.insert(id);
+          }
+        }
+        if (captured.m_initial.m_primary_devices.empty()) {
+          return std::nullopt;
+        }
+        captured.m_modified.m_topology = captured.m_initial.m_topology;
+        captured.m_modified.m_original_primary_device = *captured.m_initial.m_primary_devices.begin();
+        bool serialized {false};
+        record.baseline = toJson(captured, JSON_COMPACT, &serialized);
+        if (!serialized) {
+          return std::nullopt;
+        }
+      }
+      return record;
+    }
+
+    bool reconstruct_manager() {
+      scheduler.reset();
+      persistent_state = nullptr;
+      try {
+        auto persistence {std::make_shared<owned_settings_persistence_t>(journal)};
+        auto persistent {std::make_unique<PersistentState>(persistence, true)};
+        persistent_state = persistent.get();
+        auto manager {std::make_unique<SettingsManager>(devices, audio, std::move(persistent), WinWorkarounds {})};
+        audio = manager->getAudioContextApi();
+        scheduler = std::make_unique<RetryScheduler<SettingsManagerInterface>>(std::move(manager));
+        return true;
+      } catch (const std::exception &) {
+        persistent_state = nullptr;
+        return false;
+      }
+    }
+
+    std::string resolve(const platf::sudovda::display_t &display, std::string *active_name = nullptr) const {
+      if (active_name) {
+        active_name->clear();
+      }
+      if (!IsEqualGUID(display.identity, journal->record().identity) || display.monitor_path.empty()) {
+        return {};
+      }
+      const auto paths {api->queryDisplayConfig(QueryType::All)};
+      if (!paths) {
+        return {};
+      }
+      const auto expected_path {utf_utils::to_utf8(display.monitor_path)};
+      std::string found;
+      std::optional<std::tuple<LONG, ULONG, UINT>> active_source;
+      std::optional<std::pair<LONG, ULONG>> source_adapter;
+      std::set<UINT> sources;
+      std::string selector;
+      for (const auto &path : paths->m_paths) {
+        const auto monitor {api->getMonitorDevicePath(path)};
+        const bool same_path {boost::iequals(monitor, expected_path)};
+        if (!matching_target(path, display)) {
+          if (same_path) {
+            return {};
+          }
+          continue;
+        }
+        if (!same_path) {
+          return {};
+        }
+        const auto adapter {std::pair {path.sourceInfo.adapterId.HighPart, path.sourceInfo.adapterId.LowPart}};
+        if ((source_adapter && *source_adapter != adapter) || !sources.insert(path.sourceInfo.id).second) {
+          return {};
+        }
+        source_adapter = adapter;
+        const auto id {api->getDeviceId(path)};
+        if (id.empty() || (!found.empty() && found != id)) {
+          return {};
+        }
+        found = id;
+        if ((path.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0) {
+          const auto source {std::tuple {path.sourceInfo.adapterId.HighPart, path.sourceInfo.adapterId.LowPart, path.sourceInfo.id}};
+          const auto name {api->getDisplayName(path)};
+          if (name.empty() || (active_source && (*active_source != source || selector != name))) {
+            return {};
+          }
+          active_source = source;
+          selector = name;
+        }
+      }
+      if (active_name) {
+        *active_name = selector;
+      }
+      return found;
+    }
+
+    bool removal_ready() {
+      const auto raw {api->queryDisplayConfig(QueryType::Active)};
+      if (!raw) {
+        return false;
+      }
+      const auto current {devices->getCurrentTopology()};
+      if (!raw->m_paths.empty() && !devices->isTopologyValid(current)) {
+        return false;
+      }
+      const auto active {topology_devices(current)};
+      const auto id {bound_display ? resolve(*bound_display) : std::string {}};
+      std::string owned_id;
+      {
+        std::lock_guard lock {status_mutex};
+        owned_id = status.device_id;
+      }
+      if (!id.empty() && !owned_id.empty() && id != owned_id) {
+        return false;
+      }
+      if (owned_id.empty()) {
+        // Recovery may follow a crash before bind. Resolve from the adopted lease before removal,
+        // or prove the journal GUID is absent through lease cleanup; never guess an active selector.
+        if (!owned_absent) {
+          return false;
+        }
+      }
+      const auto evidence {journal->restoration_state()};
+      if (!evidence) {
+        return false;
+      }
+      SingleDisplayConfigState restored;
+      if (!evidence->empty() && (!fromJson(std::string {evidence->begin(), evidence->end()}, restored) || !valid_library_state(restored))) {
+        return false;
+      }
+      auto initial {topology_devices(restored.m_initial.m_topology)};
+      initial.erase(owned_id);
+      if (active.contains(owned_id)) {
+        // Only a proven first-headless owned-only destination permits last-output removal.
+        return journal->record().initially_headless && initial.empty() && active.size() == 1;
+      }
+      if (initial.empty()) {
+        return !active.empty() || (journal->record().initially_headless && owned_absent);
+      }
+      const auto available {devices->enumAvailableDevices()};
+      if (available.empty()) {
+        return false;
+      }
+      for (const auto &device : available) {
+        if (initial.contains(device.m_device_id) && !active.contains(device.m_device_id)) {
+          return false;
+        }
+        if (device.m_device_id != owned_id && restored.m_initial.m_primary_devices.contains(device.m_device_id) && (!device.m_info || !device.m_info->m_primary)) {
+          return false;
+        }
+      }
+      return !active.empty();
+    }
+
+    bool headless_owned_only() const {
+      std::optional<SingleDisplayConfigState> parsed;
+      if (!validated_settings(parsed)) {
+        return false;
+      }
+      if (!parsed) {
+        return true;
+      }
+      const auto &stored {*parsed};
+      std::string owned;
+      {
+        std::lock_guard lock {status_mutex};
+        owned = status.device_id;
+      }
+      if (owned.empty()) {
+        return false;
+      }
+      const auto only_owned {[&](const auto &ids) {
+        return std::ranges::all_of(ids, [&](const auto &id) {
+          return id == owned;
+        });
+      }};
+      const auto optional_owned {[&](const std::string &id) {
+        return id.empty() || id == owned;
+      }};
+      StringSet mode_ids;
+      for (const auto &[id, mode] : stored.m_modified.m_original_modes) {
+        mode_ids.insert(id);
+      }
+      for (const auto &[id, hdr] : stored.m_modified.m_original_hdr_states) {
+        mode_ids.insert(id);
+      }
+      return only_owned(topology_devices(stored.m_initial.m_topology)) && only_owned(stored.m_initial.m_primary_devices) &&
+             only_owned(topology_devices(stored.m_modified.m_topology)) && only_owned(mode_ids) &&
+             optional_owned(stored.m_modified.m_original_primary_device) && optional_owned(stored.m_modified.m_interim_primary_device);
+    }
+
+    bool detach_headless_owned() {
+      const auto raw {api->queryDisplayConfig(QueryType::Active)};
+      if (!raw) {
+        return false;
+      }
+      const auto current {devices->getCurrentTopology()};
+      if (!raw->m_paths.empty() && !devices->isTopologyValid(current)) {
+        return false;
+      }
+      std::string owned;
+      {
+        std::lock_guard lock {status_mutex};
+        owned = status.device_id;
+      }
+      if ((!bound_display && !owned_absent) || (owned.empty() && !owned_absent) || (bound_display && resolve(*bound_display) != owned)) {
+        return false;
+      }
+      ActiveTopology remaining {current};
+      for (auto &group : remaining) {
+        std::erase(group, owned);
+      }
+      std::erase_if(remaining, [](const auto &group) {
+        return group.empty();
+      });
+      const auto unowned {topology_devices(remaining)};
+      const auto modes {devices->getCurrentDisplayModes(unowned)};
+      const auto hdr {devices->getCurrentHdrStates(unowned)};
+      if (modes.size() != unowned.size() || hdr.size() != unowned.size()) {
+        return false;
+      }
+      StringSet primary;
+      for (const auto &id : unowned) {
+        if (devices->isPrimary(id)) {
+          primary.insert(id);
+        }
+      }
+      if (!remaining.empty() && !devices->isTopologyTheSame(current, remaining) && (!devices->setTopology(remaining) || !devices->isTopologyTheSame(devices->getCurrentTopology(), remaining))) {
+        return false;
+      }
+      // Never submit an empty topology. A sole owned output is removed only by exact lease cleanup.
+      return modes == devices->getCurrentDisplayModes(unowned) && hdr == devices->getCurrentHdrStates(unowned) &&
+             std::ranges::all_of(primary, [&](const auto &id) {
+               return devices->isPrimary(id);
+             });
+    }
+  };
+
+  owned_display_configuration_t::owned_display_configuration_t(std::unique_ptr<state_t> state):
+      state_ {std::move(state)} {}
+
+  owned_display_configuration_t::~owned_display_configuration_t() {
+    // No global or status lock is held while joining callbacks. They never synchronously call an owner.
+    ++state_->revision;
+    state_->scheduler.reset();
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::make(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, bool recovery, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio, const std::string *expected_bytes) {
+    using namespace platf::sudovda;
+    const auto fail {[](errc_t code) {
+      return std::unexpected(failure_t {code, operation_t::journal});
+    }};
+    auto state {std::make_unique<state_t>()};
+    state->api = std::move(api);
+    state->devices = std::move(devices);
+    state->audio = std::move(audio);
+    state->authority = authority;
+    {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.owned_reservation.expired()) {
+        return fail(errc_t::busy);
+      }
+      if (DD_DATA.sm_instance) {
+        DD_DATA.sm_instance->stop();
+      }
+      if (DD_DATA.persistence_watch && DD_DATA.persistence_watch->has_pending_restores()) {
+        if (!DD_DATA.startup_exclusion) {
+          revert_configuration_unlocked(revert_option_e::try_indefinitely);
+        }
+        return fail(errc_t::busy);
+      }
+      state->reservation = std::make_shared<int>(0);
+      DD_DATA.owned_reservation = state->reservation;
+    }
+    if (!state->api || !state->devices) {
+      return fail(errc_t::enumeration_failed);
+    }
+    if (recovery) {
+      auto journal {expected_bytes ? ownership_journal_t::load(journal_path, authority, *expected_bytes) : ownership_journal_t::load(journal_path, authority)};
+      if (!journal) {
+        return std::unexpected(journal.error());
+      }
+      state->journal = std::move(*journal);
+      if (!state->journal->record().initially_headless && (!fromJson(state->journal->record().baseline, state->baseline) || !state->devices->isTopologyValid(state->baseline.m_initial.m_topology))) {
+        return fail(errc_t::ownership_unverified);
+      }
+    } else {
+      const auto record {state->snapshot(identity, generation)};
+      if (!record) {
+        return fail(errc_t::enumeration_failed);
+      }
+      if (!record->initially_headless && !fromJson(record->baseline, state->baseline)) {
+        return fail(errc_t::journal_failed);
+      }
+      const auto observed {state->observed_devices()};
+      const StringSet observed_ids {observed.begin(), observed.end()};
+      const auto initial_refs {recovery_references(state->baseline)};
+      if (!std::ranges::all_of(initial_refs, [&](const auto &id) {
+            return observed_ids.contains(id);
+          })) {
+        return fail(errc_t::enumeration_failed);
+      }
+      auto journal {ownership_journal_t::create(journal_path, *record, authority, observed)};
+      if (!journal) {
+        return std::unexpected(journal.error());
+      }
+      state->journal = std::move(*journal);
+    }
+    if (!manager) {
+      auto persistence {std::make_shared<owned_settings_persistence_t>(state->journal)};
+      // A malformed library record is an error, never permission to forget restoration state.
+      try {
+        auto persistent {std::make_unique<PersistentState>(persistence, true)};
+        state->persistent_state = persistent.get();
+        auto concrete {std::make_unique<SettingsManager>(state->devices, state->audio, std::move(persistent), WinWorkarounds {})};
+        state->audio = concrete->getAudioContextApi();
+        manager = std::move(concrete);
+      } catch (const std::exception &) {
+        return fail(errc_t::journal_failed);
+      }
+    }
+    state->status.generation = state->journal->record().generation;
+    if (const auto mapping {state->journal->mapping()}) {
+      state->status.device_id = mapping->device_id;
+    }
+    state->status.initially_headless = state->journal->record().initially_headless;
+    state->status.source_released = state->journal->source_retired();
+    if (state->status.source_released) {
+      state->status.phase = owned_display_phase_e::recovering;
+    }
+    state->scheduler = std::make_unique<RetryScheduler<SettingsManagerInterface>>(std::move(manager));
+    return std::unique_ptr<owned_display_configuration_t> {new owned_display_configuration_t(std::move(state))};
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::begin(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority) {
+    auto api {std::make_shared<WinApiLayer>()};
+    return make(journal_path, identity, generation, authority, false, api, std::make_shared<WinDisplayDevice>(api, false), nullptr, std::make_shared<sunshine_audio_context_t>());
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority) {
+    auto api {std::make_shared<WinApiLayer>()};
+    return make(journal_path, {}, 0, authority, true, api, std::make_shared<WinDisplayDevice>(api, false), nullptr, std::make_shared<sunshine_audio_context_t>());
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, const std::string &expected_bytes) {
+    auto api {std::make_shared<WinApiLayer>()};
+    return make(journal_path, {}, 0, authority, true, api, std::make_shared<WinDisplayDevice>(api, false), nullptr, std::make_shared<sunshine_audio_context_t>(), &expected_bytes);
+  }
+
+  std::shared_ptr<platf::sudovda::ownership_journal_t> owned_display_configuration_t::journal() const {
+    std::lock_guard command {state_->command_mutex};
+    return state_->journal;
+  }
+
+  bool owned_display_configuration_t::bind(const platf::sudovda::display_t &display, std::uint64_t generation) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation)) {
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->status_mutex};
+      if (state_->status.phase != owned_display_phase_e::reserved) {
+        return false;
+      }
+    }
+    const auto id {state_->resolve(display)};
+    if (id.empty()) {
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->status_mutex};
+      if (!state_->status.device_id.empty() && state_->status.device_id != id) {
+        return false;
+      }
+    }
+    if (!state_->journal->bind_mapping(display, id)) {
+      return false;
+    }
+    std::lock_guard lock {state_->status_mutex};
+    if (!state_->status.device_id.empty() && state_->status.device_id != id) {
+      return false;
+    }
+    state_->bound_display = display;
+    state_->status.device_id = id;
+    return true;
+  }
+
+  bool owned_display_configuration_t::bind_absent(const platf::sudovda::lease_t &lease, std::uint64_t generation) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || !lease.belongs_to(state_->journal) || !lease.identity_absent() || !IsEqualGUID(lease.identity(), state_->journal->record().identity)) {
+      return false;
+    }
+    std::lock_guard lock {state_->status_mutex};
+    if (state_->status.phase != owned_display_phase_e::reserved || state_->bound_display) {
+      return false;
+    }
+    state_->owned_absent = true;
+    return true;
+  }
+
+  std::expected<void, platf::sudovda::failure_t> owned_display_configuration_t::revalidate_recovery_binding(platf::sudovda::lease_t &lease, std::uint64_t generation) {
+    using namespace platf::sudovda;
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || !state_->scheduler || !lease.belongs_to(state_->journal) || !IsEqualGUID(lease.identity(), state_->journal->record().identity)) {
+      return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+    }
+    ++state_->revision;
+    state_->scheduler->stop();
+    const auto fail = [&](owned_display_error_e error, failure_t failure = {errc_t::ownership_unverified, operation_t::journal}) -> std::expected<void, failure_t> {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.phase = owned_display_phase_e::cleanup_pending;
+      state_->status.removal_permitted = false;
+      state_->status.restore_error = error;
+      state_->status.restore_retry_required = true;
+      return std::unexpected(failure);
+    };
+    {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.removal_permitted = false;
+    }
+    if (state_->journal->source_retired() || !state_->journal->validate(state_->authority)) {
+      return fail(owned_display_error_e::recovery_state_unproven);
+    }
+    if (const auto failure = lease.heartbeat_failure()) {
+      return fail(owned_display_error_e::recovery_state_unproven, *failure);
+    }
+    const auto refreshed = lease.refresh_display();
+    if (!refreshed) {
+      return fail(owned_display_error_e::observed_source_mismatch, refreshed.error());
+    }
+    const auto mapping = state_->journal->mapping();
+    std::string retained_id;
+    {
+      std::lock_guard lock {state_->status_mutex};
+      retained_id = state_->status.device_id;
+    }
+    if (lease.identity_absent()) {
+      if (lease.display() || (mapping && !retained_id.empty() && retained_id != mapping->device_id) || (!mapping && (!retained_id.empty() || state_->bound_display))) {
+        return fail(owned_display_error_e::observed_source_mismatch);
+      }
+      // Driver absence cannot override a conflicting available Windows target, monitor path or
+      // library identity. All-path queries may retain unavailable entries after monitor removal.
+      const auto paths = state_->api->queryDisplayConfig(QueryType::All);
+      if (!paths) {
+        return fail(owned_display_error_e::observed_source_mismatch);
+      }
+      if (mapping) {
+        const auto expected_path = utf_utils::to_utf8(mapping->monitor_path);
+        for (const auto &path : paths->m_paths) {
+          if (!path.targetInfo.targetAvailable) {
+            continue;
+          }
+          const bool same_target = path.targetInfo.adapterId.HighPart == mapping->target.adapter.HighPart && path.targetInfo.adapterId.LowPart == mapping->target.adapter.LowPart && path.targetInfo.id == mapping->target.target;
+          if (same_target || boost::iequals(state_->api->getMonitorDevicePath(path), expected_path) || state_->api->getDeviceId(path) == mapping->device_id) {
+            return fail(owned_display_error_e::observed_source_mismatch);
+          }
+        }
+      }
+      if (!state_->journal->validate(state_->authority)) {
+        return fail(owned_display_error_e::journal_unavailable);
+      }
+      if (const auto failure = lease.heartbeat_failure()) {
+        return fail(owned_display_error_e::recovery_state_unproven, *failure);
+      }
+      state_->bound_display.reset();
+      state_->owned_absent = true;
+      return {};
+    }
+    const auto &display = lease.display();
+    if (!display) {
+      return fail(owned_display_error_e::observed_source_mismatch);
+    }
+    const auto id = state_->resolve(*display);
+    if (id.empty() || (!retained_id.empty() && retained_id != id)) {
+      return fail(owned_display_error_e::observed_source_mismatch);
+    }
+    if (mapping) {
+      if (mapping->device_id != id || mapping->target.adapter.HighPart != display->target.adapter.HighPart || mapping->target.adapter.LowPart != display->target.adapter.LowPart || mapping->target.target != display->target.target || !boost::iequals(mapping->monitor_path, display->monitor_path)) {
+        return fail(owned_display_error_e::observed_source_mismatch);
+      }
+    } else if (state_->bound_display || !retained_id.empty() || !state_->journal->bind_mapping(*display, id)) {
+      return fail(owned_display_error_e::recovery_state_unproven);
+    }
+    if (!state_->journal->validate(state_->authority)) {
+      return fail(owned_display_error_e::journal_unavailable);
+    }
+    if (const auto failure = lease.heartbeat_failure()) {
+      return fail(owned_display_error_e::recovery_state_unproven, *failure);
+    }
+    state_->bound_display = *display;
+    state_->owned_absent = false;
+    std::lock_guard lock {state_->status_mutex};
+    state_->status.device_id = id;
+    return {};
+  }
+
+  bool owned_display_configuration_t::prepare(const SingleDisplayConfiguration &configuration, std::uint64_t generation, unsigned int max_attempts) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || !state_->scheduler || state_->journal->source_retired() || !state_->journal->add_was_armed() || !max_attempts || max_attempts > 100 || !state_->bound_display || !state_->journal->validate(state_->authority)) {
+      return false;
+    }
+    SingleDisplayConfiguration selected {configuration};
+    {
+      std::lock_guard lock {state_->status_mutex};
+      if (state_->status.phase != owned_display_phase_e::reserved || (!selected.m_device_id.empty() && selected.m_device_id != state_->status.device_id)) {
+        return false;
+      }
+      selected.m_device_id = state_->status.device_id;
+      state_->status.phase = owned_display_phase_e::preparing;
+      state_->status.attempts = 0;
+    }
+    const auto revision {++state_->revision};
+    state_->scheduler->schedule([state = state_.get(), revision, selected, max_attempts](auto &manager, auto &stop) {
+      try {
+        if (state->revision != revision) {
+          stop.requestStop();
+          return;
+        }
+        if (!state->journal->validate(state->authority)) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::failed;
+          state->status.apply_error = owned_display_error_e::journal_unavailable;
+          stop.requestStop();
+          return;
+        }
+        std::optional<SingleDisplayConfigState> previous;
+        if (!state->validated_settings(previous) || !state->journal->observe_devices(state->observed_devices())) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::failed;
+          state->status.apply_error = owned_display_error_e::recovery_state_unproven;
+          stop.requestStop();
+          return;
+        }
+        const auto result {manager.applySettings(selected)};
+        const auto name {result == SettingsManagerInterface::ApplyResult::Ok ? manager.getDisplayName(selected.m_device_id) : std::string {}};
+        std::optional<EnumeratedDevice::Info> observed;
+        std::string active_name;
+        if (!name.empty() && state->bound_display && state->resolve(*state->bound_display, &active_name) == selected.m_device_id && active_name == name) {
+          for (const auto &device : manager.enumAvailableDevices()) {
+            if (device.m_device_id == selected.m_device_id && device.m_display_name == name) {
+              observed = device.m_info;
+            }
+          }
+        }
+        const bool verified {observed && (!selected.m_resolution || observed->m_resolution == *selected.m_resolution) && (!selected.m_refresh_rate || detail::fuzzyCompare(observed->m_refresh_rate, *selected.m_refresh_rate)) && (!selected.m_hdr_state || observed->m_hdr_state == selected.m_hdr_state)};
+        if (state->revision != revision) {
+          stop.requestStop();
+          return;
+        }
+        std::lock_guard lock {state->status_mutex};
+        state->status.apply_result = result;
+        ++state->status.attempts;
+        if (result == SettingsManagerInterface::ApplyResult::Ok && verified) {
+          state->status.phase = owned_display_phase_e::ready;
+          state->status.display_name = name;
+          state->status.observed = observed;
+          stop.requestStop();
+        } else if (result != SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable || state->status.attempts >= max_attempts) {
+          state->status.phase = owned_display_phase_e::failed;
+          if (result == SettingsManagerInterface::ApplyResult::Ok) {
+            state->status.apply_error = owned_display_error_e::observed_source_mismatch;
+          }
+          stop.requestStop();
+        }
+      } catch (const std::exception &) {
+        if (state->revision == revision) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::failed;
+          state->status.apply_error = owned_display_error_e::operation_exception;
+        }
+        stop.requestStop();
+      }
+    },
+                                {.m_sleep_durations = {state_->retry_interval}});
+    return true;
+  }
+
+  bool owned_display_configuration_t::bind_absent(const platf::sudovda::cleanup_receipt_t &receipt, std::uint64_t generation) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || receipt.kind() != platf::sudovda::cleanup_receipt_t::kind_e::removed || !state_->journal->accepts_receipt(receipt)) {
+      return false;
+    }
+    std::lock_guard lock {state_->status_mutex};
+    if (state_->status.phase != owned_display_phase_e::reserved || state_->bound_display) {
+      return false;
+    }
+    state_->owned_absent = true;
+    return true;
+  }
+
+  bool owned_display_configuration_t::restore(std::uint64_t generation, std::chrono::milliseconds delay) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || !state_->scheduler || delay < std::chrono::milliseconds::zero()) {
+      return false;
+    }
+    const auto revision {++state_->revision};
+    {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.phase = owned_display_phase_e::reverting;
+      state_->status.attempts = 0;
+      state_->status.display_name.clear();
+      state_->status.restore_retry_required = false;
+    }
+    SchedulerOptions options {.m_sleep_durations = {state_->retry_interval}};
+    if (delay > std::chrono::milliseconds::zero()) {
+      options.m_sleep_durations = {delay, state_->retry_interval};
+      options.m_execution = SchedulerOptions::Execution::ScheduledOnly;
+    }
+    state_->scheduler->schedule([state = state_.get(), revision](auto &manager, auto &stop) {
+      try {
+        if (state->revision != revision) {
+          stop.requestStop();
+          return;
+        }
+        if (!state->journal->validate(state->authority)) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::cleanup_pending;
+          state->status.removal_permitted = false;
+          state->status.restore_error = owned_display_error_e::journal_unavailable;
+          state->status.restore_retry_required = true;
+          stop.requestStop();
+          return;
+        }
+        const bool headless {state->journal->record().initially_headless && !state->journal->source_retired()};
+        std::optional<SingleDisplayConfigState> previous;
+        std::string owned_id;
+        {
+          std::lock_guard lock {state->status_mutex};
+          owned_id = state->status.device_id;
+        }
+        if ((!state->journal->source_retired() && !state->bound_display && !state->owned_absent) || !state->validated_settings(previous) || (headless && previous && owned_id.empty())) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::cleanup_pending;
+          state->status.removal_permitted = false;
+          state->status.restore_error = headless ? owned_display_error_e::headless_ownership_unproven : owned_display_error_e::recovery_state_unproven;
+          state->status.restore_retry_required = true;
+          stop.requestStop();
+          return;
+        }
+        const bool owned_only {headless && state->headless_owned_only()};
+        if (!owned_only && !state->journal->observe_devices(state->observed_devices())) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::cleanup_pending;
+          state->status.removal_permitted = false;
+          state->status.restore_error = owned_display_error_e::journal_unavailable;
+          state->status.restore_retry_required = true;
+          stop.requestStop();
+          return;
+        }
+        const bool detached {owned_only && state->detach_headless_owned()};
+        const bool discarded {detached && manager.resetPersistence()};
+        if (discarded && state->audio && state->audio->isCaptured()) {
+          // The library returns early for an already-empty cache. Release its retained audio too.
+          state->audio->release();
+        }
+        const std::optional<SettingsManagerInterface::RevertResult> result {owned_only ? std::nullopt : std::make_optional(manager.revertSettings())};
+        const bool ordinary_detached {!headless || owned_only || result != SettingsManagerInterface::RevertResult::Ok || state->detach_headless_owned()};
+        const auto settings {state->journal->settings()};
+        const bool retired {state->journal->source_retired()};
+        const bool ready {(discarded || result == SettingsManagerInterface::RevertResult::Ok) && ordinary_detached && settings && (retired || state->removal_ready())};
+        if (state->revision != revision) {
+          stop.requestStop();
+          return;
+        }
+        std::lock_guard lock {state->status_mutex};
+        state->status.revert_result = result;
+        state->status.restore_error = (owned_only && !detached) || !ordinary_detached ? std::make_optional(owned_display_error_e::headless_unowned_outputs) :
+                                      (!settings || (owned_only && !discarded))       ? std::make_optional(owned_display_error_e::journal_unavailable) :
+                                                                                        std::nullopt;
+        ++state->status.attempts;
+        state->status.unavailable_settings_pending = settings && !settings->empty();
+        state->status.removal_permitted = !retired && ready;
+        state->status.restore_retry_required = false;
+        state->status.phase = ready ? (retired ? (settings->empty() ? owned_display_phase_e::restored : owned_display_phase_e::recovering) : owned_display_phase_e::removal_ready) : owned_display_phase_e::cleanup_pending;
+        if (ready && settings->empty()) {
+          stop.requestStop();
+        }
+      } catch (const std::exception &) {
+        if (state->revision == revision) {
+          std::lock_guard lock {state->status_mutex};
+          state->status.phase = owned_display_phase_e::cleanup_pending;
+          state->status.removal_permitted = false;
+          state->status.restore_error = owned_display_error_e::operation_exception;
+          state->status.restore_retry_required = true;
+        }
+        stop.requestStop();
+      }
+    },
+                                options);
+    return true;
+  }
+
+  bool owned_display_configuration_t::cancel(std::uint64_t generation) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation)) {
+      return false;
+    }
+    ++state_->revision;
+    if (state_->scheduler) {
+      state_->scheduler->stop();
+    }
+    std::lock_guard lock {state_->status_mutex};
+    state_->status.phase = owned_display_phase_e::cancelled;
+    state_->status.display_name.clear();
+    return true;
+  }
+
+  owned_display_status_t owned_display_configuration_t::status() const {
+    std::lock_guard lock {state_->status_mutex};
+    return state_->status;
+  }
+
+  bool owned_display_configuration_t::retire_source(const platf::sudovda::cleanup_receipt_t &receipt, std::uint64_t generation) {
+    std::unique_lock command {state_->command_mutex};
+    if (!state_->valid_generation(generation) || !state_->scheduler) {
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->status_mutex};
+      if (!state_->status.removal_permitted && receipt.kind() != platf::sudovda::cleanup_receipt_t::kind_e::unarmed) {
+        return false;
+      }
+    }
+    ++state_->revision;
+    state_->scheduler->stop();
+    if (!state_->journal->retire(receipt)) {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.phase = owned_display_phase_e::cleanup_pending;
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.source_released = true;
+      state_->status.phase = owned_display_phase_e::recovering;
+    }
+    command.unlock();
+    // The owner serializes source transitions. A concurrent begin_next is still safe: generation
+    // validation rejects this obsolete recovery request before it reaches the scheduler.
+    std::ignore = restore(generation);
+    return true;
+  }
+
+  bool owned_display_configuration_t::begin_next(const GUID &identity, std::uint64_t generation) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->reservation || !state_->scheduler || !state_->journal->source_retired() || generation <= state_->journal->record().generation) {
+      return false;
+    }
+    try {
+      ++state_->revision;
+      state_->scheduler->stop();
+      if (!state_->journal->validate(state_->authority)) {
+        return false;
+      }
+      std::optional<SingleDisplayConfigState> previous;
+      if (!state_->validated_settings(previous) || !state_->journal->observe_devices(state_->observed_devices())) {
+        return false;
+      }
+      const auto result {state_->scheduler->execute([](auto &manager) {
+        return manager.revertSettings();
+      })};
+      if (result != SettingsManagerInterface::RevertResult::Ok) {
+        std::lock_guard lock {state_->status_mutex};
+        state_->status.revert_result = result;
+        state_->status.phase = owned_display_phase_e::cleanup_pending;
+        return false;
+      }
+      const auto record {state_->snapshot(identity, generation)};
+      if (!record) {
+        return false;
+      }
+      SingleDisplayConfigState next_baseline;
+      if (!record->initially_headless && !fromJson(record->baseline, next_baseline)) {
+        return false;
+      }
+      auto next {state_->journal->begin_next(*record, state_->authority, state_->observed_devices())};
+      if (!next) {
+        std::lock_guard lock {state_->status_mutex};
+        state_->status.phase = owned_display_phase_e::cleanup_pending;
+        return false;
+      }
+      state_->journal = std::move(*next);
+      state_->baseline = std::move(next_baseline);
+      state_->bound_display.reset();
+      state_->owned_absent = false;
+      {
+        std::lock_guard lock {state_->status_mutex};
+        state_->status = owned_display_status_t {.generation = generation, .initially_headless = record->initially_headless};
+      }
+      if (!state_->reconstruct_manager()) {
+        std::lock_guard lock {state_->status_mutex};
+        state_->status.phase = owned_display_phase_e::cleanup_pending;
+        return false;
+      }
+      // No background revert is scheduled during preparation, active media or retained application life.
+      return true;
+    } catch (const std::exception &) {
+      std::lock_guard lock {state_->status_mutex};
+      state_->status.generation = state_->journal->record().generation;
+      state_->status.phase = owned_display_phase_e::cleanup_pending;
+      state_->status.restore_error = owned_display_error_e::operation_exception;
+      return false;
+    }
+  }
+
+  bool owned_display_configuration_t::complete(std::uint64_t generation) {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->valid_generation(generation)) {
+      return false;
+    }
+    {
+      std::lock_guard lock {state_->status_mutex};
+      if (state_->status.phase != owned_display_phase_e::restored || !state_->status.source_released || state_->status.unavailable_settings_pending) {
+        return false;
+      }
+    }
+    state_->scheduler->stop();
+    if (!state_->journal->complete()) {
+      return false;
+    }
+    std::lock_guard lock {state_->status_mutex};
+    state_->status.phase = owned_display_phase_e::restored;
+    state_->reservation.reset();
+    return true;
+  }
+
+  #ifdef SUNSHINE_TESTS
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::test_begin(const std::filesystem::path &journal_path, const GUID &identity, std::uint64_t generation, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, std::unique_ptr<SettingsManagerInterface> manager, std::shared_ptr<AudioContextInterface> audio) {
+    return make(journal_path, identity, generation, authority, false, std::move(api), std::move(devices), std::move(manager), std::move(audio));
+  }
+
+  void owned_display_configuration_t::test_set_retry_interval(std::chrono::milliseconds interval) {
+    std::lock_guard command {state_->command_mutex};
+    if (interval > std::chrono::milliseconds::zero()) {
+      state_->retry_interval = interval;
+    }
+  }
+
+  owned_display_status_t owned_display_configuration_t::test_status_after_scheduled_work() const {
+    std::lock_guard command {state_->command_mutex};
+    if (!state_->scheduler) {
+      return status();
+    }
+    return state_->scheduler->execute([this](auto &) {
+      return status();
+    });
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices) {
+    return make(journal_path, {}, 0, authority, true, std::move(api), std::move(devices), nullptr, nullptr);
+  }
+
+  std::expected<std::unique_ptr<owned_display_configuration_t>, platf::sudovda::failure_t> owned_display_configuration_t::test_recover(const std::filesystem::path &journal_path, const platf::sudovda::recovery_authority_t &authority, std::shared_ptr<WinApiLayerInterface> api, std::shared_ptr<WinDisplayDeviceInterface> devices, const std::string &expected_bytes) {
+    return make(journal_path, {}, 0, authority, true, std::move(api), std::move(devices), nullptr, nullptr, &expected_bytes);
+  }
+  #endif
+#endif
+
 #ifdef SUNSHINE_TESTS
   namespace {
     /**
@@ -1123,6 +2345,10 @@ namespace display_device {
     DD_DATA.sm_instance = std::make_unique<RetryScheduler<SettingsManagerInterface>>(std::move(manager));
   }
 
+  std::unique_ptr<platf::deinit_t> test_make_deinit_guard() {
+    return make_deinit_guard();
+  }
+
   void test_set_retry_interval(const std::chrono::milliseconds interval) {
     std::lock_guard lock {DD_DATA.mutex};
     DD_DATA.test_retry_interval = interval;
@@ -1141,6 +2367,13 @@ namespace display_device {
     DD_DATA.sm_instance.reset();
     DD_DATA.persistence_watch.reset();
     DD_DATA.test_retry_interval.reset();
+  #ifdef _WIN32
+    DD_DATA.startup_exclusion.reset();
+    DD_DATA.startup_ordinary_path.reset();
+    startup_excluded = false;
+    startup_legacy_tracked = false;
+    startup_legacy_pending = false;
+  #endif
   }
 #endif
 }  // namespace display_device
