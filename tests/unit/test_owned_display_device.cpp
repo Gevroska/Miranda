@@ -1537,7 +1537,8 @@ TEST_F(OwnedRecoveryAdoptionTest, ArmedAbsentAdoptionRetiresTheSameEpisodeWithou
   }
   prepare_startup();
   ASSERT_TRUE(rtsp_stream::adopt_source_recovery(context));
-  expect_retained_completion(0);
+  // An absent adopted GUID still requires the exact adapter-issued removal receipt.
+  expect_retained_completion(1);
   EXPECT_EQ(b_calls, 1u);
   EXPECT_EQ(driver_calls, 1u);
   EXPECT_EQ(model->additions, 1u);
@@ -1660,7 +1661,10 @@ TEST_F(OwnedRecoveryAdoptionTest, RemovalFailureAndCloseOnlyRetryRetainTheActual
     return state.cleanup_blocked && model->removals == 1u;
   }));
   EXPECT_FALSE(journal_data().at("source_retired").get<bool>());
-  EXPECT_TRUE(model->tick);
+  // Removal completed; the retained close-only transport needs no display heartbeat.
+  EXPECT_FALSE(model->tick);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
   {
     std::lock_guard lock {model->mutex};
     model->close_failure = false;
