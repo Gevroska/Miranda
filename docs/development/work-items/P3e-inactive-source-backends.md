@@ -22,7 +22,7 @@ Independent source review requested corrections for slow progress starving ready
 
 ## Acceptance and evidence
 
-All cases below are authored source regressions and remain unexecuted in this worker candidate.
+The author handed off the source regressions below without executing them. The coordinator evidence records subsequent integrated validation.
 
 | Area | Source cases | Remaining evidence |
 |---|---|---|
@@ -37,16 +37,18 @@ Only read-only source/diff inspection was performed by the author. No formatter,
 
 ## Coordinator validation
 
-The integrated Windows UCRT64 application/test build passes for verified source checkpoint `33397e1d20105ab0cab68c60ac9cca5898f74a10`. Native checks pass without skips: 14 backend, 150 owned-display/component, 30 startup, 27 capture, 100 security and 41 source-owner cases. These include the slow-progress and retained-retry corrections. Native boundaries remain injected; this establishes no installed driver, actual display, encoder, VM application or physical streaming result.
+Source checkpoint e0a4c50124a4a058719179040edb468db1e4c69d passes the Windows UCRT64 application/test and Web production build using a verified frozen source overlay. Its full native suite runs 1,360 cases in 154.131 seconds: 1,346 pass, 12 skip and the same two external httpbin downloads fail with CURL7. There are no other failures. All 45 new owner/integration cases pass without skips, and the separate complete 166-case component group passes. The full run includes the managed HTTPS, source-owner, startup, backend, capture and permission regressions; its skipped cases remain unqualified.
 
-The separate managed group has four passes and two preparation failures. Its command-entered prerequisite failed before the publication/revocation assertions, while a positive launch exceeded its handler-return admission wait. Broader process/full qualification remains outstanding. Hosted builds exposed a standard-library atomic shared-pointer portability error and a Clang unused capture; the independently reviewed repair requires renewed native and hosted execution. No earlier failure is reclassified as passing.
+The corrected fixtures retain the original one-second reconciliation, two-second response and configured admission checks. The configured-command case completes the preceding application's real cleanup before starting its admission window. Sandbox-local real children remain native processes with actual groups, environments and undo commands; only test-scoped Flatpak host-prefix preparation is bypassed. Portable POSIX exit scripts replace assumed executable paths. Native boundaries remain injected for display components. These checks qualify no installed driver, actual display topology, VM application or physical stream. Earlier preparation delays remain unexplained.
+
+## Hosted portability and process creation
+
+Earlier hosted checks exposed standard atomic shared-pointer portability, an unused production capture and missing ARM aggregate initializers. The reviewed corrections preserve the pinned toolchains, dependencies and warning policy. The macOS fixture now uses its existing shell path. Flatpak fixtures execute local real children inside the builder; installed-package host transport and application-PATH behavior need separate qualification.
+
+At 74bf5702, the Windows diagnostic completed both suspended-child observations with confirmed cleanup. In the observed current-account parent job with zero breakaway limits, explicit breakaway failed immediately with error 5, while omission created the child. Its unchanged functional suite still failed ten initial child-creation cases; that run remains failed.
+
+The repair omits explicit breakaway only after successful queries establish a current job without explicit permission. Unknown observations preserve the existing request. Both native launch APIs retain their token/environment handling and atomic target-job assignment; there is no uncontained retry or parent-policy change. This follows the [Windows creation contract](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags). Five decision cases pass locally; renewed full hosted execution is required for the restrictive-job path. The diagnostic remains a creation measurement, and SYSTEM/service execution remains separate evidence.
 
 ## Delivery
 
-### Hosted process-creation observation
-
-The `4bbedaac` portability repair compiles on the hosted macOS targets, but their full suites expose a real-child executable lookup failure. Windows AMD64 runs 1,317 cases with 1,295 passes, 12 skips and ten failures; the affected managed cases fail during initial child creation before reaching their permission or revocation assertions. Windows ARM64 still reports missing aggregate-field initializers. Flatpak test failures and the remaining platform results require separate diagnosis. These are outstanding failures, not accepted platform coverage.
-
-The reviewed Windows diagnostic captures the native creation error immediately after the API call and preserves existing launch flags, atomic job assignment and token routing. Its test-only observation records primitive error and parent-job metadata. Before the unchanged hosted full suite, a separate helper compares two suspended current-account children in a new owned kill-on-close job, changing only the breakaway flag. It never resumes either initial thread, changes no parent-job policy and refuses to start the tests after uncertain cleanup. The comparison measures creation in that context; it does not establish command execution or explain the original failure by itself. Runtime evidence for this diagnostic remains pending.
-
-Native component integration is complete for the stated source checkpoint. Renewed portability checks and the complete hosted matrix remain outstanding. E2 must implement protected provisioning, recovered-episode adoption, startup/headless ordering and shutdown drain before production factory registration. This prerequisite remains inactive and unreleased.
+The source prerequisite is independently reviewed and locally validated with the stated skips and external failures. Exact-head hosted checks remain outstanding. Exact recovered-owner completion/gate release, protected provisioning and production startup/shutdown lifetime integration precede factory registration. This prerequisite remains inactive and unreleased.

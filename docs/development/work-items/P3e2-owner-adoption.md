@@ -32,18 +32,23 @@ Existing actual-journal/B/lease fixtures add unarmed, armed-present, armed-absen
 
 Independent source review identified a timer-registration failure that could strand the sole future and prevent executor stop. The correction adds an owner-loop drain that does not depend on successful timer rearming or a worker completion post. Two additional actual-context regressions hold observation in flight, persistently fail registration after its future is installed, request stop and release the worker. They require bounded stop, consumed futures and identical retained context/generation/authorization/heartbeat/gate, with no shutdown removal or completion. The second also holds concurrent process work and requires it to drain before stop completes. Failure cleanup may restore a healthy registration only after an assertion has already failed; it is outside the successful persistent-failure proof.
 
-These are authored cases, not executed results. Independent actual-diff review and resulting-candidate native validation remain required, including existing owner, backend, startup, component, process and permission coverage. There is no VM, installed-driver, physical-streaming or human-acceptance claim.
+The author handoff contained unexecuted regressions. Independent source review accepted the actual diff after the timer-drain correction, and the coordinator results below now cover the integrated candidate. There is no VM, installed-driver, physical-streaming or human-acceptance claim.
 
 ## Validation
 
 | Check / environment | Candidate | Result | Evidence / limitation |
 |---|---|---|---|
 | Author source inspection and whitespace check | Working delta on the stated base | Prepared | Not independent review or compilation |
-| Added and existing regressions | Working delta | Authored, not executed | Native execution belongs to the development coordinator |
+| Integrated native build | e0a4c501 | Pass | Windows UCRT64 application/test and Web production build; verified frozen source overlay, not a clean committed release build |
+| Full native suite | e0a4c501 | 1,346 pass / 12 skip / 2 external failures, 154.131 seconds | 1,360 cases; the same two httpbin downloads report CURL7; no other failures |
+| New owner/integration regressions | e0a4c501 | All 45 pass, none skipped | 34 adoption additions/replacements, one publication-portability case, two scoped-command cases, five job-policy cases and three checked-reader cases |
+| Separate affected component check | e0a4c501 | 166 pass, none skipped | Includes exact B/journal/recovery logic with injected native primitives |
 | B completion / startup release | Excluded | Unimplemented for adopted contexts | Recovery remains busy at `awaiting_completion` |
 | Production provider / bootstrap / shutdown / provisioning | Excluded | Unimplemented | No active registration or production lifetime guarantee |
 | VM / driver / physical streaming | Excluded | Unqualified | Injected primitives establish no hardware result |
 
 ## Delivery
 
-This is an inactive source candidate with no integration, publication or release claim. Next actions are independent review, formatting and focused native validation of the integrated revision. Exact completion and checked startup-gate release are the following bounded slice; protected provisioning and production lifetime integration remain separate work.
+The inactive source prerequisite is independently reviewed and locally validated for the stated checkpoint. Exact-head hosted checks and publication remain separate gates; no release is qualified. Exact completion and checked startup-gate release are the following bounded slice; protected provisioning and production lifetime integration remain separate work.
+
+The native correction preserves the actual lease contract: recovery of an absent adopted GUID still issues its exact removal receipt, and successful removal stops heartbeat while a failed transport close remains owned. Fixture journal observations now use the existing serialized, checked read-only transaction. Read failure, absence, valid empty bytes and malformed data remain distinct; three regressions cover protected-write serialization, permanent denial and those storage states. Earlier failed runs remain recorded, and the original native open error was not captured.
