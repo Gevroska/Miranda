@@ -44,8 +44,10 @@
 
     <!-- Apps Grid -->
     <div v-if="catalogError" class="alert alert-danger">{{ catalogError }}</div>
+    <p v-if="displayedApps.length && !shortcutHost" class="small text-muted">{{ $t('apps.artemis_host_unavailable') }}</p>
+    <p v-else-if="displayedApps.some(row => row.shortcut)" class="small text-muted">{{ $t('apps.artemis_stop_help') }}</p>
     <div class="row g-3" v-if="displayedApps.length > 0">
-      <div class="col-12 col-sm-6 col-md-4 col-lg-3" v-for="{ app, index } in displayedApps" :key="app.uuid">
+      <div class="col-12 col-sm-6 col-md-4 col-lg-3" v-for="{ app, index, shortcut } in displayedApps" :key="app.uuid">
         <div class="card app-card h-100">
           <div class="app-poster-container">
             <img
@@ -78,6 +80,13 @@
           </div>
           <div class="card-body d-flex flex-column">
             <h5 class="card-title mb-3">{{ app.name }}</h5>
+            <div v-if="shortcut" class="d-flex flex-wrap gap-2 mb-2">
+              <a class="btn btn-sm btn-outline-secondary" :href="shortcut.uri">{{ $t('apps.artemis_open') }}</a>
+              <button class="btn btn-sm btn-outline-secondary" type="button" @click="downloadArtemisShortcut(app)">
+                {{ $t('apps.artemis_download') }}
+              </button>
+            </div>
+            <p v-else-if="shortcutHost" class="small text-muted mb-2">{{ $t('apps.artemis_app_unavailable') }}</p>
             <div class="mt-auto d-flex gap-2">
               <button class="btn btn-sm btn-primary flex-fill" @click="editApp(index)">
                 <edit :size="16" class="icon"></edit>
@@ -575,6 +584,7 @@
   import { toRaw } from 'vue'
   import Navbar from './Navbar.vue'
   import Checkbox from './Checkbox.vue'
+  import { buildArtemisShortcut, isArtemisUuid } from './artemis_shortcut'
   import { apiFetch } from './fetch_utils'
   import SunshineVersion from './sunshine_version'
   import { Modal } from 'bootstrap/dist/js/bootstrap'
@@ -712,6 +722,8 @@
         deleteTarget: null,
         catalogRevision: "",
         catalogError: "",
+        catalogRequest: null,
+        shortcutHost: null,
         deleteError: "",
         version: null,
         githubVersion: null,
@@ -751,7 +763,10 @@
           });
         }
 
-        return list;
+        return list.map(row => ({
+          ...row,
+          shortcut: buildArtemisShortcut(this.shortcutHost, row.app),
+        }));
       },
       sortModeLabel() {
         switch (this.sortMode) {
@@ -857,15 +872,44 @@
         if (modal) modal.hide();
       },
       async loadApps() {
+        const request = Symbol();
+        this.catalogRequest = request;
         this.catalogError = "";
+        this.shortcutHost = null;
         try {
           const response = await fetch("./api/apps");
           const result = await response.json();
-          if (!response.ok || result.status === false) throw new Error(result.error || this.$t("apps.catalog_error"));
+          if (this.catalogRequest !== request) return;
+          if (!response.ok || result.status === false || !Array.isArray(result.apps)) {
+            throw new Error(result.error || this.$t("apps.catalog_error"));
+          }
           this.apps = result.apps;
           this.catalogRevision = result.revision;
+          if (isArtemisUuid(result.host_uuid)) {
+            this.shortcutHost = { uuid: result.host_uuid, name: result.host_name };
+          }
         } catch (error) {
-          this.catalogError = error.message || this.$t("apps.catalog_error");
+          if (this.catalogRequest === request) {
+            this.catalogError = error.message || this.$t("apps.catalog_error");
+          }
+        }
+      },
+      downloadArtemisShortcut(app) {
+        if (!this.apps.includes(app)) return;
+        const shortcut = buildArtemisShortcut(this.shortcutHost, app);
+        if (!shortcut) return;
+
+        const link = document.createElement('a');
+        const blob = new Blob([shortcut.content], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        try {
+          link.href = url;
+          link.download = shortcut.filename;
+          document.body.append(link);
+          link.click();
+        } finally {
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 0);
         }
       },
       async confirmDelete() {

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount } from '@vue/test-utils'
 
 vi.mock('../../src_assets/common/assets/web/Navbar.vue', () => ({
   default: { template: '<div />' },
@@ -338,3 +339,242 @@ describe('application catalog revisions', () => {
     expect(ctx.catalogRevision).toBe('revision-B');
   });
 });
+
+describe('Artemis application shortcuts', () => {
+  const hostUuid = 'A1111111-1111-4111-8111-111111111111'
+  const appUuid = 'b2222222-2222-4222-8222-222222222222'
+  const otherAppUuid = 'c3333333-3333-4333-8333-333333333333'
+  const open = 'a[href^="art://"]'
+  const downloadLabel = 'apps.artemis_download'
+  let page
+  let fetchCatalog
+
+  function catalogResponse(overrides = {}) {
+    return {
+      ok: true,
+      json: async () => ({
+        apps: [{ uuid: appUuid, name: 'R&D + 50%' }],
+        revision: 'revision-A',
+        host_uuid: hostUuid,
+        host_name: 'Room A',
+        ...overrides,
+      }),
+    }
+  }
+
+  async function mountApps(overrides) {
+    fetchCatalog = vi.fn().mockResolvedValue(catalogResponse(overrides))
+    vi.stubGlobal('fetch', vi.fn(url => {
+      if (url === './api/apps') return fetchCatalog()
+      if (url === './api/config') {
+        return Promise.resolve({ json: async () => ({ platform: 'windows', version: '1.0.0' }) })
+      }
+      if (url === 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest') {
+        return Promise.resolve({ json: async () => ({ tag_name: 'v1.0.0' }) })
+      }
+      throw new Error('Unexpected request ' + url)
+    }))
+    page = mount(Apps, { global: { mocks: { $t: key => key }, stubs: { 'i18n-t': true } } })
+    await flushPromises()
+  }
+
+  function downloadButton(card = page) {
+    return card.findAll('button').find(button => button.text() === downloadLabel)
+  }
+
+  afterEach(() => {
+    page?.unmount()
+    page = undefined
+    vi.restoreAllMocks()
+  })
+
+  it('opens and downloads matching selectors with safely encoded labels and no application operation', async () => {
+    const hostName = ' Room A + %26 & # "東京"\r\n\u2028[app_uuid] ignored \uD800 '
+    const appName = ' ../../CON\\R&D + 50% 🎮\u0000\u0085\u2029[host_uuid] "app" \uDC00 '
+    await mountApps({
+      host_name: hostName,
+      apps: [{ id: '42', uuid: appUuid, name: appName }],
+      address: 'should-not-be-used.invalid:1234',
+    })
+    const createObjectURL = vi.fn().mockReturnValue('blob:artemis-shortcut')
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', Object.assign(class extends URL {}, { createObjectURL, revokeObjectURL }))
+    const expectedFields = {
+      host_uuid: hostUuid,
+      host_name: 'Room A + %26 & # "東京" [app_uuid] ignored �',
+      app_uuid: appUuid,
+      app_name: '../../CON\\R&D + 50% 🎮 [host_uuid] "app" �',
+    }
+
+    const link = page.get(open)
+    const linkClick = vi.fn(event => {
+      expect(event.defaultPrevented).toBe(false)
+      event.preventDefault()
+    })
+    link.element.addEventListener('click', linkClick)
+    expect(link.text()).toBe('apps.artemis_open')
+    expect(linkClick).not.toHaveBeenCalled()
+    expect(createObjectURL).not.toHaveBeenCalled()
+    await link.trigger('click')
+    expect(linkClick).toHaveBeenCalledOnce()
+
+    const href = link.attributes('href')
+    const uri = new URL(href)
+    expect(href).toMatch(/^art:\/\/launch\?host_uuid=/)
+    expect(uri.host).toBe('launch')
+    expect(uri.pathname + uri.username + uri.password + uri.hash).toBe('')
+    expect([...uri.searchParams.entries()]).toEqual(Object.entries(expectedFields))
+    expect(href).toContain('Room%20A%20%2B%20%2526%20%26%20%23')
+
+    const dispatch = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function () {
+      expect(this.isConnected).toBe(true)
+      expect(this.getAttribute('href')).toBe('blob:artemis-shortcut')
+      expect(this.download).toBe('Miranda-' + appUuid + '.art')
+      expect(revokeObjectURL).not.toHaveBeenCalled()
+    })
+    await downloadButton().trigger('click')
+    expect(createObjectURL).toHaveBeenCalledOnce()
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(document.querySelector('a[download]')).toBeNull()
+    await vi.waitFor(() => expect(revokeObjectURL).toHaveBeenCalledExactlyOnceWith('blob:artemis-shortcut'))
+
+    const [[blob]] = createObjectURL.mock.calls
+    expect(blob.type).toBe('text/plain;charset=utf-8')
+    const bytes = await new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(new Uint8Array(reader.result))
+      reader.onerror = () => reject(reader.error)
+      reader.readAsArrayBuffer(blob)
+    })
+    const expectedText = `[host_uuid] ${hostUuid}\n[host_name] ${expectedFields.host_name}\n[app_uuid] ${appUuid}\n[app_name] ${expectedFields.app_name}\n`
+    expect([...bytes]).toEqual([...new TextEncoder().encode(expectedText)])
+    const records = new TextDecoder().decode(bytes).split('\n').map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'))
+      .map(line => {
+        const space = line.indexOf(' ')
+        return [line.slice(0, space).slice(1, -1), line.slice(space + 1).trim()]
+      })
+    expect(records).toEqual(Object.entries(expectedFields))
+
+    expect(page.vm.apps[0].name).toBe(appName)
+    expect(fetchCatalog).toHaveBeenCalledOnce()
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(apiFetch).not.toHaveBeenCalled()
+  })
+
+  it('targets the committed row through duplicate names, sorting, filtering and an unsaved rename', async () => {
+    const thirdAppUuid = 'd4444444-4444-4444-8444-444444444444'
+    await mountApps({
+      apps: [
+        { uuid: appUuid, name: 'Room A' },
+        { uuid: otherAppUuid, name: 'Room A' },
+        { uuid: thirdAppUuid, name: 'A Room' },
+      ],
+    })
+    const visibleUuids = () => page.findAll(open).map(link =>
+      new URL(link.attributes('href')).searchParams.get('app_uuid')
+    )
+    expect(visibleUuids()).toEqual([appUuid, otherAppUuid, thirdAppUuid])
+
+    await page.get('.apps-toolbar button[aria-pressed]').trigger('click')
+    expect(visibleUuids()).toEqual([thirdAppUuid, appUuid, otherAppUuid])
+
+    const edit = vi.spyOn(page.vm, 'openEditModal').mockImplementation(() => {})
+    const firstCard = page.get('.app-card')
+    await firstCard.findAll('button').find(button => button.text() === 'apps.edit').trigger('click')
+    expect(edit).toHaveBeenCalledOnce()
+    expect(page.vm.editForm.uuid).toBe(thirdAppUuid)
+    page.vm.editForm.name = 'Unsaved app name'
+    page.vm.editForm.uuid = appUuid
+    await page.vm.$nextTick()
+    const thirdUri = new URL(page.get(open).attributes('href'))
+    expect(thirdUri.searchParams.get('app_uuid')).toBe(thirdAppUuid)
+    expect(thirdUri.searchParams.get('app_name')).toBe('A Room')
+
+    await page.get('#app-search').setValue('Room A')
+    expect(visibleUuids()).toEqual([appUuid, otherAppUuid])
+    page.vm.newApp()
+    page.vm.editForm.uuid = thirdAppUuid
+    await page.vm.$nextTick()
+    expect(visibleUuids()).toEqual([appUuid, otherAppUuid])
+
+    const createObjectURL = vi.fn().mockReturnValue('blob:filtered-shortcut')
+    const revokeObjectURL = vi.fn()
+    vi.stubGlobal('URL', Object.assign(class extends URL {}, { createObjectURL, revokeObjectURL }))
+    const dispatch = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function () {
+      expect(this.download).toBe('Miranda-' + otherAppUuid + '.art')
+    })
+    await downloadButton(page.findAll('.app-card')[1]).trigger('click')
+    expect(dispatch).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(revokeObjectURL).toHaveBeenCalledExactlyOnceWith('blob:filtered-shortcut'))
+    expect(apiFetch).not.toHaveBeenCalled()
+  })
+
+  it('omits empty optional labels and refuses missing or malformed app IDs', async () => {
+    await mountApps({
+      host_name: null,
+      apps: [
+        { uuid: appUuid, name: ' \u0000 ' },
+        { id: '42', name: 'Room A' },
+        { uuid: otherAppUuid + '\n', name: 'Room A' },
+      ],
+    })
+    expect(page.findAll(open)).toHaveLength(1)
+    expect(page.get(open).attributes('href')).toBe(`art://launch?host_uuid=${hostUuid}&app_uuid=${appUuid}`)
+    for (const card of page.findAll('.app-card').slice(1)) {
+      expect(card.text()).toContain('apps.artemis_app_unavailable')
+      expect(downloadButton(card)).toBeUndefined()
+    }
+  })
+
+  it.each([undefined, null, hostUuid + '\n', 'wrong-shape'])('keeps app management available without a stable host ID (%s)', async value => {
+    await mountApps({ host_uuid: value })
+    expect(page.text()).toContain('apps.artemis_host_unavailable')
+    expect(page.find(open).exists()).toBe(false)
+    expect(downloadButton()).toBeUndefined()
+    expect(page.get('.app-card').text()).toContain('apps.edit')
+  })
+
+  it('invalidates existing shortcuts during reload and keeps them unavailable on failure', async () => {
+    await mountApps()
+    expect(page.find(open).exists()).toBe(true)
+
+    const response = Promise.withResolvers()
+    fetchCatalog.mockReturnValueOnce(response.promise)
+    const reload = page.vm.loadApps()
+    await page.vm.$nextTick()
+    expect(page.find(open).exists()).toBe(false)
+    expect(downloadButton()).toBeUndefined()
+
+    response.resolve({ ok: false, json: async () => ({ error: 'Catalog failed', host_uuid: hostUuid }) })
+    await reload
+    expect(page.text()).toContain('Catalog failed')
+    expect(page.find(open).exists()).toBe(false)
+    expect(page.vm.catalogRevision).toBe('revision-A')
+
+    fetchCatalog.mockResolvedValueOnce(catalogResponse({ host_uuid: null }))
+    await page.vm.loadApps()
+    expect(page.text()).toContain('apps.artemis_host_unavailable')
+    expect(page.find(open).exists()).toBe(false)
+
+    fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: [{ uuid: appUuid, name: 'Room A' }] }))
+    await page.vm.loadApps()
+    const params = new URL(page.get(open).attributes('href')).searchParams
+    expect(params.get('app_uuid')).toBe(appUuid)
+    expect(params.get('app_name')).toBe('Room A')
+  })
+
+  it('ignores a stale successful response after a later reload has invalidated shortcuts', async () => {
+    await mountApps()
+    const earlierResponse = Promise.withResolvers()
+    fetchCatalog.mockReturnValueOnce(earlierResponse.promise)
+    const earlierReload = page.vm.loadApps()
+    fetchCatalog.mockResolvedValueOnce(catalogResponse({ host_uuid: null, revision: 'revision-B' }))
+    await page.vm.loadApps()
+
+    earlierResponse.resolve(catalogResponse())
+    await earlierReload
+    expect(page.find(open).exists()).toBe(false)
+    expect(page.vm.catalogRevision).toBe('revision-B')
+  })
+})
