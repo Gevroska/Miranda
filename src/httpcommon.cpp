@@ -9,6 +9,7 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -48,6 +49,7 @@
 #endif
 
 // local includes
+#include "app_catalog.h"
 #include "config.h"
 #include "crypto.h"
 #include "file_handler.h"
@@ -106,6 +108,46 @@ namespace http {
   namespace {
     std::unordered_set<std::string> recovery_required;  ///< Failed restorations block further writes until operator recovery.
     std::mutex state_file_mutex;  ///< Serializes credentials and pairing updates, including shared-file defaults.
+
+    /** @brief Keep the legacy always-writing callback distinct from byte preparation that may be read-only. */
+    enum class state_update_intent_e {
+      replacement,  ///< Refuse write-ineligible originals before invoking the callback.
+      preparation  ///< Permit exact read-only inspection; a requested replacement still requires write eligibility.
+    };
+
+#ifndef _WIN32
+    /**
+     * @brief Read complete binary bytes and explicitly check native read and close errors before preparation.
+     */
+    bool read_state_bytes(const fs::path &path, std::string &bytes) {
+      auto *input = std::fopen(path.c_str(), "rb");
+      if (!input) {
+        return false;
+      }
+      auto close = util::fail_guard([&]() {
+        if (input) {
+          std::fclose(input);
+        }
+      });
+      std::array<char, 16384> buffer;
+      while (true) {
+        const auto count = std::fread(buffer.data(), 1, buffer.size(), input);
+        if (std::ferror(input)) {
+          return false;
+        }
+        bytes.append(buffer.data(), count);
+        if (std::feof(input)) {
+          break;
+        }
+        if (!count) {
+          return false;
+        }
+      }
+      const auto result = std::fclose(input);
+      input = nullptr;
+      return result == 0;
+    }
+#endif
 #ifdef SUNSHINE_TESTS
     std::function<std::optional<std::uint32_t>(const fs::path &, const fs::path &, const fs::path &)> state_replace_hook;  ///< Deterministic native partial-failure injection.
     std::function<void(test_support::state_security_stage_e, const fs::path &)> state_security_hook;  ///< Inspect only the empty temporary at its native security gates.
@@ -285,8 +327,8 @@ namespace http {
       verify,  ///< Verify the committed candidate.
       restore,  ///< Restore a verified original.
       cleanup,  ///< Remove a known transaction-owned file.
-      guard_open,  ///< Open the verified backup while the original guard remains held.
-      guard_close  ///< Report checked original-guard closure after transferring ownership.
+      guard_open,  ///< Open a backup-path original guard before preparing the temporary.
+      guard_close  ///< Report checked closure of the superseded original guard.
     };
   #endif
 
@@ -442,8 +484,20 @@ namespace http {
       state_require(written && written < name.size() && !std::wstring_view {name.data()}.starts_with(L"\\\\?\\UNC\\"), "State update refused: remote providers are not qualified");
     }
 
-    /** @brief Capture complete supported policy/metadata and refuse unsupported authority before bytes. */
-    state_snapshot_t state_capture(HANDLE handle, const fs::path &path) {
+    /** @brief Permit only the READONLY attribute during a byte callback's exact read inspection. */
+    enum class state_inspection_e {
+      replacement,  ///< Every replacement, prepared candidate, backup and restoration retains strict eligibility.
+      read_only  ///< Capture the exact READONLY attribute without allowing its replacement.
+    };
+
+    /**
+     * @brief Capture complete supported policy/metadata and refuse unsupported authority before bytes.
+     * @param handle Guarded regular file.
+     * @param path Corresponding path supplied to native inspection hooks.
+     * @param inspection Whether exact byte preparation may inspect READONLY while retaining all other refusals.
+     * @return Immutable identity, metadata, authority and bytes.
+     */
+    state_snapshot_t state_capture(HANDLE handle, const fs::path &path, state_inspection_e inspection = state_inspection_e::replacement) {
       state_snapshot_t result;
       state_require(state_stage(state_stage_e::metadata, path), "State metadata inspection was refused");
       state_require(GetFileInformationByHandle(handle, &result.identity) && GetFileInformationByHandleEx(handle, FileBasicInfo, &result.basic, sizeof(result.basic)), "State file metadata could not be captured");
@@ -458,8 +512,9 @@ namespace http {
       state_require(!(attributes & FILE_ATTRIBUTE_COMPRESSED), "State update refused: compression cannot be preserved");
       state_require(!(attributes & FILE_ATTRIBUTE_SPARSE_FILE), "State update refused: sparse allocation cannot be preserved");
       state_require(!(attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)), "State update refused: a regular non-reparse file is required");
-      state_require(!(attributes & FILE_ATTRIBUTE_READONLY), "State update refused: the destination is read-only");
-      state_require(!(attributes & ~state_attributes), "State update refused: unsupported file attributes");
+      const auto inspected_read_only = inspection == state_inspection_e::read_only ? FILE_ATTRIBUTE_READONLY : 0U;
+      state_require(!(attributes & FILE_ATTRIBUTE_READONLY) || inspected_read_only, "State update refused: the destination is read-only");
+      state_require(!(attributes & ~(state_attributes | inspected_read_only)), "State update refused: unsupported file attributes");
       state_provider(handle);
       state_stream_inventory(handle);
       result.security = read_file_security(handle);
@@ -817,9 +872,10 @@ namespace http {
      * @param expected Captured identity, policy and bytes.
      * @param diagnose_commit Whether a failed final comparison emits bounded component diagnostics.
      * @param creation_time Exact unless verifying the final initial-absence commit.
+     * @param inspection Replacement eligibility unless revalidating exact byte-preparation observations.
      * @return Whether the complete snapshot matches; inspection failures also reject it.
      */
-    bool state_path_matches(const fs::path &path, const state_snapshot_t &expected, bool diagnose_commit = false, state_creation_time_e creation_time = state_creation_time_e::exact) {
+    bool state_path_matches(const fs::path &path, const state_snapshot_t &expected, bool diagnose_commit = false, state_creation_time_e creation_time = state_creation_time_e::exact, state_inspection_e inspection = state_inspection_e::replacement) {
       try {
         state_handle_t handle {state_open(path)};
         if (handle.value == INVALID_HANDLE_VALUE) {
@@ -828,7 +884,7 @@ namespace http {
           }
           return false;
         }
-        const auto current = state_capture(handle.value, path);
+        const auto current = state_capture(handle.value, path, inspection);
         const bool matches = state_same(expected, current, creation_time);
         if (!matches && diagnose_commit) {
           state_log_snapshot_mismatch("committed", expected, current, creation_time);
@@ -975,20 +1031,22 @@ namespace http {
     }
 
     /**
-     * @brief Execute one guarded JSON replacement with a verified same-file backup and explicit recovery.
+     * @brief Prepare guarded bytes and optionally replace them with verified backup and explicit recovery.
      * @param destination Configured state pathname.
      * @param temporary Unique same-directory replacement.
      * @param backup Unique same-directory original hard link.
      * @param identity Process-local recovery key.
-     * @param update Mutation of the captured JSON bytes.
-     * @return True only after a verified commit; cleanup failure does not negate that commit.
+     * @param prepare Exactly one preparation from captured bytes; nullopt requests a verified read-only result.
+     * @param intent Whether byte preparation may inspect READONLY before choosing no-op or replacement.
+     * @return True after verified no-op or commit; cleanup failure does not negate a verified commit.
      */
-    bool update_windows_state(const fs::path &destination, const fs::path &temporary, const fs::path &backup, const std::string &identity, const std::function<void(pt::ptree &)> &update) {
+    bool update_windows_state(const fs::path &destination, const fs::path &temporary, const fs::path &backup, const std::string &identity, const std::function<std::optional<std::string>(const std::string &)> &prepare, state_update_intent_e intent) {
       state_handle_t original_handle;
       state_handle_t temporary_handle;
       std::optional<state_snapshot_t> original, prepared;
       std::optional<BY_HANDLE_FILE_INFORMATION> temporary_id;
       bool backup_owned = false, attempted = false, retain = false, verified_commit = false, initial_captured = false, temporary_created = false;
+      const auto original_inspection = intent == state_update_intent_e::preparation ? state_inspection_e::read_only : state_inspection_e::replacement;
       const auto block = [&]() {
         retain = true;
         recovery_required.insert(identity);
@@ -1028,7 +1086,7 @@ namespace http {
       const auto recover = [&]() {
         if (!attempted) {
           if ((original && !state_recovery_guard("uncommitted_original", [&]() {
-                 return state_path_matches(destination, *original);
+                 return state_path_matches(destination, *original, false, state_creation_time_e::exact, original_inspection);
                })) ||
               (initial_captured && !original && !state_recovery_guard("uncommitted_absence", [&]() {
                  return state_missing(destination);
@@ -1104,22 +1162,22 @@ namespace http {
         if (original_handle.value != INVALID_HANDLE_VALUE) {
           BY_HANDLE_FILE_INFORMATION guarded_id {};
           state_require(GetFileInformationByHandle(original_handle.value, &guarded_id) && !blocked_state_ids.contains(state_id_key(guarded_id)), "State recovery is required before updating this file through any known alias");
-          original = state_capture(original_handle.value, destination);
+          original = state_capture(original_handle.value, destination, original_inspection);
         } else {
           if (original_error != ERROR_FILE_NOT_FOUND) {
             throw state_file_error_t {"State original could not be guarded against ordinary writers", original_error};
           }
         }
         initial_captured = true;
-        pt::ptree tree;
-        if (original) {
-          std::istringstream input {original->bytes};
-          pt::read_json(input, tree);
+        const std::string absent_bytes;
+        const auto replacement = prepare(original ? original->bytes : absent_bytes);
+        if (!replacement) {
+          // Catalog callers can publish captured state after a no-op; reject a changed path or guarded object.
+          state_require(original ? state_same(*original, state_capture(original_handle.value, destination, original_inspection)) && state_path_matches(destination, *original, false, state_creation_time_e::exact, original_inspection) : state_missing(destination), "State read-only snapshot changed during preparation");
+          return true;
         }
-        update(tree);
-        std::ostringstream serialized;
-        pt::write_json(serialized, tree);
-        const auto bytes = serialized.str();
+        state_require(!original || !(original->basic.FileAttributes & FILE_ATTRIBUTE_READONLY), "State update refused: the prepared destination is read-only");
+        const auto &bytes = *replacement;
         if (original) {
           state_require(state_stage(state_stage_e::backup, destination, temporary, backup) && CreateHardLinkW(backup.c_str(), destination.c_str(), nullptr), "State original hard-link backup could not be created");
           backup_owned = true;
@@ -1301,7 +1359,14 @@ namespace http {
   }
 #endif
 
-  bool update_state_file(const std::string &file, const std::function<void(pt::ptree &)> &update) {
+  /**
+   * @brief Hold the shared transaction lock while keeping byte preparation and legacy replacement eligibility distinct.
+   * @param file Configured state pathname.
+   * @param prepare Complete byte preparation performed under the shared guard.
+   * @param intent Whether the caller can request a read-only result.
+   * @return Whether the requested read-only transaction or verified replacement succeeded.
+   */
+  static bool update_state_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare, state_update_intent_e intent) {
     std::lock_guard lock {state_file_mutex};
     const fs::path destination {file};
     std::error_code identity_error;
@@ -1317,8 +1382,9 @@ namespace http {
     const auto temporary = fs::path {destination.string() + ".tmp-" + suffix};
     const auto backup = fs::path {destination.string() + ".backup-" + suffix};
 #ifdef _WIN32
-    return update_windows_state(destination, temporary, backup, identity, update);
+    return update_windows_state(destination, temporary, backup, identity, prepare, intent);
 #else
+    (void) intent;
     bool preserve_recovery_files = false;
     auto cleanup = util::fail_guard([&]() {
       if (!preserve_recovery_files) {
@@ -1328,15 +1394,18 @@ namespace http {
       }
     });
     try {
-      pt::ptree tree;
+      std::string original;
       const bool existed = fs::exists(destination);
       if (existed) {
-        pt::read_json(destination.string(), tree);
+        if (!read_state_bytes(destination, original)) {
+          return false;
+        }
       }
-      update(tree);
-      std::ostringstream serialized;
-      pt::write_json(serialized, tree);
-      const auto bytes = serialized.str();
+      const auto replacement = prepare(original);
+      if (!replacement) {
+        return true;
+      }
+      const auto &bytes = *replacement;
       int handle = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
       if (handle < 0) {
         return false;
@@ -1365,6 +1434,11 @@ namespace http {
         state_update_hook();
       }
   #endif
+      // Detect external edits observed before writing. Arbitrary external writers must still cooperate.
+      std::string latest;
+      if (fs::exists(destination) != existed || (existed && (!read_state_bytes(destination, latest) || latest != original))) {
+        return false;
+      }
       std::size_t written = 0;
       while (written < bytes.size()) {
         const auto count = ::write(handle, bytes.data() + written, bytes.size() - written);
@@ -1388,6 +1462,25 @@ namespace http {
       return false;
     }
 #endif
+  }
+
+  bool update_state_file(const std::string &file, const std::function<void(pt::ptree &)> &update) {
+    return update_state_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
+      pt::ptree tree;
+      if (!original.empty() || fs::exists(file)) {
+        std::istringstream input {original};
+        pt::read_json(input, tree);
+      }
+      update(tree);
+      std::ostringstream serialized;
+      pt::write_json(serialized, tree);
+      return serialized.str();
+    },
+                              state_update_intent_e::replacement);
+  }
+
+  bool update_state_file_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare) {
+    return update_state_bytes(file, prepare, state_update_intent_e::preparation);
   }
 
 #ifdef SUNSHINE_TESTS
@@ -1441,10 +1534,15 @@ namespace http {
   int save_user_creds(const std::string &file, const std::string &username, const std::string &password, bool run_our_mouth) {
     const auto salt = crypto::rand_alphabet(16);
     const auto hash = util::hex(crypto::hash(password + salt)).to_string();
-    if (!update_state_file(file, [&](auto &tree) {
-          tree.put("username", username);
-          tree.put("salt", salt);
-          tree.put("password", hash);
+    if (!update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
+          auto tree = original.empty() && !fs::exists(file) ? proc::catalog::json::object() : proc::catalog::parse(original);
+          if (!tree.is_object()) {
+            throw std::invalid_argument {"credentials: expected a document object"};
+          }
+          tree["username"] = username;
+          tree["salt"] = salt;
+          tree["password"] = hash;
+          return tree.dump(2) + "\n";
         })) {
       return -1;
     }

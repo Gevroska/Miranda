@@ -208,6 +208,13 @@ list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_PUBLISHER_ISSUE_URL="${SUNSHINE_PUBLIS
 
 include_directories(BEFORE "${CMAKE_SOURCE_DIR}")
 
+if(APPLE)
+    # Search the selected OpenSSL headers before shared dependency includes.
+    include_directories(BEFORE "${OPENSSL_INCLUDE_DIR}")
+else()
+    set(_sunshine_openssl_system_include "${OPENSSL_INCLUDE_DIR}")
+endif()
+
 include_directories(
         BEFORE
         SYSTEM
@@ -215,11 +222,12 @@ include_directories(
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/include"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/nanors/deps/obl"
-        ${OPENSSL_INCLUDE_DIR}
+        ${_sunshine_openssl_system_include}
         ${Opus_INCLUDE_DIR}
         ${FFMPEG_INCLUDE_DIRS}
         ${Boost_INCLUDE_DIRS}  # has to be the last, or we get runtime error on macOS ffmpeg encoder
 )
+unset(_sunshine_openssl_system_include)
 
 if(NOT APPLE)
     include_directories(BEFORE SYSTEM "${NV_CODEC_HEADERS_13_1_INCLUDE_DIR}")

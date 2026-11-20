@@ -63,6 +63,18 @@ function addRemappingEntry() {
                aria-labelledby="panelsStayOpen-headingOne">
             <div class="accordion-body">
 
+              <p class="form-text">{{ $t('display_preferences.availability') }}</p>
+              <Checkbox id="force_virtual_display" class="mb-3" locale-prefix="config"
+                        v-model="config.force_virtual_display" default="disabled" />
+              <div class="mb-3">
+                <label for="virtual_display_identity" class="form-label">{{ $t('config.virtual_display_identity') }}</label>
+                <select id="virtual_display_identity" class="form-select" v-model="config.virtual_display_identity">
+                  <option value="client">{{ $t('config.virtual_display_identity_client') }}</option>
+                  <option value="application">{{ $t('config.virtual_display_identity_application') }}</option>
+                  <option value="client_application">{{ $t('config.virtual_display_identity_client_application') }}</option>
+                </select>
+              </div>
+
               <!-- Configuration option -->
               <div class="mb-3">
                 <label for="dd_configuration_option" class="form-label">

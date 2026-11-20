@@ -1,6 +1,6 @@
 # Decision log and open questions
 
-Updated: 2026-10-23. This file is the authoritative scope record. Confirmed means directly stated or selected by the owner in this chat. Proposed means suggested by the analysis.
+Updated: 2026-10-26. This file is the authoritative scope record. Confirmed means directly stated or selected by the owner in this chat. Proposed means suggested by the analysis.
 
 ## Confirmed decisions
 
@@ -51,6 +51,7 @@ Updated: 2026-10-23. This file is the authoritative scope record. Confirmed mean
 | DEC-43 | Use Apollo's handling of Sunshine as the reference for Miranda's eventual installation transition. The owner leans toward replacement rather than a separate test installation. | Adopt an Apollo-like service handover direction, while defining Miranda's own identity and explicit application/settings migration. This does not authorize deleting existing installations or data during analysis, nor establish a fully specified automatic cross-product uninstaller. |
 | DEC-44 | On 2026-10-23, require an explicit permission grant in the authenticated Web UI for every paired device, including the first owner device. | Pairing order never grants authority. All newly paired devices remain blocked until an administrator grants rights; no automatic first-client owner bootstrap. |
 | DEC-45 | Devices with launch rights may explicitly stop the application for everyone, including while other viewers remain. | Enforce launch authority on client Stop requests and clean up the shared session. Ordinary disconnect and joining remain separate operations; neither may replace or stop another viewer's application/display. The authenticated administration UI retains its explicit global Stop. |
+| DEC-46 | Retain the virtual screen by default while its application runs after the last viewer disconnects. With Restore on disconnect enabled, restore the previous displays and remove the virtual screen after the last viewer leaves. | Reuse the existing restoration delay and complete safe restoration before removal. Remaining viewers keep their source unchanged. No-app/Desktop sources release on last disconnect; retained application exit and explicit Stop release the source. Policy persistence and resolution precede production lifecycle integration. |
 
 ## Resolved questions
 

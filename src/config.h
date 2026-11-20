@@ -151,6 +151,13 @@ namespace config {
      * @brief Display-device integration settings.
      */
     struct dd_t {
+      /** @brief Selects the persistent identities used to derive a virtual monitor's GUID. */
+      enum class identity_option_e {
+        client,  ///< One persistent monitor per authenticated paired client.
+        application,  ///< One monitor per stable application UUID, including reserved Desktop.
+        client_application  ///< One monitor per persistent client/application tuple.
+      };
+
       /**
        * @brief Compatibility workarounds for display-device control.
        */
@@ -223,6 +230,8 @@ namespace config {
       std::chrono::milliseconds config_revert_delay;  ///< Time to wait until settings are reverted (after stream ends/app exists).
       bool config_revert_on_disconnect;  ///< Specify whether to revert display configuration on client disconnect.
       mode_remapping_t mode_remapping;  ///< Display mode remapping rules grouped by automatic selection mode.
+      bool force_virtual = false;  ///< Additive global virtual-source preference; activation is a later integration step.
+      identity_option_e virtual_identity = identity_option_e::client;  ///< Persistent virtual-monitor identity policy.
       workarounds_t wa;  ///< Display-device compatibility workarounds.
     };
 

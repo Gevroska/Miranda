@@ -10,6 +10,7 @@
 #include <future>
 #include <optional>
 #include <queue>
+#include <stdexcept>
 #include <utility>
 
 // lib includes
@@ -85,6 +86,17 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace stream {
+  namespace {
+    /** @brief Consume only confirmed logical application state, without waiting for process observation. */
+    bool control_should_terminate(const proc::published_snapshot_t &application, bool has_session_awaiting_peer) {
+      return application.lifetime.appid == 0 && !has_session_awaiting_peer;
+    }
+
+    /** @brief Preserve inherited disconnect policy while a logical app or detached placeholder remains active. */
+    bool last_session_should_revert(const proc::published_snapshot_t &application, bool revert_on_disconnect) {
+      return revert_on_disconnect || application.lifetime.appid == 0;
+    }
+  }  // namespace
 
   /**
    * @brief Enumerates supported socket options.
@@ -482,6 +494,39 @@ namespace stream {
   /**
    * @brief UDP broadcast socket and target address state.
    */
+#ifdef SUNSHINE_TESTS
+  struct start_fault_state_t {
+    test_support::start_fault_e point;
+    control_server_t control;
+    std::atomic_size_t started {0}, ended {0};
+  };
+
+  std::shared_ptr<start_fault_state_t> start_fault_state;
+
+  namespace test_support {
+    bool control_would_terminate(bool has_session_awaiting_peer) {
+      return control_should_terminate(*proc::proc.published_snapshot(), has_session_awaiting_peer);
+    }
+
+    bool last_session_would_revert(bool revert_on_disconnect) {
+      return last_session_should_revert(*proc::proc.published_snapshot(), revert_on_disconnect);
+    }
+
+    void set_start_fault(std::optional<start_fault_e> fault) {
+      start_fault_state.reset();
+      if (fault) {
+        start_fault_state = std::make_shared<start_fault_state_t>();
+        start_fault_state->point = *fault;
+      }
+    }
+
+    std::array<std::size_t, 3> start_fault_observation() {
+      auto lock = start_fault_state->control._sessions.lock();
+      return {start_fault_state->control._sessions->size(), start_fault_state->started.load(), start_fault_state->ended.load()};
+    }
+  }  // namespace test_support
+#endif
+
   struct broadcast_ctx_t {
     message_queue_queue_t message_queue_queue;  ///< Queues carrying encoded video and audio packets to sender threads.
 
@@ -565,6 +610,15 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    std::shared_ptr<const rtsp_stream::capture_source_t> source;  ///< D capture binding; actual teardown requires separate owner pins.
+    std::shared_ptr<rtsp_stream::capture_pin_t> source_pin;  ///< Preissued on the owner; D shares it until actual resource destruction.
+    bool counted = false;  ///< Platform lifecycle accounting begins only after start succeeds.
+    bool control_registered = false;  ///< Partial-start unwind must drain a published control slot.
+    bool joined = false;  ///< Failure and normal cleanup share idempotent join accounting.
+#ifdef SUNSHINE_TESTS
+    std::shared_ptr<start_fault_state_t> start_fault;
+    std::jthread test_control;
+#endif
     std::string client_uuid;  ///< Persistent UUID of the authenticated pairing owning the stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
@@ -1387,7 +1441,8 @@ namespace stream {
       }
 
       // Don't break until any pending sessions either expire or connect
-      if (proc::proc.running() == 0 && !has_session_awaiting_peer) {
+      rtsp_stream::refresh_process_liveness();
+      if (control_should_terminate(*proc::proc.published_snapshot(), has_session_awaiting_peer)) {
         BOOST_LOG(info) << "Process terminated"sv;
         break;
       }
@@ -2214,6 +2269,24 @@ namespace stream {
       return session.client_cert;
     }
 
+    std::uint32_t launch_id(session_t &session) {
+      return session.launch_session_id;
+    }
+
+    const std::shared_ptr<const rtsp_stream::capture_source_t> &source(session_t &session) {
+      return session.source;
+    }
+
+    const std::shared_ptr<rtsp_stream::capture_pin_t> &source_pin(session_t &session) {
+      return session.source_pin;
+    }
+
+    void abort_start(session_t &session) {
+      session.state.store(state_e::STOPPING, std::memory_order_relaxed);
+      session.shutdown_event->raise(true);
+      join(session);
+    }
+
     void update_permissions(session_t &session, permissions::mask_t allowed) {
       input::update_permissions(session.input, allowed);
     }
@@ -2236,6 +2309,9 @@ namespace stream {
      * @brief Wait for worker threads owned by the session to exit.
      */
     void join(session_t &session) {
+      if (session.joined) {
+        return;
+      }
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
       // The alternative is that Sunshine can never start another session until it's manually restarted.
@@ -2251,34 +2327,49 @@ namespace stream {
       });
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
-      session.videoThread.join();
+      if (session.videoThread.joinable()) {
+        session.videoThread.join();
+      }
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
-      session.audioThread.join();
+      if (session.audioThread.joinable()) {
+        session.audioThread.join();
+      }
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
-      session.controlEnd.view();
+      if (session.control_registered) {
+        session.controlEnd.view();
+      }
+#ifdef SUNSHINE_TESTS
+      if (session.test_control.joinable()) {
+        session.test_control.join();
+      }
+#endif
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
 
       // If this is the last session, invoke the platform callbacks
-      if (--running_sessions == 0) {
-        bool revert_display_config {config::video.dd.config_revert_on_disconnect};
-        if (proc::proc.running()) {
+      if (session.counted && --running_sessions == 0) {
+        const auto application = proc::proc.published_snapshot();
+        const bool revert_display_config = last_session_should_revert(*application, config::video.dd.config_revert_on_disconnect);
+        rtsp_stream::refresh_process_liveness();
+        if (application->lifetime.appid) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-          system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
+          system_tray::update_tray_pausing(application->app_name);
 #endif
         } else {
           // We have no app running and also no clients anymore.
-          revert_display_config = true;
           input::terminate_gamepads();
         }
 
-        if (revert_display_config) {
+        if (revert_display_config && !session.source) {
           display_device::revert_configuration();
         }
 
         platf::streaming_will_stop();
       }
+
+      session.counted = false;
+      session.joined = true;
 
       BOOST_LOG(debug) << "Session ended"sv;
     }
@@ -2287,23 +2378,50 @@ namespace stream {
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      const auto client = nvhttp::current_client(session.client_uuid, session.client_cert);
-      session.input = input::alloc(session.mail, session.input_session_id, client ? client->permissions : 0);
+#ifdef SUNSHINE_TESTS
+      session.start_fault = start_fault_state;
+      if (!session.start_fault)
+#endif
+      {
+        const auto client = nvhttp::current_client(session.client_uuid, session.client_cert);
+        session.input = input::alloc(session.mail, session.input_session_id, client ? client->permissions : 0);
 
-      session.broadcast_ref = broadcast.ref();
-      if (!session.broadcast_ref) {
-        input::reset(session.input);
-        return -1;
+        session.broadcast_ref = broadcast.ref();
+        if (!session.broadcast_ref) {
+          input::reset(session.input);
+          return -1;
+        }
       }
 
       session.control.expected_peer_address = addr_string;
       BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
 
       // Insert this session into the session list
+      auto *control =
+#ifdef SUNSHINE_TESTS
+        session.start_fault ? &session.start_fault->control :
+#endif
+                              &session.broadcast_ref->control_server;
       {
-        auto lg = session.broadcast_ref->control_server._sessions.lock();
-        session.broadcast_ref->control_server._sessions->push_back(&session);
+        auto lg = control->_sessions.lock();
+        control->_sessions->push_back(&session);
+        session.control_registered = true;
       }
+#ifdef SUNSHINE_TESTS
+      if (session.start_fault) {
+        session.test_control = std::jthread([&session, control]() {
+          session.shutdown_event->view();
+          {
+            auto lock = control->_sessions.lock();
+            std::erase(*control->_sessions, &session);
+          }
+          session.controlEnd.raise(true);
+        });
+        if (session.start_fault->point == test_support::start_fault_e::control_registered) {
+          throw std::runtime_error {"Injected failure after control registration"};
+        }
+      }
+#endif
 
       auto addr = boost::asio::ip::make_address(addr_string);
       session.video.peer.address(addr);
@@ -2314,16 +2432,28 @@ namespace stream {
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
+#ifdef SUNSHINE_TESTS
+      if (session.start_fault) {
+        session.audioThread = std::jthread([&session]() {
+          ++session.start_fault->started;
+          session.shutdown_event->view();
+          ++session.start_fault->ended;
+        });
+        throw std::runtime_error {"Injected failure after first worker start"};
+      }
+#endif
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
       // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
+      const auto first_session = ++running_sessions == 1;
+      session.counted = true;
+      if (first_session) {
         platf::streaming_will_start();
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-        system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
+        system_tray::update_tray_playing(proc::proc.published_snapshot()->app_name);
 #endif
       }
 
@@ -2340,6 +2470,13 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->source = launch_session.source;
+      if (session->source) {
+        session->source_pin = rtsp_stream::acquire_capture_pin(session->source);
+        if (!session->source_pin) {
+          throw std::runtime_error {"Managed capture ticket unavailable"};
+        }
+      }
       session->client_uuid = launch_session.client_uuid;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;

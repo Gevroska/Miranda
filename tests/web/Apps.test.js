@@ -13,6 +13,20 @@ import Apps from '../../src_assets/common/assets/web/Apps.vue'
 beforeEach(() => vi.clearAllMocks())
 afterEach(() => vi.unstubAllGlobals())
 
+describe('application display preferences', () => {
+  it('edits force-virtual without changing stable identities or unknown typed metadata', () => {
+    const app = { name: 'Game', id: '17', uuid: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', foreign: { flags: [false, null] } }
+    const context = { apps: [app], platform: 'windows', openEditModal: vi.fn() }
+    Apps.methods.editApp.call(context, 0)
+    expect(context.editForm['force-virtual-display']).toBe(false)
+    context.editForm['force-virtual-display'] = true
+    expect(context.editForm.uuid).toBe(app.uuid)
+    expect(context.editForm.id).toBe(app.id)
+    expect(context.editForm.foreign).toEqual(app.foreign)
+    expect(app['force-virtual-display']).toBeUndefined()
+  })
+})
+
 /**
  * Build a minimal context object that satisfies
  * the `this` contract of fileBrowserConfirm().
@@ -47,6 +61,7 @@ function saveContext(imagePath) {
   return {
     editForm: { 'image-path': imagePath },
     editFormError: '',
+    catalogRevision: 'revision-A',
     $refs: { editModal: { querySelector: () => modalBody } },
     $t: (key, _params) => key,
     _modalBody: modalBody,
@@ -273,3 +288,53 @@ describe('fileBrowserNavigate', () => {
     expect(ctx.fileBrowserCurrentPath).toBe('/old')
   })
 })
+
+
+describe('application catalog revisions', () => {
+  it('sends the fetched revision while preserving hidden identity', async () => {
+    const ctx = saveContext('');
+    ctx.editForm.uuid = '11111111-1111-1111-1111-111111111111';
+    ctx.editForm.id = '42';
+    vi.stubGlobal('document', { location: { reload: vi.fn() } });
+    await Apps.methods.save.call(ctx);
+    expect(apiFetch).toHaveBeenCalledWith('./api/apps', expect.objectContaining({
+      headers: expect.objectContaining({ 'If-Match': 'revision-A' }),
+      body: JSON.stringify(ctx.editForm),
+    }));
+    expect(document.location.reload).toHaveBeenCalledOnce();
+  });
+
+  it.each([409, 428, 500])('retains the form and displays a %s failure', async status => {
+    const ctx = saveContext('');
+    const form = ctx.editForm;
+    apiFetch.mockResolvedValueOnce({ status, json: async () => ({ error: 'Reload the catalog before retrying' }) });
+    vi.stubGlobal('document', { location: { reload: vi.fn() } });
+    await Apps.methods.save.call(ctx);
+    expect(ctx.editForm).toBe(form);
+    expect(ctx.editFormError).toBe('Reload the catalog before retrying');
+    expect(document.location.reload).not.toHaveBeenCalled();
+  });
+
+  it('deletes by UUID with a revision and retains the target after a conflict', async () => {
+    const uuid = '11111111-1111-1111-1111-111111111111';
+    const ctx = { deleteTarget: { uuid }, catalogRevision: 'revision-A', deleteError: '', $t: key => key };
+    apiFetch.mockResolvedValueOnce({ status: 409, json: async () => ({ error: 'Catalog changed' }) });
+    vi.stubGlobal('document', { location: { reload: vi.fn() } });
+    await Apps.methods.confirmDelete.call(ctx);
+    expect(apiFetch).toHaveBeenCalledWith('./api/apps/' + uuid, expect.objectContaining({
+      method: 'DELETE', headers: expect.objectContaining({ 'If-Match': 'revision-A' }),
+    }));
+    expect(ctx.deleteError).toBe('Catalog changed');
+    expect(ctx.deleteTarget.uuid).toBe(uuid);
+    expect(document.location.reload).not.toHaveBeenCalled();
+  });
+
+  it('loads committed identities and revision together', async () => {
+    const apps = [{ name: 'A', id: '42', uuid: '11111111-1111-1111-1111-111111111111' }];
+    const ctx = { apps: [], catalogRevision: '', catalogError: '', $t: key => key };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ apps, revision: 'revision-B' }) }));
+    await Apps.methods.loadApps.call(ctx);
+    expect(ctx.apps).toBe(apps);
+    expect(ctx.catalogRevision).toBe('revision-B');
+  });
+});

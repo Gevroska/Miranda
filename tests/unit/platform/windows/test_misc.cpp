@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/platform/windows/test_misc.cpp
- * @brief Tests for Windows thread priority mapping.
+ * @brief Tests for Windows process creation and thread priority mapping.
  */
 
 // test includes
@@ -9,6 +9,7 @@
 #ifdef _WIN32
   // standard includes
   #include <array>
+  #include <optional>
   #include <utility>
 
   // platform includes
@@ -17,6 +18,36 @@
   // local includes
   #include <src/platform/common.h>
   #include <src/utility.h>
+
+namespace platf::test_support {
+  /** @brief Apply the production flag decision to a checked job limit or unknown policy. */
+  DWORD creation_flags_for_job(DWORD flags, std::optional<DWORD> known_job_limits);
+}  // namespace platf::test_support
+
+TEST(WindowsProcessCreationFlagsTest, UnknownParentPolicyPreservesExistingFlags) {
+  constexpr DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+  EXPECT_EQ(platf::test_support::creation_flags_for_job(flags, std::nullopt), flags);
+}
+
+TEST(WindowsProcessCreationFlagsTest, RestrictiveParentPreservesConsoleUnicodeAndExtendedStartupFlags) {
+  constexpr DWORD retained = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE;
+  EXPECT_EQ(platf::test_support::creation_flags_for_job(retained | CREATE_BREAKAWAY_FROM_JOB, DWORD {0}), retained);
+}
+
+TEST(WindowsProcessCreationFlagsTest, ExplicitBreakawayPermissionPreservesTheRequest) {
+  constexpr DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+  EXPECT_EQ(platf::test_support::creation_flags_for_job(flags, DWORD {JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE}), flags);
+}
+
+TEST(WindowsProcessCreationFlagsTest, SilentBreakawayUsesParentPolicyWithoutAnExplicitRequest) {
+  constexpr DWORD retained = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+  EXPECT_EQ(platf::test_support::creation_flags_for_job(retained | CREATE_BREAKAWAY_FROM_JOB, DWORD {JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK}), retained);
+}
+
+TEST(WindowsProcessCreationFlagsTest, RestrictivePolicyDoesNotAddAnAbsentBreakawayRequest) {
+  constexpr DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE;
+  EXPECT_EQ(platf::test_support::creation_flags_for_job(flags, DWORD {JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE}), flags);
+}
 
 TEST(WindowsThreadPriorityTest, MapsEveryPriorityAndIgnoresUnknownValues) {
   using enum platf::thread_priority_e;

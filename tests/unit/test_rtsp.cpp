@@ -9,6 +9,7 @@
 // standard includes
 #include <array>
 #include <string>
+#include <thread>
 #include <utility>
 
 // lib includes
@@ -114,4 +115,35 @@ TEST(RtspResponseTest, CommonDispatcherPreservesResponsesWithoutServerContext) {
       EXPECT_TRUE(response.ends_with("\r\n\r\n"));
     }
   }
+}
+
+TEST(RtspCatalogTest, NestedCatalogWorkStaysOnProcessLaneAndStartupFallbackStaysInline) {
+  const auto caller = std::this_thread::get_id();
+  std::thread::id dispatched;
+  {
+    auto owner = rtsp_stream::test_support::start_owner();
+    std::thread::id owner_thread;
+    rtsp_stream::test_support::owner_operation([&]() {
+      ASSERT_TRUE(rtsp_stream::on_owner_thread());
+      EXPECT_FALSE(rtsp_stream::on_process_worker());
+      owner_thread = std::this_thread::get_id();
+    });
+    rtsp_stream::catalog_operation([&]() {
+      EXPECT_TRUE(rtsp_stream::on_process_worker());
+      EXPECT_FALSE(rtsp_stream::on_owner_thread());
+      dispatched = std::this_thread::get_id();
+      EXPECT_NE(dispatched, owner_thread);
+      rtsp_stream::catalog_operation([&]() {
+        EXPECT_TRUE(rtsp_stream::on_process_worker());
+        EXPECT_FALSE(rtsp_stream::on_owner_thread());
+        EXPECT_EQ(std::this_thread::get_id(), dispatched);
+      });
+    });
+    EXPECT_NE(dispatched, caller);
+  }
+  rtsp_stream::catalog_operation([&]() {
+    EXPECT_TRUE(rtsp_stream::on_process_worker());
+    EXPECT_FALSE(rtsp_stream::on_owner_thread());
+    EXPECT_EQ(std::this_thread::get_id(), caller);
+  });
 }

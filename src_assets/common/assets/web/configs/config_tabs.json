@@ -45,6 +45,8 @@
       "external_audio": "disabled",
       "adapter_name": "",
       "output_name": "",
+      "force_virtual_display": "disabled",
+      "virtual_display_identity": "client",
       "dd_configuration_option": "disabled",
       "dd_resolution_option": "auto",
       "dd_manual_resolution": "",

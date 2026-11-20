@@ -5,6 +5,9 @@
 #pragma once
 
 // standard includes
+#include <array>
+#include <cstddef>
+#include <optional>
 #include <utility>
 
 // lib includes
@@ -12,6 +15,7 @@
 
 // local includes
 #include "audio.h"
+#include "capture_source.h"
 #include "crypto.h"
 #include "permissions.h"
 #include "video.h"
@@ -101,6 +105,14 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+    /** @brief Owner accounting identifier retained independently of the RTSP handshake token. */
+    std::uint32_t launch_id(session_t &session);
+    /** @brief Immutable managed source binding for later D capture integration; carries no capture pin. */
+    const std::shared_ptr<const rtsp_stream::capture_source_t> &source(session_t &session);
+    /** @brief Owner-preissued ticket; D shares it through actual detached resource destruction. */
+    const std::shared_ptr<rtsp_stream::capture_pin_t> &source_pin(session_t &session);
+    /** @brief Safely unwind a failed/partial start before releasing its prepared-source ownership. */
+    void abort_start(session_t &session);
     /**
      * @brief Apply current device input rights and wait for category cleanup.
      * @param session Active stream whose viewing authority remains valid.
@@ -108,4 +120,20 @@ namespace stream {
      */
     void update_permissions(session_t &session, permissions::mask_t allowed);
   }  // namespace session
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /** @brief Exercise the production control termination decision using the current published observation only. */
+    bool control_would_terminate(bool has_session_awaiting_peer);
+    /** @brief Exercise the production last-session legacy restoration decision without another process refresh. */
+    bool last_session_would_revert(bool revert_on_disconnect);
+    enum class start_fault_e {
+      control_registered,
+      first_worker_started
+    };
+    /** @brief Substitute inert control/worker dependencies while injecting faults in the actual start path. */
+    void set_start_fault(std::optional<start_fault_e> fault);
+    /** @brief Actual registered slots and started/ended test workers after partial-start unwind. */
+    std::array<std::size_t, 3> start_fault_observation();
+  }  // namespace test_support
+#endif
 }  // namespace stream

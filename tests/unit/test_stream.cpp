@@ -8,9 +8,11 @@
 
 // standard includes
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +27,10 @@ namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
   std::optional<std::pair<std::uint16_t, std::string_view>> parse_control_packet(const ENetPacket &packet);
 }  // namespace stream
+
+namespace stream::session {
+  extern std::atomic_uint running_sessions;
+}
 
 TEST(ConcatAndInsertTests, ConcatNoInsertionTest) {
   std::array<char, 2> b1 = {'a', 'b'};
@@ -107,4 +113,40 @@ TEST(StreamSessionIdentityTests, AllocationRetainsAuthenticatedUuidAndCertificat
   EXPECT_EQ(stream::session::client_uuid(*session), launch_session.client_uuid);
   EXPECT_EQ(stream::session::client_cert(*session), launch_session.client_cert);
   EXPECT_NE(stream::session::client_uuid(*session), launch_session.unique_id);
+  EXPECT_EQ(stream::session::launch_id(*session), 42U);
+  EXPECT_FALSE(stream::session::source(*session));
+  EXPECT_FALSE(stream::session::source_pin(*session));
+}
+
+TEST(StreamSessionIdentityTests, PartialStartUnwindIsIdempotentAndDoesNotConsumeRunningSessionCount) {
+  rtsp_stream::launch_session_t launch {};
+  launch.gcm_key.resize(16);
+  launch.iv.resize(16);
+  stream::config_t config {};
+  const auto session = stream::session::alloc(config, launch);
+  const auto before = stream::session::running_sessions.load();
+  EXPECT_NO_THROW(stream::session::abort_start(*session));
+  EXPECT_NO_THROW(stream::session::abort_start(*session));
+  EXPECT_EQ(stream::session::running_sessions.load(), before);
+}
+
+TEST(StreamSessionIdentityTests, ActualPartialStartFaultsDrainRegisteredControlAndStartedWorkerExactlyOnce) {
+  for (const auto boundary : {stream::test_support::start_fault_e::control_registered, stream::test_support::start_fault_e::first_worker_started}) {
+    stream::test_support::set_start_fault(boundary);
+    rtsp_stream::launch_session_t launch {};
+    launch.gcm_key.resize(16);
+    launch.iv.resize(16);
+    stream::config_t config {};
+    const auto session = stream::session::alloc(config, launch);
+    const auto before = stream::session::running_sessions.load();
+    EXPECT_THROW(stream::session::start(*session, "127.0.0.1"), std::runtime_error);
+    EXPECT_NO_THROW(stream::session::abort_start(*session));
+    EXPECT_NO_THROW(stream::session::abort_start(*session));
+    const auto observed = stream::test_support::start_fault_observation();
+    EXPECT_EQ(observed[0], 0U);
+    EXPECT_EQ(observed[1], boundary == stream::test_support::start_fault_e::first_worker_started ? 1U : 0U);
+    EXPECT_EQ(observed[2], observed[1]);
+    EXPECT_EQ(stream::session::running_sessions.load(), before);
+    stream::test_support::set_start_fault(std::nullopt);
+  }
 }

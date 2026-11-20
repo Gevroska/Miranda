@@ -336,6 +336,8 @@ namespace platf::dxgi {
      */
     int init(const ::video::config_t &config, const std::string &display_name);
 
+    bool keep_display_awake = true;  ///< Native and legacy capture preserve the existing display power request.
+
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override;
 
     factory1_t factory;  ///< DXGI factory used to enumerate adapters and outputs.

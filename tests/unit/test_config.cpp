@@ -67,6 +67,11 @@ TEST(ConfigDefaultsTest, TreatsFp16SdrCapturesAsLinear) {
   EXPECT_FALSE(config::video.fp16_sdr_gamma_encoded);
 }
 
+TEST(ConfigDefaultsTest, UsesPerClientVirtualIdentityWithoutForcingVirtual) {
+  EXPECT_FALSE(config::video.dd.force_virtual);
+  EXPECT_EQ(config::video.dd.virtual_identity, config::video_t::dd_t::identity_option_e::client);
+}
+
 TEST(ConfigDefaultsTest, PreservesAmdEncoderNumericDefaults) {
   EXPECT_EQ(config::video.amd.amd_usage_h264, 1);
   EXPECT_EQ(config::video.amd.amd_usage_hevc, 1);
@@ -280,4 +285,23 @@ TEST_F(ConfigPersistenceTest, ParsesNvencTwoPassModesAndDefaultsUnknownValues) {
     config::apply_config_for_test(std::string {"nvenc_twopass = "} + std::string {setting} + "\n");
     EXPECT_EQ(config::video.nv.two_pass, expected) << setting;
   }
+}
+
+TEST_F(ConfigPersistenceTest, ParsesVirtualDisplayPolicyAndDefaultsUnknownIdentityToClient) {
+  using identity = config::video_t::dd_t::identity_option_e;
+  const auto original_video = config::video;
+  const auto restore_video = util::fail_guard([original_video]() {
+    config::video = original_video;
+  });
+  const auto apps_file = config_file().parent_path() / "sunshine_test_config_apps.json";
+  ASSERT_EQ(file_handler::write_file(apps_file.string().c_str(), "{}"), 0);
+  config::stream.file_apps = apps_file.string();
+  config::apply_config_for_test("force_virtual_display = enabled\nvirtual_display_identity = application\n");
+  EXPECT_TRUE(config::video.dd.force_virtual);
+  EXPECT_EQ(config::video.dd.virtual_identity, identity::application);
+  config::apply_config_for_test("force_virtual_display = disabled\nvirtual_display_identity = client_application\n");
+  EXPECT_FALSE(config::video.dd.force_virtual);
+  EXPECT_EQ(config::video.dd.virtual_identity, identity::client_application);
+  config::apply_config_for_test("virtual_display_identity = unknown\n");
+  EXPECT_EQ(config::video.dd.virtual_identity, identity::client);
 }
