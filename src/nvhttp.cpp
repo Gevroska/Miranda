@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -1600,6 +1601,34 @@ namespace nvhttp {
     }
   }
 
+  /** @brief Decoded Artemis virtual-display intent for a stream request. */
+  enum class virtual_display_intent_e {
+    default_policy,  ///< No client opt-in. Host, app and device preferences still apply.
+    requested,  ///< Require Virtual when preparing a fresh source.
+    invalid  ///< A repeated, empty or unsupported option.
+  };
+
+  /**
+   * @brief Classify virtualDisplay without affecting admission or source policy.
+   * @param args Case-insensitive query arguments with decoded values.
+   * @return The intent from the single option, or the default policy when absent.
+   */
+  virtual_display_intent_e virtual_display_intent(const args_t &args) {
+    const auto [first, last] = args.equal_range("virtualDisplay");
+    if (first == last) {
+      return virtual_display_intent_e::default_policy;
+    }
+    if (std::next(first) == last) {
+      if (first->second == "0") {
+        return virtual_display_intent_e::default_policy;
+      }
+      if (first->second == "1") {
+        return virtual_display_intent_e::requested;
+      }
+    }
+    return virtual_display_intent_e::invalid;
+  }
+
   /**
    * @brief Prepare an authorized launch or join before exposing an RTSP admission.
    * @param resuming Whether the request resumes the currently selected application.
@@ -1626,6 +1655,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Missing a required stream parameter");
       return;
     }
+    const auto display_intent = virtual_display_intent(args);
     std::shared_ptr<rtsp_stream::launch_session_t> session;
     try {
       session = make_launch_session(host_audio, args, identity);
@@ -1643,7 +1673,7 @@ namespace nvhttp {
       auto application = std::make_shared<application_operation_t>();
       auto physical_available = std::make_shared<std::optional<bool>>(true);
       const auto encryption = net::encryption_mode_for_address(request->remote_endpoint().address());
-      auto status = rtsp_stream::prepare_source_launch(session, [session, args, identity, resuming, encryption, &host_audio, application, physical_available](const rtsp_stream::source_snapshot_t &active) -> std::pair<int, std::shared_ptr<const display_policy::source_request_t>> {
+      auto status = rtsp_stream::prepare_source_launch(session, [session, args, identity, resuming, display_intent, encryption, &host_audio, application, physical_available](const rtsp_stream::source_snapshot_t &active) -> std::pair<int, std::shared_ptr<const display_policy::source_request_t>> {
         const auto client = current_client(identity.uuid, identity.cert);
         if (!client || !permissions::allows(client->permissions, permissions::view)) {
           return {403, {}};
@@ -1675,6 +1705,9 @@ namespace nvhttp {
         if (!session->rtsp_cipher && encryption == config::ENCRYPTION_MODE_MANDATORY) {
           return {403, {}};
         }
+        if (display_intent == virtual_display_intent_e::invalid) {
+          return {400, {}};
+        }
         session->appid = selected.first;
         session->app_uuid = selected.second;
         if (!active.managed && args.contains("localAudioPlayMode")) {
@@ -1690,6 +1723,7 @@ namespace nvhttp {
           return {503, {}};
         }
         fresh.physical_source_available = **physical_available;
+        fresh.client_requests_virtual = display_intent == virtual_display_intent_e::requested;
         fresh.authenticated_client_uuid = client->uuid;
         fresh.application_uuid = selected.first > 0 ? std::optional {selected.second} : std::nullopt;
         fresh.device = client->display;
@@ -1810,6 +1844,16 @@ namespace nvhttp {
         return 403;
       if (active && !same_application)
         return 503;
+      const auto encryption = net::encryption_mode_for_address(request->remote_endpoint().address());
+      if (!session->rtsp_cipher && encryption == config::ENCRYPTION_MODE_MANDATORY) {
+        return 403;
+      }
+      if (display_intent == virtual_display_intent_e::invalid) {
+        return 400;
+      }
+      if (!active && display_intent == virtual_display_intent_e::requested) {
+        return 503;
+      }
       session->appid = target;
       session->app_uuid = std::move(selected.second);
       session->joining = active;
@@ -1817,10 +1861,6 @@ namespace nvhttp {
         host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
       }
       session->host_audio = host_audio;
-      const auto encryption = net::encryption_mode_for_address(request->remote_endpoint().address());
-      if (!session->rtsp_cipher && encryption == config::ENCRYPTION_MODE_MANDATORY) {
-        return 403;
-      }
       if (current > 0 && !same_application) {
         proc::proc.terminate();
       }
