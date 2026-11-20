@@ -147,9 +147,12 @@ class Sunshine < Formula
     ENV["BUILD_VERSION"] = "@BUILD_VERSION@"
     ENV["COMMIT"] = "@GITHUB_COMMIT@"
 
-    setup_linux_gcc_environment if OS.linux?
-
     return unless OS.linux?
+
+    # Use GCC because gcov from llvm cannot handle our paths
+    gcc_path = Formula[GCC_FORMULA]
+    ENV["CC"] = "#{gcc_path.opt_bin}/gcc-#{GCC_VERSION}"
+    ENV["CXX"] = "#{gcc_path.opt_bin}/g++-#{GCC_VERSION}"
 
     # Install jinja2 (required by the glad OpenGL/EGL loader generator) into a
     # temporary virtualenv. We pass its Python path to cmake via Python_EXECUTABLE
@@ -161,16 +164,9 @@ class Sunshine < Formula
     @glad_python = (buildpath/"venv/bin/python3").to_s
   end
 
-  def setup_linux_gcc_environment
-    # Use GCC because gcov from llvm cannot handle our paths
-    gcc_path = Formula[GCC_FORMULA]
-    ENV["CC"] = "#{gcc_path.opt_bin}/gcc-#{GCC_VERSION}"
-    ENV["CXX"] = "#{gcc_path.opt_bin}/g++-#{GCC_VERSION}"
-  end
-
   ## @brief Generate CMake arguments with Homebrew dependency and Linux runtime paths.
   ## @return CMake command-line arguments.
-  def base_cmake_args
+  def build_cmake_args
     args = %W[
       -DBUILD_WERROR=ON
       -DCMAKE_INSTALL_PREFIX=#{prefix}
@@ -192,31 +188,8 @@ class Sunshine < Formula
     args << "-DSUNSHINE_EXECUTABLE_PATH=#{opt_bin}/sunshine" if OS.linux?
     # Point cmake at the venv Python that has jinja2 installed (set up in setup_build_environment)
     args << "-DPython_EXECUTABLE=#{@glad_python}" if @glad_python
-    args
-  end
 
-  def add_test_args(args)
-    if BUILD_VALIDATION_TESTS
-      args << "-DBUILD_TESTS=ON"
-      test_runtime = opt_libexec/"tests"
-      args << "-DSUNSHINE_TEST_SOURCE_DIR=#{test_runtime}"
-      args << "-DSUNSHINE_TEST_RUNTIME_DIR=#{test_runtime}"
-      coverage_arg = if OS.mac?
-        "-DSUNSHINE_LLVM_COVERAGE=ON"
-      else
-        # gcovr writes intermediate files next to the mapped sources, so use Homebrew's writable temp tree.
-        coverage_runtime = HOMEBREW_TEMP/"coverage"
-        "-DSUNSHINE_TEST_GCOV_ROOT=#{coverage_runtime}"
-      end
-      args << coverage_arg
-      ohai "Building tests: enabled"
-    else
-      args << "-DBUILD_TESTS=OFF"
-      ohai "Building tests: disabled"
-    end
-  end
-
-  def add_docs_args(args)
+    add_test_args(args)
     if build.with? "docs"
       ohai "Building docs: enabled"
       args << "-DBUILD_DOCS=ON"
@@ -224,18 +197,51 @@ class Sunshine < Formula
       ohai "Building docs: disabled"
       args << "-DBUILD_DOCS=OFF"
     end
+    add_boost_args(args)
+
+    return args unless OS.linux?
+
+    cuda_path = Formula["lizardbyte/homebrew/#{CUDA_FORMULA}"]
+    nvcc_path = "#{cuda_path.opt_libexec}/homebrew/bin/nvcc"
+    gcc_path = Formula[GCC_FORMULA]
+
+    args << "-DSUNSHINE_ENABLE_CUDA=ON"
+    args << "-DCMAKE_CUDA_COMPILER:PATH=#{nvcc_path}"
+    args << "-DCMAKE_CUDA_TOOLKIT_ROOT_DIR:PATH=#{cuda_path.opt_libexec}"
+    args << "-DCMAKE_CUDA_HOST_COMPILER=#{gcc_path.opt_bin}/gcc-#{GCC_VERSION}"
+    ohai "CUDA enabled with nvcc at: #{nvcc_path}"
+    args
+  end
+
+  def add_test_args(args)
+    unless BUILD_VALIDATION_TESTS
+      args << "-DBUILD_TESTS=OFF"
+      ohai "Building tests: disabled"
+      return
+    end
+
+    args << "-DBUILD_TESTS=ON"
+    test_runtime = opt_libexec/"tests"
+    args << "-DSUNSHINE_TEST_SOURCE_DIR=#{test_runtime}"
+    args << "-DSUNSHINE_TEST_RUNTIME_DIR=#{test_runtime}"
+    coverage_arg = if OS.mac?
+      "-DSUNSHINE_LLVM_COVERAGE=ON"
+    else
+      # gcovr writes intermediate files next to the mapped sources, so use Homebrew's writable temp tree.
+      coverage_runtime = HOMEBREW_TEMP/"coverage"
+      "-DSUNSHINE_TEST_GCOV_ROOT=#{coverage_runtime}"
+    end
+    args << coverage_arg
+    ohai "Building tests: enabled"
   end
 
   def add_boost_args(args)
     if build.without? "static-boost"
       args << "-DBOOST_USE_STATIC=OFF"
       ohai "Disabled statically linking Boost libraries"
-    else
-      configure_static_boost(args)
+      return
     end
-  end
 
-  def configure_static_boost(args)
     args << "-DBOOST_USE_STATIC=ON"
     ohai "Enabled statically linking Boost libraries"
 
@@ -250,24 +256,6 @@ class Sunshine < Formula
     ENV.append "LDFLAGS", "-L#{icu4c_lib_path}"
     ENV["LIBRARY_PATH"] = icu4c_lib_path
     ohai "Linking against ICU libraries at: #{icu4c_lib_path}"
-  end
-
-  def add_cuda_args(args)
-    return unless OS.linux?
-
-    configure_cuda(args)
-  end
-
-  def configure_cuda(args)
-    cuda_path = Formula["lizardbyte/homebrew/#{CUDA_FORMULA}"]
-    nvcc_path = "#{cuda_path.opt_libexec}/homebrew/bin/nvcc"
-    gcc_path = Formula[GCC_FORMULA]
-
-    args << "-DSUNSHINE_ENABLE_CUDA=ON"
-    args << "-DCMAKE_CUDA_COMPILER:PATH=#{nvcc_path}"
-    args << "-DCMAKE_CUDA_TOOLKIT_ROOT_DIR:PATH=#{cuda_path.opt_libexec}"
-    args << "-DCMAKE_CUDA_HOST_COMPILER=#{gcc_path.opt_bin}/gcc-#{GCC_VERSION}"
-    ohai "CUDA enabled with nvcc at: #{nvcc_path}"
   end
 
   def release_homebrew_testpath
@@ -286,7 +274,10 @@ class Sunshine < Formula
     odie "#{path} was not created" unless path.exist?
   end
 
-  def run_test_suite(artifact_dir)
+  def run_standalone_validation
+    return if ENV.fetch("HOMEBREW_BOTTLE_BUILD", "false") == "true"
+
+    artifact_dir = testpath
     mkdir_p artifact_dir/"tests"
     test_results = artifact_dir/TEST_RESULTS_XML
 
@@ -299,6 +290,7 @@ class Sunshine < Formula
     end
 
     ensure_artifact_exists test_results
+    generate_coverage_report testpath, ENV.fetch("HOMEBREW_BUILDPATH", "")
   end
 
   def with_llvm_profile_file(artifact_dir)
@@ -313,80 +305,49 @@ class Sunshine < Formula
     end
   end
 
-  def coverage_gcov_options
-    gcc_path = Formula[GCC_FORMULA]
-    ["--gcov-executable", "#{gcc_path.opt_bin}/gcov-#{GCC_VERSION}"]
-  end
-
-  def llvm_profdata_executable
-    Utils.safe_popen_read("xcrun", "--find", "llvm-profdata").strip
-  end
-
-  def llvm_cov_executable
-    Utils.safe_popen_read("xcrun", "--find", "llvm-cov").strip
-  end
-
   def coverage_report_path(artifact_dir)
     artifact_dir/(OS.mac? ? COVERAGE_LCOV : COVERAGE_XML)
-  end
-
-  def coverage_common_options(coverage_report)
-    [
-      "--exclude-noncode-lines",
-      "--exclude-throw-branches",
-      "--exclude-unreachable-branches",
-      "--xml-pretty",
-      "-o=#{coverage_report}",
-    ]
   end
 
   def generate_coverage_report(artifact_dir, coverage_buildpath)
     return if coverage_buildpath.to_s.empty?
 
     coverage_report = coverage_report_path(artifact_dir)
+    has_lines = if OS.mac?
+      profile_files = Dir["#{artifact_dir}/*.profraw"]
+      odie "No LLVM profile data was created" if profile_files.empty?
 
-    if OS.mac?
-      generate_llvm_coverage_report artifact_dir, coverage_buildpath, coverage_report
+      profile_data = artifact_dir/COVERAGE_PROFDATA
+      llvm_profdata = Utils.safe_popen_read("xcrun", "--find", "llvm-profdata").strip
+      system llvm_profdata, "merge", "--sparse", "-o", profile_data.to_s, *profile_files
+      llvm_cov = Utils.safe_popen_read("xcrun", "--find", "llvm-cov").strip
+      lcov = Utils.safe_popen_read(
+        llvm_cov,
+        "export",
+        "-format=lcov",
+        "-instr-profile=#{profile_data}",
+        (bin/TEST_BINARY).to_s,
+      )
+      coverage_report.write lcov_for_source_files(lcov, coverage_buildpath)
+      coverage_report.read.lines.any? { |line| line.start_with?("DA:") }
     else
-      generate_gcov_coverage_report coverage_report, coverage_buildpath
+      cd "#{coverage_buildpath}/build" do
+        gcc_path = Formula[GCC_FORMULA]
+        system "gcovr", "tests/CMakeFiles/#{TEST_BINARY}.dir/__/src",
+          "-r", "../src",
+          "--gcov-executable", "#{gcc_path.opt_bin}/gcov-#{GCC_VERSION}",
+          "--exclude-noncode-lines",
+          "--exclude-throw-branches",
+          "--exclude-unreachable-branches",
+          "--xml-pretty",
+          "-o=#{coverage_report}"
+      end
+
+      coverage_report.read[/lines-valid="(\d+)"/, 1].to_i.positive?
     end
 
+    odie "#{coverage_report} does not contain any source lines" unless has_lines
     ensure_artifact_exists coverage_report
-  end
-
-  def generate_llvm_coverage_report(artifact_dir, coverage_buildpath, coverage_report)
-    profile_files = Dir["#{artifact_dir}/*.profraw"]
-    odie "No LLVM profile data was created" if profile_files.empty?
-
-    profile_data = artifact_dir/COVERAGE_PROFDATA
-    system llvm_profdata_executable, "merge", "--sparse", "-o", profile_data.to_s, *profile_files
-    lcov = Utils.safe_popen_read(
-      llvm_cov_executable,
-      "export",
-      "-format=lcov",
-      "-instr-profile=#{profile_data}",
-      (bin/TEST_BINARY).to_s,
-    )
-    coverage_report.write lcov_for_source_files(lcov, coverage_buildpath)
-    ensure_lcov_report_has_lines coverage_report
-  end
-
-  def generate_gcov_coverage_report(coverage_report, coverage_buildpath)
-    cd "#{coverage_buildpath}/build" do
-      system "gcovr", "tests/CMakeFiles/#{TEST_BINARY}.dir/__/src",
-        "-r", "../src",
-        *coverage_gcov_options,
-        *coverage_common_options(coverage_report)
-    end
-
-    ensure_cobertura_report_has_lines coverage_report
-  end
-
-  def coverage_source_prefixes(coverage_buildpath)
-    coverage_buildpath = Pathname.new(coverage_buildpath.to_s)
-    paths = [coverage_buildpath.to_s]
-    paths << coverage_buildpath.realpath.to_s if coverage_buildpath.exist?
-    paths.uniq.map { |path| "#{path}/src/" }
   end
 
   def relative_lcov_record(record, source_prefixes)
@@ -412,19 +373,12 @@ class Sunshine < Formula
   end
 
   def lcov_for_source_files(lcov, coverage_buildpath)
-    source_prefixes = coverage_source_prefixes(coverage_buildpath)
+    coverage_buildpath = Pathname.new(coverage_buildpath.to_s)
+    paths = [coverage_buildpath.to_s]
+    paths << coverage_buildpath.realpath.to_s if coverage_buildpath.exist?
+    source_prefixes = paths.uniq.map { |path| "#{path}/src/" }
     records = lcov.split("end_of_record\n")
     records.filter_map { |record| relative_lcov_record(record, source_prefixes) }.join
-  end
-
-  def ensure_cobertura_report_has_lines(path)
-    lines_valid = path.read[/lines-valid="(\d+)"/, 1].to_i
-    odie "#{path} does not contain any source lines" if lines_valid.zero?
-  end
-
-  def ensure_lcov_report_has_lines(path)
-    has_lines = path.read.lines.any? { |line| line.start_with?("DA:") }
-    odie "#{path} does not contain any source lines" unless has_lines
   end
 
   def collect_test_artifacts
@@ -437,81 +391,68 @@ class Sunshine < Formula
     (artifact_dir/COVERAGE_BUILDPATH_FILE).write coverage_buildpath.to_s
   end
 
-  def build_cmake_args
-    args = base_cmake_args
-    add_test_args(args)
-    add_docs_args(args)
-    add_boost_args(args)
-    add_cuda_args(args)
-    args
+  def install_validation_files
+    return unless BUILD_VALIDATION_TESTS
+
+    bin.install "build/tests/#{TEST_BINARY}"
+
+    test_runtime = libexec/"tests"
+    %w[docs src src_assets test_assets].each do |directory|
+      test_runtime.install "build/tests/#{directory}"
+    end
+    boost_test_fixtures = %w[
+      cmake/compile_definitions/macos.cmake
+      cmake/dependencies/Boost_Sunshine.cmake
+      cmake/macros/common.cmake
+      cmake/prep/options.cmake
+      package-lock.cmake
+      packaging/linux/Arch/PKGBUILD
+      packaging/linux/copr/Sunshine.spec
+      packaging/linux/flatpak/modules/boost.json
+      packaging/linux/flatpak/scripts/additional-install.sh
+      scripts/linux_build.sh
+      tests/scripts/test_additional_install.sh
+    ]
+    if OS.mac?
+      boost_test_fixtures += %w[
+        .github/workflows/ci-macos.yml
+        scripts/macos_build.sh
+      ]
+    end
+    boost_test_fixtures.each do |fixture|
+      (test_runtime/Pathname.new(fixture).dirname).install "build/tests/#{fixture}"
+    end
+    test_runtime.install "sunshine.png"
+    (test_runtime/"tests/unit").install "tests/unit/test_video.cpp"
+
+    return unless OS.linux?
+
+    coverage_runtime = test_runtime/"coverage"
+    coverage_runtime.install "src"
+    (test_runtime/GCOV_PREFIX_STRIP_FILE).write "#{buildpath.each_filename.count}\n"
+    coverage_notes = buildpath.glob("build/**/*.gcno")
+    odie "No gcov notes were created" if coverage_notes.empty?
+
+    coverage_notes.each do |coverage_note|
+      relative_note = coverage_note.relative_path_from(buildpath)
+      (coverage_runtime/relative_note.dirname).install coverage_note
+    end
   end
 
-  def build_and_install_project
+  def install
+    setup_build_environment
     system "cmake", "-S", ".", "-B", "build", "-G", "Unix Makefiles",
             *std_cmake_args,
             *build_cmake_args
 
     system "make", "-C", "build"
     system "make", "-C", "build", "install"
-  end
-
-  def install_platform_specific_files
-    if BUILD_VALIDATION_TESTS
-      bin.install "build/tests/#{TEST_BINARY}"
-
-      test_runtime = libexec/"tests"
-      %w[docs src src_assets test_assets].each do |directory|
-        test_runtime.install "build/tests/#{directory}"
-      end
-      boost_test_fixtures = %w[
-        cmake/compile_definitions/macos.cmake
-        cmake/dependencies/Boost_Sunshine.cmake
-        cmake/macros/common.cmake
-        cmake/prep/options.cmake
-        package-lock.cmake
-        packaging/linux/Arch/PKGBUILD
-        packaging/linux/copr/Sunshine.spec
-        packaging/linux/flatpak/modules/boost.json
-        packaging/linux/flatpak/scripts/additional-install.sh
-        scripts/linux_build.sh
-        tests/scripts/test_additional_install.sh
-      ]
-      if OS.mac?
-        boost_test_fixtures += %w[
-          .github/workflows/ci-macos.yml
-          scripts/macos_build.sh
-        ]
-      end
-      boost_test_fixtures.each do |fixture|
-        (test_runtime/Pathname.new(fixture).dirname).install "build/tests/#{fixture}"
-      end
-      test_runtime.install "sunshine.png"
-      (test_runtime/"tests/unit").install "tests/unit/test_video.cpp"
-
-      if OS.linux?
-        coverage_runtime = test_runtime/"coverage"
-        coverage_runtime.install "src"
-        (test_runtime/GCOV_PREFIX_STRIP_FILE).write "#{buildpath.each_filename.count}\n"
-        coverage_notes = buildpath.glob("build/**/*.gcno")
-        odie "No gcov notes were created" if coverage_notes.empty?
-
-        coverage_notes.each do |coverage_note|
-          relative_note = coverage_note.relative_path_from(buildpath)
-          (coverage_runtime/relative_note.dirname).install coverage_note
-        end
-      end
-    end
+    install_validation_files
 
     # codesign the binary on intel macs
     system "codesign", "-s", "-", "--force", "--deep", bin/"sunshine" if OS.mac? && Hardware::CPU.intel?
 
     bin.install "src_assets/linux/misc/postinst" if OS.linux?
-  end
-
-  def install
-    setup_build_environment
-    build_and_install_project
-    install_platform_specific_files
     collect_test_artifacts
   end
 
@@ -583,9 +524,8 @@ class Sunshine < Formula
           generate_coverage_report artifact_dir, coverage_buildpath.read.strip
           assert_path_exists coverage_report_path(artifact_dir)
         end
-      elsif ENV.fetch("HOMEBREW_BOTTLE_BUILD", "false") != "true"
-        run_test_suite testpath
-        generate_coverage_report testpath, ENV.fetch("HOMEBREW_BUILDPATH", "")
+      else
+        run_standalone_validation
       end
 
       lcov = <<~LCOV
