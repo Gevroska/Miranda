@@ -33,6 +33,8 @@
   #include <winioctl.h>
   #include <winternl.h>
 #else
+  #include <fcntl.h>
+  #include <sys/file.h>
   #include <sys/stat.h>
   #include <unistd.h>
   #ifdef __linux__
@@ -3139,3 +3141,67 @@ TEST_F(StateFileTransactionTest, ByteAndPropertyTreeAdaptersShareTheWholeTransac
   EXPECT_EQ(result.get<std::string>("tree-update"), "retained");
   EXPECT_EQ(result.get<std::string>("fixture"), "original");
 }
+
+#ifndef _WIN32
+TEST_F(StateFileTransactionTest, HostIdentityDirectoryLockExcludesIndependentContendersThroughCommit) {
+  const auto contender = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  ASSERT_GE(contender, 0);
+  const auto close = util::fail_guard([&]() {
+    ::close(contender);
+  });
+  const auto original = state_bytes();
+  const auto candidate = R"({"fixture":"host identity candidate"})";
+  ASSERT_EQ(::flock(contender, LOCK_EX | LOCK_NB), 0);
+  bool prepared = false;
+  EXPECT_FALSE(http::update_host_identity_state(file.string(), [&](const auto &) -> std::optional<std::string> {
+    prepared = true;
+    return candidate;
+  }));
+  EXPECT_FALSE(prepared);
+  EXPECT_TRUE(state_bytes() == original);
+  ASSERT_EQ(::flock(contender, LOCK_UN), 0);
+
+  bool at_commit = false;
+  http::test_support::set_state_replace_hook([&](const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+    at_commit = true;
+    const auto result = ::flock(contender, LOCK_EX | LOCK_NB);
+    const auto error = errno;
+    EXPECT_EQ(result, -1);
+    EXPECT_EQ(error, EWOULDBLOCK);
+    if (result == 0) {
+      ::flock(contender, LOCK_UN);
+    }
+    return std::nullopt;
+  });
+  EXPECT_TRUE(http::update_host_identity_state(file.string(), [&](const auto &current) -> std::optional<std::string> {
+    EXPECT_TRUE(current == original);
+    return candidate;
+  }));
+  EXPECT_TRUE(at_commit);
+  EXPECT_TRUE(state_bytes() == candidate);
+  EXPECT_EQ(::flock(contender, LOCK_EX | LOCK_NB), 0);
+}
+
+TEST_F(StateFileTransactionTest, HostIdentityRefusesAReplacedParentNamespace) {
+  const auto parent = directory / "configured";
+  const auto retired = directory / "retired";
+  const auto destination = parent / "host.json";
+  ASSERT_TRUE(std::filesystem::create_directory(parent));
+  const auto replacement = R"({"fixture":"separate directory"})";
+  http::test_support::set_state_replace_hook([&](const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+    std::filesystem::rename(parent, retired);
+    std::filesystem::create_directory(parent);
+    std::ofstream {destination} << replacement;
+    return std::nullopt;
+  });
+
+  EXPECT_FALSE(http::update_host_identity_state(destination.string(), [](const auto &) -> std::optional<std::string> {
+    return R"({"fixture":"uncommitted candidate"})";
+  }));
+  std::ifstream actual {destination, std::ios::binary};
+  ASSERT_TRUE(actual);
+  const std::string bytes {std::istreambuf_iterator<char> {actual}, std::istreambuf_iterator<char> {}};
+  EXPECT_TRUE(bytes == replacement);
+  EXPECT_TRUE(std::filesystem::is_empty(retired));
+}
+#endif

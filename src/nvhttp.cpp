@@ -320,11 +320,45 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Persist the current state to its backing store.
+   * @brief Accept the paired-device collection formats supported by the state writer.
+   */
+  void validate_named_devices(const proc::catalog::json &root) {
+    const auto devices = root.find("named_devices");
+    if (devices != root.end() && !devices->is_array() && *devices != "") {
+      throw std::invalid_argument {"paired state: expected a device array or legacy empty string"};
+    }
+  }
+
+  namespace {
+    bool host_id_durable = false;  ///< Written only during initialization, before either HTTP listener starts.
+
+    /**
+     * @brief Check the host UUID spelling without altering the GameStream identifier.
+     */
+    bool valid_host_uuid(std::string_view id) {
+      if (id.size() != 36) {
+        return false;
+      }
+      for (std::size_t i = 0; i < id.size(); ++i) {
+        const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+        if (separator ? id[i] != '-' : "0123456789abcdefABCDEF"sv.find(id[i]) == std::string_view::npos) {
+          return false;
+        }
+      }
+      return true;
+    }
+  }  // namespace
+
+  /**
+   * @brief Persist the current state unless pairing is deliberately in memory only.
    */
   bool save_state(const client_t &client = client_root) {
-    return http::update_state_file_bytes(config::nvhttp.file_state, [&](const std::string &original) -> std::optional<std::string> {
-      auto tree = original.empty() && !fs::exists(config::nvhttp.file_state) ? proc::catalog::json::object() : proc::catalog::parse(original);
+    if (config::sunshine.flags[config::flag::FRESH_STATE]) {
+      return true;
+    }
+    const auto &path = config::nvhttp.file_state;
+    const auto prepare = [&](const std::string &original) -> std::optional<std::string> {
+      auto tree = original.empty() && !fs::exists(path) ? proc::catalog::json::object() : proc::catalog::parse(original);
       // No replacement means a successful read-only transaction; invalid state must throw.
       if (!tree.is_object() || (tree.contains("root") && !tree["root"].is_object())) {
         throw std::invalid_argument {"paired state: expected document and root objects"};
@@ -333,10 +367,14 @@ namespace nvhttp {
       if (root.is_null()) {
         root = proc::catalog::json::object();
       }
-      const auto previous = root.value("named_devices", proc::catalog::json::array());
-      if (!previous.is_array() && previous != "") {
-        throw std::invalid_argument {"paired state: expected a device array or legacy empty string"};
+      if (const auto id = root.find("uniqueid"); id != root.end() && id->is_string()) {
+        const auto &committed_id = id->get_ref<const std::string &>();
+        if (committed_id != http::unique_id && valid_host_uuid(committed_id)) {
+          throw std::invalid_argument {"paired state: a different host identity was committed"};
+        }
       }
+      validate_named_devices(root);
+      const auto previous = root.value("named_devices", proc::catalog::json::array());
       root["uniqueid"] = http::unique_id;
       root.erase("devices");
       auto devices = proc::catalog::json::array();
@@ -367,7 +405,9 @@ namespace nvhttp {
       }
       root["named_devices"] = std::move(devices);
       return tree.dump(2) + "\n";
-    });
+    };
+    // An initializer that could not verify its identity must contend for the same guard as a startup commit.
+    return host_id_durable ? http::update_state_file_bytes(path, prepare) : http::update_host_identity_state(path, prepare);
   }
 
   /**
@@ -578,41 +618,73 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Load state from its backing store.
+   * @brief Interpret a complete enable flag, or use the legacy default when the field is absent.
+   * @return An enabled or disabled value, or no value for a malformed present field.
    */
-  void load_state() {
-    if (!fs::exists(config::nvhttp.file_state)) {
-      BOOST_LOG(info) << "File "sv << config::nvhttp.file_state << " doesn't exist"sv;
-      http::unique_id = uuid_util::uuid_t::generate().string();
-      return;
+  std::optional<bool> paired_device_enabled(const proc::catalog::json &device) {
+    const auto enabled = device.find("enabled");
+    if (enabled == device.end()) {
+      return true;
     }
+    if (enabled->is_boolean()) {
+      return enabled->get<bool>();
+    }
+    if (*enabled == "true" || *enabled == "1" || (enabled->is_number_integer() && *enabled == 1)) {
+      return true;
+    }
+    if (*enabled == "false" || *enabled == "0" || (enabled->is_number_integer() && *enabled == 0)) {
+      return false;
+    }
+    return std::nullopt;
+  }
 
-    pt::ptree tree;
-    proc::catalog::json typed;
-    try {
-      std::ifstream file {config::nvhttp.file_state, std::ios::binary};
-      const std::string bytes {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
-      if (!file || file.bad()) {
-        throw std::runtime_error {"State file could not be read"};
+  /**
+   * @brief Validate legacy authority fields before restoring pairings from a document without a host ID.
+   */
+  void validate_clients_for_identity_migration(const proc::catalog::json &root, const pt::ptree &raw) {
+    if (const auto legacy = root.find("devices"); legacy != root.end() && *legacy != "") {
+      if (!legacy->is_array()) {
+        throw std::invalid_argument {"paired state: expected a legacy device array or empty string"};
       }
-      typed = proc::catalog::parse(bytes);
-      std::istringstream input {bytes};
-      pt::read_json(input, tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-
-      return;
+      for (const auto &device : *legacy) {
+        if (!device.contains("uniqueid") || !device.at("uniqueid").is_string()) {
+          throw std::invalid_argument {"paired state: invalid legacy device identity"};
+        }
+        const auto certs = device.find("certs");
+        if (certs != device.end() && *certs != "" && (!certs->is_array() || !std::ranges::all_of(*certs, [](const auto &cert) {
+              return cert.is_string();
+            }))) {
+          throw std::invalid_argument {"paired state: expected a legacy certificate array or empty string"};
+        }
+      }
     }
 
-    auto unique_id_p = tree.get_optional<std::string>("root.uniqueid");
-    if (!unique_id_p) {
-      // This file doesn't contain moonlight credentials
-      http::unique_id = uuid_util::uuid_t::generate().string();
+    const auto devices = root.find("named_devices");
+    if (devices == root.end() || !devices->is_array()) {
       return;
     }
-    http::unique_id = std::move(*unique_id_p);
+    std::size_t index = 0;
+    for (const auto &[_, node] : raw.get_child("named_devices")) {
+      const auto &device = devices->at(index++);
+      for (const auto *key : {"name", "cert", "uuid"}) {
+        if (!device.contains(key) || !device.at(key).is_string()) {
+          throw std::invalid_argument {"paired state: invalid paired-device identity"};
+        }
+      }
+      if (!paired_device_enabled(device).has_value()) {
+        throw std::invalid_argument {"paired state: invalid paired-device enable flag"};
+      }
+      const auto grant = device.find("permissions");
+      if (grant != device.end() && ((!grant->is_string() && !grant->is_number_integer()) || !permissions::parse(node.get<std::string>("permissions")))) {
+        throw std::invalid_argument {"paired state: invalid paired-device permission mask"};
+      }
+    }
+  }
 
-    auto root = tree.get_child("root");
+  /**
+   * @brief Decode paired clients from the same state snapshot used for the host identity.
+   */
+  client_t decode_clients(const pt::ptree &root, const proc::catalog::json &typed) {
     client_t client;
 
     // Import from old format
@@ -635,20 +707,24 @@ namespace nvhttp {
 
     if (root.count("named_devices")) {
       std::size_t index = 0;
+      const auto &devices = typed.at("root").at("named_devices");
       for (auto &[_, el] : root.get_child("named_devices")) {
+        const auto &node = devices.at(index++);
         named_cert_t named_cert;
         named_cert.name = el.get_child("name").get_value<std::string>();
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
-        named_cert.enabled = el.get<bool>("enabled", true);
+        const auto enabled = paired_device_enabled(node);
+        named_cert.enabled = enabled.value_or(false);
+        if (!enabled.has_value()) {
+          BOOST_LOG(warning) << "Invalid paired-client enable flag requires an explicit administrator update"sv;
+        }
         const auto grant = permissions::parse(el.get<std::string>("permissions", "0"));
         named_cert.permissions = grant.value_or(0);
         if (!grant) {
           BOOST_LOG(warning) << "Invalid paired-client permission mask requires an explicit administrator grant"sv;
         }
         try {
-          const auto &devices = typed.at("root").at("named_devices");
-          const auto &node = devices.at(index);
           if (node.contains("display")) {
             named_cert.display = display_policy::parse_device(node.at("display"));
           }
@@ -656,7 +732,6 @@ namespace nvhttp {
           named_cert.display_valid = false;
           BOOST_LOG(warning) << "Invalid paired-client display preferences require an explicit administrator update"sv;
         }
-        ++index;
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -667,13 +742,100 @@ namespace nvhttp {
         named_cert.cert = std::move(canonical_certificate);
       }
     }
+    return client;
+  }
 
-    std::lock_guard lock {client_auth_mutex()};
-    for (auto &device : client.named_devices) {
-      device.revision = ++authorization_revision;
+  void initialize_state() {
+    host_id_durable = false;
+    if (config::sunshine.flags[config::flag::FRESH_STATE]) {
+      return;
     }
-    client_root = std::move(client);
-    rebuild_client_cert_chain();
+
+    http::unique_id.clear();
+    std::string generated_id;
+    const auto generate_id = [&]() -> const std::string & {
+      if (generated_id.empty()) {
+        generated_id = uuid_util::uuid_t::generate().string();
+      }
+      return generated_id;
+    };
+    const auto &path = config::nvhttp.file_state;
+    std::optional<std::string> effective_id;
+    client_t clients;
+    const auto decode_state = [&](const std::string &bytes) {
+      auto typed = proc::catalog::parse(bytes);
+      std::istringstream input {bytes};
+      pt::ptree tree;
+      pt::read_json(input, tree);
+      const auto value = tree.get_optional<std::string>("root.uniqueid");
+      effective_id = value ? *value : generate_id();
+      const auto root = typed.find("root");
+      if (!typed.is_object() || (root != typed.end() && !root->is_object())) {
+        throw std::invalid_argument {"paired state: expected document and root objects"};
+      }
+      if (root != typed.end()) {
+        validate_named_devices(*root);
+        const auto &raw = tree.get_child("root");
+        if (!root->contains("uniqueid")) {
+          validate_clients_for_identity_migration(*root, raw);
+        }
+        clients = decode_clients(raw, typed);
+      }
+      return typed;
+    };
+    bool valid_id = false;
+    const bool durable = http::update_host_identity_state(path, [&](const std::string &original) -> std::optional<std::string> {
+      auto tree = original.empty() && !fs::exists(path) ? proc::catalog::json::object() : decode_state(original);
+      if (!tree.contains("root")) {
+        tree["root"] = proc::catalog::json::object();
+      }
+      auto &root = tree["root"];
+      if (const auto id = root.find("uniqueid"); id != root.end()) {
+        valid_id = effective_id && id->is_string() && id->get_ref<const std::string &>() == *effective_id && valid_host_uuid(*effective_id);
+        return std::nullopt;
+      }
+      root["uniqueid"] = generate_id();
+      valid_id = true;
+      return tree.dump(2) + "\n";
+    });
+
+    try {
+      if (!durable) {
+        // Recover the ordinary GameStream identity and paired records even if protected preparation was refused.
+        effective_id.reset();
+        clients = {};
+        if (fs::exists(path)) {
+          if (!fs::is_regular_file(path)) {
+            throw std::runtime_error {"State path is not a regular file"};
+          }
+          std::ifstream file {path, std::ios::binary};
+          const std::string bytes {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+          if (!file || file.bad()) {
+            throw std::runtime_error {"State file could not be read"};
+          }
+          decode_state(bytes);
+        }
+      }
+      if (!effective_id) {
+        effective_id = generate_id();
+      }
+      std::lock_guard lock {client_auth_mutex()};
+      for (auto &device : clients.named_devices) {
+        device.revision = ++authorization_revision;
+      }
+      client_root = std::move(clients);
+      rebuild_client_cert_chain();
+      host_id_durable = durable && valid_id;
+    } catch (const std::exception &) {
+      BOOST_LOG(error) << "Couldn't load paired state from "sv << path;
+    }
+    if (effective_id) {
+      http::unique_id = std::move(*effective_id);
+    }
+  }
+
+  std::optional<std::string_view> shortcut_host_uuid() {
+    return host_id_durable ? std::optional<std::string_view> {http::unique_id} : std::nullopt;
   }
 
   /**
@@ -712,7 +874,7 @@ namespace nvhttp {
       });
       named_cert.revision = ++authorization_revision;
       candidate.named_devices.emplace_back(std::move(named_cert));
-      if (!config::sunshine.flags[config::flag::FRESH_STATE] && !save_state(candidate)) {
+      if (!save_state(candidate)) {
         return {};
       }
       client_root = std::move(candidate);
@@ -1995,6 +2157,7 @@ namespace nvhttp {
     if (rtsp_stream::has_source_backend()) {
       struct application_operation_t {
         bool execute = false;
+        bool selector_unavailable = false;
         std::uint64_t instance = 0;
       };
 
@@ -2021,6 +2184,7 @@ namespace nvhttp {
         try {
           selected = proc::catalog::resolve(args.contains("appid") ? std::optional {get_arg(args, "appid")} : std::nullopt, args.contains("appuuid") ? std::optional {get_arg(args, "appuuid")} : std::nullopt, applications, selected_current, resuming);
         } catch (const proc::catalog::error &error) {
+          application->selector_unavailable = error.status == 404;
           return {error.status, {}};
         }
         const bool same = selected == selected_current && (selected_current.first > 0 || active.managed);
@@ -2133,7 +2297,10 @@ namespace nvhttp {
       }
       tree.put("root.<xmlattr>.status_code", status);
       if (status != 200) {
-        tree.put("root.<xmlattr>.status_message", status == 403 ? "Permission denied or required encryption unavailable" : "Managed source preparation failed or another operation is pending");
+        const auto message = status == 404 && application->selector_unavailable ? "The requested application is no longer available" :
+                             status == 403                                      ? "Permission denied or required encryption unavailable" :
+                                                                                  "Managed source preparation failed or another operation is pending";
+        tree.put("root.<xmlattr>.status_message", message);
         return;
       }
       tree.put("root.sessionUrl0", std::format("{}{}:{}", session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
@@ -2142,6 +2309,7 @@ namespace nvhttp {
     }
     bool configured = false;
     bool started_application = false;
+    bool selector_unavailable = false;
     const auto status = rtsp_stream::prepare_launch(session, [&]() {
       const auto client = current_client(identity.uuid, identity.cert);
       if (!client || !permissions::allows(client->permissions, permissions::view)) {
@@ -2164,6 +2332,7 @@ namespace nvhttp {
       try {
         selected = proc::catalog::resolve(args.contains("appid") ? std::optional {get_arg(args, "appid")} : std::nullopt, args.contains("appuuid") ? std::optional {get_arg(args, "appuuid")} : std::nullopt, applications, current_identity, resuming);
       } catch (const proc::catalog::error &error) {
+        selector_unavailable = error.status == 404;
         return error.status;
       }
       target = selected.first;
@@ -2236,7 +2405,10 @@ namespace nvhttp {
                                                     });
     tree.put("root.<xmlattr>.status_code", status);
     if (status != 200) {
-      tree.put("root.<xmlattr>.status_message", status == 403 ? "Permission denied or required encryption unavailable" : "Stream preparation failed or another session is pending");
+      const auto message = status == 404 && selector_unavailable ? "The requested application is no longer available" :
+                           status == 403                         ? "Permission denied or required encryption unavailable" :
+                                                                   "Stream preparation failed or another session is pending";
+      tree.put("root.<xmlattr>.status_message", message);
       return;
     }
     tree.put("root.sessionUrl0", std::format("{}{}:{}", session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
@@ -2366,12 +2538,6 @@ namespace nvhttp {
     auto port_http = net::map_port(PORT_HTTP);
     auto port_https = net::map_port(PORT_HTTPS);
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
-
-    bool clean_slate = config::sunshine.flags[config::flag::FRESH_STATE];
-
-    if (!clean_slate) {
-      load_state();
-    }
 
     auto pkey = file_handler::read_file(config::nvhttp.pkey.c_str());
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
@@ -2719,7 +2885,7 @@ namespace nvhttp {
     }
 
     void reload_client_state() {
-      load_state();
+      initialize_state();
     }
   }  // namespace test_support
 #endif

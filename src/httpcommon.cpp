@@ -39,6 +39,7 @@
   #include <winioctl.h>
 #else
   #include <fcntl.h>
+  #include <sys/file.h>
   #include <sys/stat.h>
   #include <unistd.h>
   #if defined(__linux__)
@@ -112,15 +113,29 @@ namespace http {
     /** @brief Keep the legacy always-writing callback distinct from byte preparation that may be read-only. */
     enum class state_update_intent_e {
       replacement,  ///< Refuse write-ineligible originals before invoking the callback.
-      preparation  ///< Permit exact read-only inspection; a requested replacement still requires write eligibility.
+      preparation,  ///< Permit exact read-only inspection; a requested replacement still requires write eligibility.
+      host_identity  ///< Byte preparation with a cross-process startup guard on POSIX.
     };
 
 #ifndef _WIN32
     /**
      * @brief Read complete binary bytes and explicitly check native read and close errors before preparation.
      */
-    bool read_state_bytes(const fs::path &path, std::string &bytes) {
-      auto *input = std::fopen(path.c_str(), "rb");
+    bool read_state_bytes(const fs::path &path, std::string &bytes, int directory = AT_FDCWD) {
+      std::FILE *input = nullptr;
+      if (directory == AT_FDCWD) {
+        input = std::fopen(path.c_str(), "rb");
+      } else {
+        const auto file = ::openat(directory, path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        if (file < 0) {
+          return false;
+        }
+        struct stat metadata {};
+        if (::fstat(file, &metadata) || !S_ISREG(metadata.st_mode) || !(input = ::fdopen(file, "rb"))) {
+          ::close(file);
+          return false;
+        }
+      }
       if (!input) {
         return false;
       }
@@ -1382,12 +1397,35 @@ namespace http {
     const auto temporary = fs::path {destination.string() + ".tmp-" + suffix};
     const auto backup = fs::path {destination.string() + ".backup-" + suffix};
 #ifdef _WIN32
-    return update_windows_state(destination, temporary, backup, identity, prepare, intent);
+    return update_windows_state(destination, temporary, backup, identity, prepare, intent == state_update_intent_e::host_identity ? state_update_intent_e::preparation : intent);
 #else
-    (void) intent;
+    const bool host_identity = intent == state_update_intent_e::host_identity;
+    const auto parent = destination.has_parent_path() ? destination.parent_path() : fs::path {"."};
+    const int directory = host_identity ? ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC) : AT_FDCWD;
+    auto close_directory = util::fail_guard([&]() {
+      if (host_identity && directory >= 0) {
+        ::close(directory);
+      }
+    });
+    struct stat locked_parent {};
+    if (host_identity && (directory < 0 || ::flock(directory, LOCK_EX | LOCK_NB) || ::fstat(directory, &locked_parent))) {
+      BOOST_LOG(warning) << "Could not lock the state directory for host identity initialization"sv;
+      return false;
+    }
+    const auto parent_matches = [&]() {
+      struct stat current {};
+      return ::stat(parent.c_str(), &current) == 0 && current.st_dev == locked_parent.st_dev && current.st_ino == locked_parent.st_ino;
+    };
+    const auto state_name = host_identity ? destination.filename() : destination;
+    const auto temporary_name = host_identity ? temporary.filename() : temporary;
+    bool temporary_owned = false;
     bool preserve_recovery_files = false;
     auto cleanup = util::fail_guard([&]() {
-      if (!preserve_recovery_files) {
+      if (host_identity) {
+        if (temporary_owned) {
+          ::unlinkat(directory, temporary_name.c_str(), 0);
+        }
+      } else if (!preserve_recovery_files) {
         std::error_code error;
         fs::remove(temporary, error);
         fs::remove(backup, error);
@@ -1395,21 +1433,45 @@ namespace http {
     });
     try {
       std::string original;
-      const bool existed = fs::exists(destination);
-      if (existed) {
-        if (!read_state_bytes(destination, original)) {
+      struct stat original_metadata {};
+      bool existed = false;
+      if (host_identity) {
+        existed = ::fstatat(directory, state_name.c_str(), &original_metadata, AT_SYMLINK_NOFOLLOW) == 0;
+        if (existed ? !S_ISREG(original_metadata.st_mode) : errno != ENOENT) {
           return false;
         }
+      } else {
+        existed = fs::exists(destination);
       }
+      if (existed && !read_state_bytes(state_name, original, directory)) {
+        return false;
+      }
+      const auto original_matches = [&]() {
+        if (!parent_matches()) {
+          return false;
+        }
+        struct stat current {};
+        if (::fstatat(directory, state_name.c_str(), &current, AT_SYMLINK_NOFOLLOW)) {
+          return !existed && errno == ENOENT;
+        }
+        std::string latest;
+        return existed && current.st_dev == original_metadata.st_dev && current.st_ino == original_metadata.st_ino &&
+               current.st_mode == original_metadata.st_mode && current.st_uid == original_metadata.st_uid && current.st_gid == original_metadata.st_gid &&
+               read_state_bytes(state_name, latest, directory) && latest == original;
+      };
       const auto replacement = prepare(original);
       if (!replacement) {
-        return true;
+        return !host_identity || original_matches();
+      }
+      if (host_identity && existed && !(original_metadata.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
+        return false;
       }
       const auto &bytes = *replacement;
-      int handle = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+      int handle = ::openat(directory, temporary_name.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
       if (handle < 0) {
         return false;
       }
+      temporary_owned = true;
       auto close = util::fail_guard([&]() {
         if (handle >= 0) {
           ::close(handle);
@@ -1420,8 +1482,8 @@ namespace http {
           BOOST_LOG(error) << "State update refused because its access ACL cannot be preserved"sv;
           return false;
         }
-        struct stat metadata {};
-        if (::stat(destination.c_str(), &metadata) || ::fchown(handle, metadata.st_uid, metadata.st_gid) || ::fchmod(handle, metadata.st_mode & 07777)) {
+        auto metadata = original_metadata;
+        if ((!host_identity && ::stat(destination.c_str(), &metadata)) || ::fchown(handle, metadata.st_uid, metadata.st_gid) || ::fchmod(handle, metadata.st_mode & 07777)) {
           return false;
         }
       }
@@ -1434,10 +1496,12 @@ namespace http {
         state_update_hook();
       }
   #endif
-      // Detect external edits observed before writing. Arbitrary external writers must still cooperate.
-      std::string latest;
-      if (fs::exists(destination) != existed || (existed && (!read_state_bytes(destination, latest) || latest != original))) {
-        return false;
+      if (!host_identity) {
+        // Detect external edits observed before writing. Arbitrary external writers must still cooperate.
+        std::string latest;
+        if (fs::exists(destination) != existed || (existed && (!read_state_bytes(destination, latest) || latest != original))) {
+          return false;
+        }
       }
       std::size_t written = 0;
       while (written < bytes.size()) {
@@ -1453,8 +1517,29 @@ namespace http {
       if (::fsync(handle)) {
         return false;
       }
-      ::close(handle);
+      const auto close_result = ::close(handle);
       handle = -1;
+      if (host_identity) {
+        if (close_result || !original_matches()) {
+          return false;
+        }
+  #ifdef SUNSHINE_TESTS
+        if (state_replace_hook && state_replace_hook(destination, temporary, backup)) {
+          return false;
+        }
+  #endif
+        if (!parent_matches()) {
+          return false;
+        }
+        // Publish the complete new file only if the destination is still absent.
+        const int committed = existed ? ::renameat(directory, temporary_name.c_str(), directory, state_name.c_str()) :
+                                        ::linkat(directory, temporary_name.c_str(), directory, state_name.c_str(), 0);
+        if (committed) {
+          return false;
+        }
+        std::string saved;
+        return ::fsync(directory) == 0 && read_state_bytes(state_name, saved, directory) && saved == bytes && parent_matches();
+      }
       fs::rename(temporary, destination);
       return true;
     } catch (const std::exception &) {
@@ -1481,6 +1566,10 @@ namespace http {
 
   bool update_state_file_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare) {
     return update_state_bytes(file, prepare, state_update_intent_e::preparation);
+  }
+
+  bool update_host_identity_state(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare) {
+    return update_state_bytes(file, prepare, state_update_intent_e::host_identity);
   }
 
 #ifdef SUNSHINE_TESTS

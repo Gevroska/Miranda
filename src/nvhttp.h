@@ -80,10 +80,20 @@ namespace nvhttp {
   constexpr auto PAIRING_SESSION_TIMEOUT = std::chrono::minutes {5};
 
   /**
+   * @brief Initialize GameStream identity and paired clients before starting either HTTP listener.
+   * @pre Shared HTTP initialization has prepared the ephemeral identity in fresh-state mode.
+   */
+  void initialize_state();
+
+  /**
+   * @brief Return the exact durable GameStream UUID for application shortcut exports.
+   * @return Case-preserved host UUID, or no value when validated persistent identity is unavailable.
+   */
+  std::optional<std::string_view> shortcut_host_uuid();
+
+  /**
    * @brief Start the nvhttp server.
-   * @examples
-   * nvhttp::start();
-   * @examples_end
+   * @pre Shared HTTP and GameStream state have been initialized.
    */
   void start();
 

@@ -34,6 +34,15 @@ namespace http {
   bool update_state_file_bytes(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare);
 
   /**
+   * @brief Verify or initialize the persistent GameStream host identity during startup.
+   * @param file Configured pairing-state file.
+   * @param prepare Read-only inspection or replacement using the captured state bytes.
+   * @return Whether the read snapshot or committed replacement was verified.
+   * @note POSIX serializes cooperating initializers through an advisory parent-directory lock. Busy or unsupported filesystems and read-only originals refuse writes. Other writers must cooperate for existing-file replacement.
+   */
+  bool update_host_identity_state(const std::string &file, const std::function<std::optional<std::string>(const std::string &)> &prepare);
+
+  /**
    * @brief Serialize a shared JSON read/modify/verified-replacement transaction.
    * @param file State or credentials file; separate configured paths are supported.
    * @param update Mutation preserving all unrelated JSON fields.
@@ -111,7 +120,7 @@ namespace http {
     bool state_selected_security_matches(std::vector<std::uint8_t> expected, std::vector<std::uint8_t> current, bool scope = false);
   #endif
     /**
-     * @brief Inspect or fault the replacing rename using only test-owned files.
+     * @brief Inspect or fault the native commit boundary using only test-owned files.
      * @param hook Returns an error after optional fixture mutation, or no value for the native operation.
      */
     void set_state_replace_hook(std::function<std::optional<std::uint32_t>(const std::filesystem::path &, const std::filesystem::path &, const std::filesystem::path &)> hook);

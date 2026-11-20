@@ -909,6 +909,33 @@ namespace {
     EXPECT_FALSE(server);
   }
 
+  TEST_F(HttpsClientIdentityTest, ServerinfoAdvertisesTheExactShortcutHostIdentity) {
+    constexpr auto host_uuid = "aB123456-ABcd-4111-8222-00EF12345678";
+    const auto previous_host_id = http::unique_id;
+    const auto previous_host_name = config::nvhttp.sunshine_name;
+    const auto restore = util::fail_guard([&]() {
+      stop_server();
+      config::sunshine.flags[config::flag::FRESH_STATE] = true;
+      nvhttp::initialize_state();
+      http::unique_id = previous_host_id;
+      config::nvhttp.sunshine_name = previous_host_name;
+    });
+    const auto devices = nlohmann::json::array({{{"name", "client A"}, {"cert", credentials_a.x509}, {"uuid", uuid_a}}});
+    std::ofstream {config::nvhttp.file_state} << nlohmann::json {{"root", {{"uniqueid", host_uuid}, {"named_devices", devices}}}};
+    config::sunshine.flags[config::flag::FRESH_STATE] = false;
+    config::nvhttp.sunshine_name = "Room & Office";
+    nvhttp::initialize_state();
+    ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+    EXPECT_EQ(*nvhttp::shortcut_host_uuid(), host_uuid);
+
+    start_server(true, true);
+    const auto metadata = exchange("/serverinfo?uniqueid=fixture");
+    EXPECT_TRUE(metadata.contains("status_code=\"200\""));
+    EXPECT_TRUE(metadata.contains("<uniqueid>" + std::string {*nvhttp::shortcut_host_uuid()} + "</uniqueid>"));
+    EXPECT_TRUE(metadata.contains("<hostname>Room &amp; Office</hostname>"));
+    EXPECT_TRUE(metadata.contains("<Permission>0</Permission>"));
+  }
+
   TEST_F(HttpsClientIdentityTest, ZeroGrantProductionRoutesDenyActionsAndHideRestrictedMetadata) {
     isolate_catalog();
     start_server(true, true);
@@ -1267,7 +1294,9 @@ namespace {
     EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
     proc::proc.terminate();
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
-    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + selected.second)).contains("status_code=\"404\""));
+    const auto stale = exchange(stream_path("/launch", "&appid=-1&appuuid=" + selected.second));
+    expect_stream_rejection(stale, "/launch", 404);
+    EXPECT_TRUE(stale.contains("status_message=\"The requested application is no longer available\""));
     EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
   }
 
@@ -1667,6 +1696,20 @@ namespace {
     EXPECT_EQ(undo_count->load(), 0);
   }
 
+  TEST_F(ManagedHttpsProcessTest, MissingShortcutSelectorReportsUnavailableBeforeSourcePreparation) {
+    ASSERT_EQ(proc::delete_catalog_app(config::stream.file_apps, initial["revision"], app_b.second).status, 200);
+    for (const auto &route : {"/launch", "/resume"}) {
+      SCOPED_TRACE(route);
+      const auto stale = read_response(*begin_request(launch_path(app_b.second, route)));
+      expect_stream_rejection(stale, route, 404);
+      EXPECT_TRUE(stale.contains("status_message=\"The requested application is no longer available\""));
+      EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    }
+    EXPECT_EQ(backend->begins, 0);
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_EQ(undo_count->load(), 0);
+  }
+
   TEST_F(ManagedHttpsProcessTest, RemovedSelectedAppBeforeExecutePreservesOriginalIncarnationAndUndo) {
     std::promise<void> release;
     backend->gate = release.get_future().share();
@@ -1674,7 +1717,9 @@ namespace {
     ASSERT_EQ(backend->began.get_future().wait_for(2s), std::future_status::ready);
     ASSERT_EQ(proc::delete_catalog_app(config::stream.file_apps, initial["revision"], app_b.second).status, 200);
     release.set_value();
-    EXPECT_TRUE(read_response(*launching).contains("status_code=\"404\""));
+    const auto failed = read_response(*launching);
+    expect_stream_rejection(failed, "/launch", 404);
+    EXPECT_TRUE(failed.contains("status_message=\"Managed source preparation failed or another operation is pending\""));
     ASSERT_TRUE(drain_source());
     EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
     EXPECT_TRUE(proc::proc.lifetime_snapshot().tracked);

@@ -1270,7 +1270,14 @@ namespace confighttp {
 
     print_req(request);
 
-    const auto result = proc::read_catalog(config::stream.file_apps);
+    auto result = proc::read_catalog(config::stream.file_apps);
+    if (result.status == 200) {
+      auto catalog = nlohmann::ordered_json::parse(result.body);
+      const auto host_uuid = nvhttp::shortcut_host_uuid();
+      catalog["host_uuid"] = host_uuid ? nlohmann::ordered_json(*host_uuid) : nlohmann::ordered_json(nullptr);
+      catalog["host_name"] = config::nvhttp.sunshine_name;
+      result.body = catalog.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+    }
     response->write(static_cast<SimpleWeb::StatusCode>(result.status), result.body, {{"Content-Type", "application/json"}});
   }
 

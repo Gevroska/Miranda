@@ -19,6 +19,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <thread>
 #include <utility>
@@ -2442,6 +2443,96 @@ protected:
     return result;
   }
 };
+
+/**
+ * @brief Start the real catalog handler with initialized, valid or unavailable shortcut identity.
+ */
+class AppShortcutCatalogApiTest: public AppCatalogApiTest, public testing::WithParamInterface<bool> {
+protected:
+  static constexpr auto mixed_case_uuid = "aB123456-ABcd-4111-8222-00EF12345678";
+  static constexpr auto configured_name = "Room & Office";
+  std::string previous_state_file;
+  std::string previous_host_id;
+  std::string previous_host_name;
+  bool previous_fresh_state = false;
+
+  static std::string file_bytes(const std::string &path) {
+    std::ifstream file {path, std::ios::binary};
+    return {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+  }
+
+  void SetUp() override {
+    previous_state_file = config::nvhttp.file_state;
+    previous_host_id = http::unique_id;
+    previous_host_name = config::nvhttp.sunshine_name;
+    previous_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    config::sunshine.flags[config::flag::FRESH_STATE] = false;
+    config::nvhttp.file_state = (std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "app_shortcut_host.json").string();
+    config::nvhttp.sunshine_name = configured_name;
+    std::ofstream {config::nvhttp.file_state} << nlohmann::json {{"root", {{"uniqueid", GetParam() ? mixed_case_uuid : "invalid persisted ID"}}}};
+    nvhttp::initialize_state();
+    AppCatalogApiTest::SetUp();
+  }
+
+  void TearDown() override {
+    AppCatalogApiTest::TearDown();
+    std::error_code cleanup_error;
+    std::filesystem::remove(config::nvhttp.file_state, cleanup_error);
+    config::nvhttp.file_state = previous_state_file;
+    config::nvhttp.sunshine_name = previous_host_name;
+    config::sunshine.flags[config::flag::FRESH_STATE] = true;
+    nvhttp::initialize_state();
+    http::unique_id = previous_host_id;
+    config::sunshine.flags[config::flag::FRESH_STATE] = previous_fresh_state;
+  }
+};
+
+TEST_P(AppShortcutCatalogApiTest, AuthorizedReadKeepsRevisionAndOverwritesOnlyResponseMetadata) {
+  const auto host_state = file_bytes(config::nvhttp.file_state);
+  constexpr auto apps = R"({"env":{},"host_name":{"foreign":false},"apps":[{"name":"Z","foreign":{"second":1,"first":2}},{"name":"A"}],"host_uuid":"deaddead-dead-dead-dead-deaddeaddead"})";
+  std::ofstream {config::stream.file_apps} << apps;
+
+  const auto denied = client->request("GET", "/api/apps");
+  EXPECT_TRUE(denied->status_code.starts_with("401"));
+  EXPECT_FALSE(denied->content.string().contains("host_uuid"));
+  EXPECT_FALSE(denied->content.string().contains("host_name"));
+  EXPECT_EQ(file_bytes(config::stream.file_apps), apps);
+
+  const auto fetched = client->request("GET", "/api/apps", "", headers(false));
+  ASSERT_EQ(fetched->status_code, "200 OK");
+  const auto catalog = nlohmann::ordered_json::parse(fetched->content.string());
+  EXPECT_EQ(catalog.at("host_name"), configured_name);
+  if (GetParam()) {
+    EXPECT_EQ(catalog.at("host_uuid"), mixed_case_uuid);
+    EXPECT_EQ(catalog.at("host_uuid"), http::unique_id);
+  } else {
+    EXPECT_TRUE(catalog.at("host_uuid").is_null());
+  }
+
+  const auto bytes = file_bytes(config::stream.file_apps);
+  const auto stored = nlohmann::ordered_json::parse(bytes);
+  EXPECT_EQ(stored.at("host_name"), (nlohmann::ordered_json {{"foreign", false}}));
+  EXPECT_EQ(stored.at("host_uuid"), "deaddead-dead-dead-dead-deaddeaddead");
+  EXPECT_EQ(catalog.at("apps"), stored.at("apps"));
+  EXPECT_EQ(catalog["apps"][0]["name"], "Z");
+  EXPECT_EQ(catalog["apps"][0]["foreign"].begin().key(), "second");
+  EXPECT_EQ(catalog["apps"][1]["name"], "A");
+  EXPECT_EQ(catalog.at("revision"), util::hex(crypto::hash(bytes)).to_string());
+  const auto repeated = client->request("GET", "/api/apps", "", headers(false));
+  ASSERT_EQ(repeated->status_code, "200 OK");
+  EXPECT_EQ(nlohmann::ordered_json::parse(repeated->content.string()), catalog);
+  EXPECT_EQ(file_bytes(config::stream.file_apps), bytes);
+  EXPECT_EQ(file_bytes(config::nvhttp.file_state), host_state);
+
+  std::ofstream {config::stream.file_apps} << "{";
+  const auto expected_error = proc::read_catalog(config::stream.file_apps);
+  ASSERT_NE(expected_error.status, 200);
+  const auto failed = client->request("GET", "/api/apps", "", headers(false));
+  EXPECT_TRUE(failed->status_code.starts_with(std::to_string(expected_error.status)));
+  EXPECT_EQ(failed->content.string(), expected_error.body);
+}
+
+INSTANTIATE_TEST_SUITE_P(HostIdentity, AppShortcutCatalogApiTest, testing::Bool());
 
 TEST_F(AppCatalogApiTest, RevisionAndUuidPreconditionsRejectStaleTabsAndKeepUnknownFields) {
   const auto fetched = client->request("GET", "/api/apps", "", headers(false));
