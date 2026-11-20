@@ -20,7 +20,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
+
+// lib includes
+#include <boost/property_tree/xml_parser.hpp>
 
 // local includes
 #include <src/app_catalog.h>
@@ -1092,6 +1096,56 @@ namespace {
     EXPECT_TRUE(listed.contains("<UUID>" + selected.second + "</UUID>"));
     EXPECT_TRUE(listed.contains("<ID>" + std::to_string(selected.first) + "</ID>"));
     EXPECT_TRUE(listed.contains("<IDX>0</IDX>"));
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, ReorderedCatalogKeepsProtocolIdentityGrantsAndLaunchTargets) {
+    using row_t = std::tuple<std::size_t, int, std::string>;
+    const auto &other = initial.at("apps").at(1);
+    const auto other_uuid = other.at("uuid").get<std::string>();
+    const auto other_id = std::stoi(other.at("id").get<std::string>());
+    const auto read_list = [&](int status) {
+      std::istringstream response {exchange("/applist")};
+      boost::property_tree::ptree xml;
+      boost::property_tree::read_xml(response, xml);
+      const auto &root = xml.get_child("root");
+      EXPECT_EQ(root.get<int>("<xmlattr>.status_code"), status);
+      std::vector<row_t> rows;
+      for (const auto &[tag, row] : root) {
+        if (tag == "App") {
+          rows.emplace_back(row.get<std::size_t>("IDX"), row.get<int>("ID"), row.get<std::string>("UUID"));
+        }
+      }
+      return rows;
+    };
+
+    EXPECT_TRUE(read_list(403).empty());
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::list | permissions::view));
+    const std::vector<row_t> original {{0, selected.first, selected.second}, {1, other_id, other_uuid}};
+    const std::vector<row_t> reversed {{0, other_id, other_uuid}, {1, selected.first, selected.second}};
+    EXPECT_EQ(read_list(200), original);
+
+    const auto order = proc::catalog::json {{"order", {other_uuid, selected.second}}}.dump();
+    const auto result = proc::reorder_catalog_apps(config::stream.file_apps, initial.at("revision").get<std::string>(), order);
+    ASSERT_EQ(result.status, 200) << result.body;
+    EXPECT_EQ(read_list(200), reversed);
+    EXPECT_EQ(proc::proc.active_identity(), selected);
+    for (const auto &selectors : {"&appid=" + std::to_string(selected.first), "&appuuid=" + selected.second, "&appid=-1&appuuid=" + selected.second}) {
+      SCOPED_TRACE(selectors);
+      const auto launched = exchange(stream_path("/launch", selectors));
+      ASSERT_TRUE(launched.contains("status_code=\"200\"")) << launched;
+      const auto token = rtsp_stream::test_support::pending_launch();
+      ASSERT_TRUE(token);
+      EXPECT_EQ(token->appid, selected.first);
+      EXPECT_EQ(token->app_uuid, selected.second);
+      rtsp_stream::stop_application({});
+    }
+
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, 0));
+    EXPECT_TRUE(read_list(403).empty());
+    proc::proc.terminate();
+    proc::proc = proc::proc_t {};
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::list));
+    EXPECT_EQ(read_list(200), reversed);
   }
 
   TEST_F(HttpsApplicationIdentityTest, ViewOnlySameAppSelectorsPrepareFreshSourceWithoutExecutingEditedCommands) {

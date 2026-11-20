@@ -340,7 +340,7 @@ describe('application catalog revisions', () => {
   });
 });
 
-describe('Artemis application shortcuts', () => {
+describe('Apps page', () => {
   const hostUuid = 'A1111111-1111-4111-8111-111111111111'
   const appUuid = 'b2222222-2222-4222-8222-222222222222'
   const otherAppUuid = 'c3333333-3333-4333-8333-333333333333'
@@ -362,7 +362,7 @@ describe('Artemis application shortcuts', () => {
     }
   }
 
-  async function mountApps(overrides) {
+  async function mountApps(overrides, attachTo) {
     fetchCatalog = vi.fn().mockResolvedValue(catalogResponse(overrides))
     vi.stubGlobal('fetch', vi.fn(url => {
       if (url === './api/apps') return fetchCatalog()
@@ -374,7 +374,8 @@ describe('Artemis application shortcuts', () => {
       }
       throw new Error('Unexpected request ' + url)
     }))
-    page = mount(Apps, { global: { mocks: { $t: key => key }, stubs: { 'i18n-t': true } } })
+    const translate = (key, params) => params?.position ? `${key} ${params.name} ${params.position}` : key
+    page = mount(Apps, { attachTo, global: { mocks: { $t: translate }, stubs: { 'i18n-t': true } } })
     await flushPromises()
   }
 
@@ -576,5 +577,304 @@ describe('Artemis application shortcuts', () => {
     await earlierReload
     expect(page.find(open).exists()).toBe(false)
     expect(page.vm.catalogRevision).toBe('revision-B')
+  })
+
+  describe('persistent application order', () => {
+    const thirdAppUuid = 'd4444444-4444-4444-8444-444444444444'
+    const catalog = [
+      { uuid: appUuid, name: 'Room A', 'image-path': 'first.png' },
+      { uuid: otherAppUuid, name: 'Room A', 'image-path': 'second.png' },
+      { uuid: thirdAppUuid, name: 'A Room', 'image-path': 'third.png' },
+    ]
+    const initialOrder = catalog.map(app => app.uuid)
+    const button = (label, parent = page) => parent.findAll('button').find(item => item.text() === label)
+    const reorder = () => button('apps.reorder_apps')
+    const dialog = () => page.get('dialog')
+    const rows = () => dialog().findAll('li')
+    const moves = index => rows()[index].findAll('button')
+    const saveOrder = () => dialog().get('button[type="submit"]')
+    const submit = () => dialog().get('form').trigger('submit')
+    const covers = () => page.findAll('.app-poster').map(img => img.attributes('src'))
+    const coverUrls = ids => ids.map(uuid => '/api/covers/' + uuid)
+    const visibleShortcuts = () => page.findAll(open).map(link => new URL(link.attributes('href')).searchParams.get('app_uuid'))
+    const escape = () => dialog().element.dispatchEvent(new Event('cancel', { cancelable: true }))
+
+    async function mountOrderPage(overrides = {}) {
+      await mountApps({ apps: catalog, ...overrides }, document.body)
+      // jsdom exposes the dialog element but does not implement its native modal methods.
+      const element = dialog().element
+      element.showModal = () => { element.open = true }
+      element.close = () => { element.open = false }
+    }
+
+    async function startReorder() {
+      await reorder().trigger('click')
+      expect(dialog().element.open).toBe(true)
+    }
+
+    it('requires a successfully loaded multi-app catalog with a revision', async () => {
+      await mountOrderPage({ apps: catalog.slice(0, 1) })
+      expect(reorder()).toBeUndefined()
+
+      fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: catalog, revision: '' }))
+      await page.vm.loadApps()
+      expect(reorder().element.disabled).toBe(true)
+
+      fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: catalog }))
+      await page.vm.loadApps()
+      expect(reorder().element.disabled).toBe(false)
+
+      const refresh = Promise.withResolvers()
+      fetchCatalog.mockReturnValueOnce(refresh.promise)
+      const loading = page.vm.loadApps()
+      await page.vm.$nextTick()
+      expect(reorder().element.disabled).toBe(true)
+      refresh.reject(new Error('Read failed'))
+      await loading
+      expect(reorder().element.disabled).toBe(true)
+      expect(covers()).toEqual(coverUrls(initialOrder))
+      expect(visibleShortcuts()).toEqual([])
+    })
+
+    it('stages all apps in committed order under search and name sorting and gives duplicate names distinct move controls', async () => {
+      await mountOrderPage()
+      await page.get('.apps-toolbar button[aria-pressed]').trigger('click')
+      expect(covers()).toEqual(coverUrls([thirdAppUuid, appUuid, otherAppUuid]))
+      await page.get('#app-search').setValue('Room A')
+      expect(visibleShortcuts()).toEqual([appUuid, otherAppUuid])
+      await startReorder()
+
+      expect(dialog().attributes('aria-labelledby')).toBe(dialog().get('h2').attributes('id'))
+      expect(rows().map(row => row.get('div.flex-grow-1 > div').text())).toEqual(['Room A', 'Room A', 'A Room'])
+      expect(dialog().findAll('code').map(code => code.text())).toEqual([appUuid, otherAppUuid])
+      expect(moves(0)[0].element.disabled).toBe(true)
+      expect(moves(0)[1].attributes('aria-label')).toBe('apps.reorder_move_down Room A 1')
+      const moveUp = moves(1)[0]
+      expect(moveUp.attributes('aria-label')).toBe('apps.reorder_move_up Room A 2')
+      expect(moveUp.attributes('type')).toBe('button')
+      moveUp.element.focus()
+      expect(document.activeElement).toBe(moveUp.element)
+      await moveUp.trigger('click')
+      expect(document.activeElement).toBe(moves(0)[1].element)
+      expect(dialog().findAll('code').map(code => code.text())).toEqual([otherAppUuid, appUuid])
+      expect(saveOrder().element.disabled).toBe(false)
+      expect(covers()).toEqual(coverUrls([appUuid, otherAppUuid]))
+      expect(visibleShortcuts()).toEqual([appUuid, otherAppUuid])
+
+      await button('_common.cancel', dialog()).trigger('click')
+      expect(dialog().element.open).toBe(false)
+      expect(document.activeElement).toBe(reorder().element)
+      expect(apiFetch).not.toHaveBeenCalled()
+      await startReorder()
+      expect(dialog().findAll('code').map(code => code.text())).toEqual([appUuid, otherAppUuid])
+    })
+
+    it('skips unchanged orders including after undoing moves and supports native cancel', async () => {
+      await mountOrderPage()
+      await startReorder()
+      expect(saveOrder().element.disabled).toBe(true)
+      await submit()
+      await moves(0)[1].trigger('click')
+      await moves(1)[0].trigger('click')
+      expect(saveOrder().element.disabled).toBe(true)
+      await submit()
+      expect(escape()).toBe(false)
+      expect(dialog().element.open).toBe(false)
+      expect(apiFetch).not.toHaveBeenCalled()
+      expect(fetchCatalog).toHaveBeenCalledOnce()
+    })
+
+    it('sends one UUID-only PUT, blocks other mutations and reloads the authoritative cards and shortcuts', async () => {
+      await mountOrderPage()
+      await startReorder()
+      await moves(1)[0].trigger('click')
+      const put = Promise.withResolvers()
+      const refresh = Promise.withResolvers()
+      apiFetch.mockReturnValueOnce(put.promise)
+      fetchCatalog.mockReturnValueOnce(refresh.promise)
+      await Promise.all([submit(), submit()])
+      expect(apiFetch).toHaveBeenCalledExactlyOnceWith('./api/apps/order', {
+        method: 'PUT',
+        redirect: 'error',
+        headers: { 'Content-Type': 'application/json', 'If-Match': 'revision-A' },
+        body: JSON.stringify({ order: [otherAppUuid, appUuid, thirdAppUuid] }),
+      })
+      expect(button('apps.add_new').element.disabled).toBe(true)
+      expect(page.get('.app-card button.btn-primary').element.disabled).toBe(true)
+      expect(page.get('.app-card button.btn-danger').element.disabled).toBe(true)
+      await Promise.all([page.vm.save(), page.vm.confirmDelete(), page.vm.useCover({})])
+      expect(apiFetch).toHaveBeenCalledOnce()
+      expect(button('_common.cancel', dialog()).element.disabled).toBe(true)
+      escape()
+      expect(dialog().element.open).toBe(true)
+
+      put.resolve({ status: 200 })
+      await flushPromises()
+      expect(fetchCatalog).toHaveBeenCalledTimes(2)
+      expect(fetch.mock.calls.at(-1)).toEqual(['./api/apps', { cache: 'no-store' }])
+      expect(covers()).toEqual(coverUrls(initialOrder))
+      expect(visibleShortcuts()).toEqual([])
+      expect(dialog().element.open).toBe(true)
+
+      const authoritativeOrder = [catalog[2], catalog[1], catalog[0]]
+      refresh.resolve(catalogResponse({ apps: authoritativeOrder, revision: 'revision-B', host_name: 'Refreshed host' }))
+      await flushPromises()
+      expect(dialog().element.open).toBe(false)
+      expect(document.activeElement).toBe(reorder().element)
+      const ids = authoritativeOrder.map(app => app.uuid)
+      expect(covers()).toEqual(coverUrls(ids))
+      expect(visibleShortcuts()).toEqual(ids)
+      expect(new URL(page.get(open).attributes('href')).searchParams.get('host_name')).toBe('Refreshed host')
+
+      const revokeObjectURL = vi.fn()
+      vi.stubGlobal('URL', Object.assign(class extends URL {}, {
+        createObjectURL: vi.fn().mockReturnValue('blob:reordered-shortcut'), revokeObjectURL,
+      }))
+      const dispatch = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function () {
+        expect(this.download).toBe('Miranda-' + thirdAppUuid + '.art')
+      })
+      await downloadButton(page.get('.app-card')).trigger('click')
+      expect(dispatch).toHaveBeenCalledOnce()
+      await vi.waitFor(() => expect(revokeObjectURL).toHaveBeenCalledExactlyOnceWith('blob:reordered-shortcut'))
+    })
+
+    it('uses the captured revision and requires a fresh load before reapplying moves after conflict', async () => {
+      await mountOrderPage()
+      await startReorder()
+      await moves(1)[0].trigger('click')
+      fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: catalog, revision: 'revision-B' }))
+      await page.vm.loadApps()
+      apiFetch.mockResolvedValueOnce({ status: 409 })
+      await submit()
+      await flushPromises()
+      expect(apiFetch).toHaveBeenCalledOnce()
+      expect(apiFetch.mock.calls[0][1].headers['If-Match']).toBe('revision-A')
+      expect(dialog().get('[role="alert"]').text()).toBe('apps.reorder_conflict')
+      expect(covers()).toEqual(coverUrls(initialOrder))
+      expect(moves(1)[0].element.disabled).toBe(true)
+      await submit()
+      expect(apiFetch).toHaveBeenCalledOnce()
+
+      const current = [catalog[2], catalog[0], catalog[1]]
+      fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: current, revision: 'revision-C' }))
+      await button('apps.reorder_reload_apps', dialog()).trigger('click')
+      await flushPromises()
+      expect(dialog().element.open).toBe(false)
+      expect(covers()).toEqual(coverUrls(current.map(app => app.uuid)))
+      await startReorder()
+      expect(saveOrder().element.disabled).toBe(true)
+      expect(page.vm.orderDraft.revision).toBe('revision-C')
+    })
+
+    it.each([400, 428])('retains the draft and committed cards after a known HTTP %s failure', async status => {
+      await mountOrderPage()
+      await startReorder()
+      await moves(1)[0].trigger('click')
+      apiFetch.mockResolvedValueOnce({ status })
+      await submit()
+      await flushPromises()
+      expect(dialog().get('[role="alert"]').text()).toBe('apps.reorder_error')
+      expect(saveOrder().element.disabled).toBe(false)
+      expect(dialog().findAll('code').map(code => code.text())).toEqual([otherAppUuid, appUuid])
+      expect(covers()).toEqual(coverUrls(initialOrder))
+      expect(fetchCatalog).toHaveBeenCalledOnce()
+    })
+
+    it.each([408, 500, 502, 503, 504])('requires readback when a committed PUT receives HTTP %s', async status => {
+      await mountOrderPage()
+      await startReorder()
+      await moves(1)[0].trigger('click')
+      let committedCatalog = catalog
+      apiFetch.mockImplementationOnce(async (_url, { body }) => {
+        committedCatalog = JSON.parse(body).order.map(uuid => catalog.find(app => app.uuid === uuid))
+        return { status }
+      })
+      await submit()
+      await flushPromises()
+      expect(dialog().get('[role="alert"]').text()).toBe('apps.reorder_unknown')
+      expect(covers()).toEqual(coverUrls(initialOrder))
+      await submit()
+      expect(apiFetch).toHaveBeenCalledOnce()
+      await button('_common.cancel', dialog()).trigger('click')
+      expect(reorder().element.disabled).toBe(true)
+
+      fetchCatalog.mockResolvedValueOnce({ ok: false, json: async () => ({ error: 'Read failed' }) })
+      await button('apps.reorder_reload_apps').trigger('click')
+      await flushPromises()
+      expect(reorder().element.disabled).toBe(true)
+      expect(button('apps.add_new').element.disabled).toBe(true)
+      expect(page.get('.app-card button.btn-primary').element.disabled).toBe(true)
+      expect(page.get('.app-card button.btn-danger').element.disabled).toBe(true)
+      await Promise.all([page.vm.saveAppOrder(), page.vm.save(), page.vm.confirmDelete(), page.vm.useCover({})])
+      expect(apiFetch).toHaveBeenCalledOnce()
+      expect(covers()).toEqual(coverUrls(initialOrder))
+
+      fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: committedCatalog, revision: 'revision-B' }))
+      await button('apps.reorder_reload_apps').trigger('click')
+      await flushPromises()
+      const committedOrder = [otherAppUuid, appUuid, thirdAppUuid]
+      expect(covers()).toEqual(coverUrls(committedOrder))
+      expect(visibleShortcuts()).toEqual(committedOrder)
+      expect(page.vm.catalogRevision).toBe('revision-B')
+      expect(reorder().element.disabled).toBe(false)
+      expect(button('apps.add_new').element.disabled).toBe(false)
+      expect(document.activeElement).toBe(reorder().element)
+      expect(apiFetch).toHaveBeenCalledOnce()
+    })
+
+    it.each([['unknown PUT', 'apps.reorder_unknown'], ['confirmed PUT', 'apps.reorder_saved_reload']])(
+      'blocks retry after %s until a catalog read succeeds even if the dialog is canceled', async (outcome, message) => {
+        await mountOrderPage()
+        await startReorder()
+        await moves(1)[0].trigger('click')
+        const failedGet = { ok: false, json: async () => ({ error: 'Read failed', host_uuid: hostUuid }) }
+        if (outcome === 'unknown PUT') {
+          apiFetch.mockRejectedValueOnce(new Error('Connection lost'))
+        } else {
+          apiFetch.mockResolvedValueOnce({ status: 200 })
+          fetchCatalog.mockResolvedValueOnce(failedGet)
+        }
+        await submit()
+        await flushPromises()
+        expect(dialog().get('[role="alert"]').text()).toBe(message)
+        await button('_common.cancel', dialog()).trigger('click')
+        expect(reorder().element.disabled).toBe(true)
+        expect(button('apps.add_new').element.disabled).toBe(true)
+        expect(page.get('#content [role="alert"]').text()).toContain(message)
+        expect(document.activeElement).toBe(button('apps.reorder_reload_apps').element)
+
+        fetchCatalog.mockResolvedValueOnce(failedGet)
+        await button('apps.reorder_reload_apps').trigger('click')
+        await flushPromises()
+        expect(reorder().element.disabled).toBe(true)
+        expect(covers()).toEqual(coverUrls(initialOrder))
+        expect(visibleShortcuts()).toEqual([])
+        expect(apiFetch).toHaveBeenCalledOnce()
+
+        fetchCatalog.mockResolvedValueOnce(catalogResponse({ apps: catalog, revision: 'revision-B' }))
+        await button('apps.reorder_reload_apps').trigger('click')
+        await flushPromises()
+        expect(reorder().element.disabled).toBe(false)
+        expect(visibleShortcuts()).toEqual(initialOrder)
+        expect(button('apps.reorder_reload_apps')).toBeUndefined()
+        expect(document.activeElement).toBe(reorder().element)
+      },
+    )
+
+    it('ignores a save completion after leaving the Apps page', async () => {
+      await mountOrderPage()
+      await startReorder()
+      await moves(1)[0].trigger('click')
+      const put = Promise.withResolvers()
+      apiFetch.mockReturnValueOnce(put.promise)
+      await submit()
+      page.unmount()
+      page = undefined
+
+      put.resolve({ status: 200 })
+      await flushPromises()
+      expect(fetchCatalog).toHaveBeenCalledOnce()
+      expect(apiFetch).toHaveBeenCalledOnce()
+    })
   })
 })

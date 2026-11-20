@@ -169,7 +169,7 @@ namespace proc::catalog {
    */
   inline json parse(const std::string &bytes) {
     syntax_guard guard;
-    if (!json::sax_parse(bytes, &guard)) {
+    if (bytes.find('\0') != std::string::npos || !json::sax_parse(bytes, &guard)) {
       throw error {"catalog: invalid JSON, duplicate key, excessive depth or integer overflow"};
     }
     return json::parse(bytes);
@@ -391,6 +391,33 @@ namespace proc::catalog {
       ledger[std::to_string(id)] = uuid;
     }
     metadata["allocated-ids"] = std::move(ledger);
+  }
+
+  /**
+   * @brief Resolve a complete UUID permutation to positions in the normalized live app records.
+   */
+  inline std::vector<std::size_t> order_positions(const json &apps, const json &order) {
+    if (!order.is_array() || order.size() != apps.size()) {
+      throw error {"order: expected one UUID per application"};
+    }
+    std::map<std::string, std::size_t> remaining;
+    for (std::size_t i = 0; i < apps.size(); ++i) {
+      remaining.emplace(apps[i].at("uuid").get<std::string>(), i);
+    }
+    std::vector<std::size_t> positions;
+    positions.reserve(apps.size());
+    for (const auto &value : order) {
+      const auto uuid = value.is_string() ? canonical_uuid(value.get<std::string>()) : std::nullopt;
+      if (!uuid) {
+        throw error {"order: invalid application UUID"};
+      }
+      auto entry = remaining.extract(*uuid);
+      if (entry.empty()) {
+        throw error {"order: unknown or duplicate application UUID"};
+      }
+      positions.push_back(entry.mapped());
+    }
+    return positions;
   }
 
   /**

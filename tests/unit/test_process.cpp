@@ -22,6 +22,7 @@
 
 // local includes
 #include <src/app_catalog.h>
+#include <src/crypto.h>
 #include <src/display_device.h>
 #include <src/httpcommon.h>
 #include <src/logging.h>
@@ -460,6 +461,25 @@ protected:
     ProcessRefreshTest::TearDown();
   }
 
+  std::string launcher_command(bool gated) const {
+#ifdef _WIN32
+    const auto script = test_dir / "publication.cmd";
+    if (gated) {
+      std::ofstream {script} << "@echo off\r\n:wait\r\nif exist \"%P3C_PUBLICATION_GATE%\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n";
+      return "cmd.exe /D /C \"" + script.string() + "\"";
+    }
+    return "cmd.exe /D /C exit 0";
+#else
+    const auto script = test_dir / "publication.sh";
+    if (gated) {
+      std::ofstream {script} << "while [ ! -e \"$P3C_PUBLICATION_GATE\" ]; do sleep 0.01; done\nexit 0\n";
+    } else {
+      std::ofstream {script} << "exit 0\n";
+    }
+    return "/bin/sh \"" + script.string() + "\"";
+#endif
+  }
+
   void configure_launcher(bool gated) {
     boost::process::v1::environment env = boost::this_process::environment();
     env["P3C_PUBLICATION_GATE"] = gate.string();
@@ -469,22 +489,7 @@ protected:
     app.name = "Short launcher";
     app.auto_detach = true;
     app.wait_all = false;
-#ifdef _WIN32
-    app.cmd = "cmd.exe /D /C exit 0";
-    const auto script = test_dir / "publication.cmd";
-    if (gated) {
-      std::ofstream {script} << "@echo off\r\n:wait\r\nif exist \"%P3C_PUBLICATION_GATE%\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n";
-      app.cmd = "cmd.exe /D /C \"" + script.string() + "\"";
-    }
-#else
-    const auto script = test_dir / "publication.sh";
-    if (gated) {
-      std::ofstream {script} << "while [ ! -e \"$P3C_PUBLICATION_GATE\" ]; do sleep 0.01; done\nexit 0\n";
-    } else {
-      std::ofstream {script} << "exit 0\n";
-    }
-    app.cmd = "/bin/sh \"" + script.string() + "\"";
-#endif
+    app.cmd = launcher_command(gated);
     std::vector<proc::ctx_t> apps;
     apps.emplace_back(std::move(app));
     proc::proc = proc::proc_t {std::move(env), std::move(apps)};
@@ -541,6 +546,54 @@ TEST_F(ProcessPublicationTest, SuccessfulExitAfterLiveObservationBeforePublicati
   ASSERT_TRUE(exited_before_publication);
   expect_placeholder_before_another_refresh();
   EXPECT_EQ(observations, 1);
+}
+
+TEST_F(ProcessPublicationTest, ReorderOwnerJobsLeaveLauncherLifetimeToIndependentObservation) {
+  using proc::catalog::json;
+  const auto file = (test_dir / "launcher_catalog.json").string();
+  auto tree = proc::catalog::parse(R"({"env":{},"apps":[{"name":"Launcher","auto-detach":true,"wait-all":false},{"name":"Other"}]})");
+  tree["env"]["P3C_PUBLICATION_GATE"] = gate.string();
+  tree["apps"][0]["cmd"] = launcher_command(true);
+  std::ofstream {file} << tree.dump();
+  const auto loaded = proc::read_catalog(file);
+  ASSERT_EQ(loaded.status, 200) << loaded.body;
+  const auto initial = proc::catalog::parse(loaded.body);
+  const auto revision = initial["revision"].get<std::string>();
+  const auto first = initial["apps"][0];
+  const auto second = initial["apps"][1];
+  auto session = std::make_shared<rtsp_stream::launch_session_t>();
+  session->surround_info = 2;
+  ASSERT_EQ(proc::proc.execute(std::stoi(first["id"].get<std::string>()), session), 0);
+  const auto before = proc::proc.published_snapshot();
+  ASSERT_TRUE(before->lifetime.tracked);
+  std::ofstream {gate} << "release";
+  ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+  auto owner = rtsp_stream::test_support::start_owner();
+  const auto current = json {{"order", json::array({first["uuid"], second["uuid"]})}}.dump();
+  const auto reversed = json {{"order", json::array({second["uuid"], first["uuid"]})}}.dump();
+  const auto expect_lifetime_undisturbed = [&]() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {2};
+    auto published = proc::proc.published_snapshot();
+    while (published->operation_in_progress && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds {1});
+      published = proc::proc.published_snapshot();
+    }
+    EXPECT_FALSE(published->operation_in_progress);
+    EXPECT_EQ(published->lifetime.instance, before->lifetime.instance);
+    EXPECT_TRUE(published->lifetime.tracked);
+    EXPECT_FALSE(published->lifetime.placeholder);
+  };
+  EXPECT_EQ(proc::reorder_catalog_apps(file, "stale", reversed).status, 409);
+  expect_lifetime_undisturbed();
+  EXPECT_EQ(proc::reorder_catalog_apps(file, revision, current).status, 200);
+  expect_lifetime_undisturbed();
+  const auto moved = proc::reorder_catalog_apps(file, revision, reversed);
+  ASSERT_EQ(moved.status, 200) << moved.body;
+  expect_lifetime_undisturbed();
+  ASSERT_EQ(proc::proc.published_snapshot()->apps->front().uuid, second["uuid"].get<std::string>());
+  owner.reset();
+  proc::proc.refresh_published();
+  EXPECT_FALSE(proc::proc.published_snapshot()->lifetime.tracked);
 }
 
 /**
@@ -1008,6 +1061,7 @@ TEST(AppCatalogTest, RejectsDuplicateKeysOverflowAndUnsupportedSchemaWithoutLoss
        }) {
     EXPECT_THROW(proc::catalog::parse(bytes), proc::catalog::error);
   }
+  EXPECT_THROW(proc::catalog::parse(std::string {R"({"env":{},"apps":[]})"} + '\0' + "{}"), proc::catalog::error);
   auto tree = proc::catalog::parse(R"({"env":{},"apps":[],"miranda-app-identity":{"version":2,"allocated-ids":{}}})");
   const auto before = tree;
   EXPECT_THROW(proc::catalog::normalize(tree, catalog_inputs()), proc::catalog::error);
@@ -1076,6 +1130,8 @@ protected:
     http::test_support::set_state_attributes_hook({});
     http::test_support::set_state_update_hook({});
     proc::test_support::set_undo_environment_hook({});
+    proc::test_support::set_execute_entry_hook({});
+    proc::test_support::set_legacy_restore_hook({});
     rtsp_stream::test_support::set_owner_hook({});
     proc::proc.terminate();
     proc::proc = std::move(saved);
@@ -1088,6 +1144,14 @@ protected:
     return {std::istreambuf_iterator<char> {in}, std::istreambuf_iterator<char> {}};
   }
 
+  static std::string exact_revision(const std::string &bytes) {
+    return util::hex(crypto::hash(bytes)).to_string();
+  }
+
+  proc::catalog_response reorder(const std::string &revision, const proc::catalog::json &order) const {
+    return proc::reorder_catalog_apps(file.string(), revision, proc::catalog::json {{"order", order}}.dump());
+  }
+
   proc::catalog::json read() const {
     const auto result = proc::read_catalog(file.string());
     EXPECT_EQ(result.status, 200) << result.body;
@@ -1095,19 +1159,266 @@ protected:
   }
 };
 
-TEST_F(AppCatalogTransactionTest, RenameArtworkAndReorderRetainBothIdentitiesThroughRestart) {
+TEST_F(AppCatalogTransactionTest, ReorderRenameArtworkAppendAndDeleteRetainOrderAndIdentitiesThroughRestart) {
+  using proc::catalog::json;
+  std::ofstream {file} << R"json({
+    "env":{"ZZ_ORDER_ROOT":"configured","AA_ORDER_ALIAS":"$(ZZ_ORDER_ROOT)"},
+    "apps":[
+      {"name":"Same","id":"7","uuid":"11111111-1111-1111-1111-111111111111","image-path":"first.png","force-virtual-display":true,
+       "prep-cmd":[{"do":"","undo":"","foreign":{"z":[null,{},[]],"a":false}}]},
+      {"name":"Same","id":"42","uuid":"22222222-2222-2222-2222-222222222222","image-path":"second.png"},
+      {"name":"Middle","id":"8","uuid":"33333333-3333-3333-3333-333333333333","foreign":3.5}
+    ],
+    "foreign":{"z":[],"a":true},
+    "miranda-app-identity":{"version":1,"allocated-ids":{"9":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},"foreign":null}
+  })json";
   const auto initial = read();
-  auto edit = initial["apps"][0];
-  const auto uuid = edit["uuid"];
-  const auto id = edit["id"];
-  edit["name"] = "Zulu renamed";
+  const auto original = proc::catalog::parse(bytes());
+  const auto moved = reorder(initial["revision"], json::array({APP_UUID_B, APP_UUID_C, APP_UUID_A}));
+  ASSERT_EQ(moved.status, 200) << moved.body;
+  const auto committed = proc::catalog::parse(moved.body);
+  EXPECT_NE(committed["revision"], initial["revision"]);
+  auto expected = original;
+  expected["apps"] = json::array({original["apps"][1], original["apps"][2], original["apps"][0]});
+  EXPECT_EQ(bytes(), expected.dump(4) + "\n");
+  EXPECT_EQ(committed["revision"], exact_revision(bytes()));
+  const auto published = proc::proc.published_snapshot();
+  ASSERT_EQ(published->apps->size(), 3);
+  EXPECT_EQ(published->apps->at(0).uuid, APP_UUID_B);
+  EXPECT_EQ(published->apps->at(1).uuid, APP_UUID_C);
+  EXPECT_EQ(published->apps->at(2).uuid, APP_UUID_A);
+  EXPECT_TRUE(published->apps->at(2).force_virtual_display);
+
+  auto edit = committed["apps"][2];
+  edit["name"] = "AAA renamed";
   edit["image-path"] = "synthetic.png";
-  const auto result = proc::save_catalog_app(file.string(), initial["revision"], edit.dump());
-  ASSERT_EQ(result.status, 200) << result.body;
+  const auto edited = proc::save_catalog_app(file.string(), committed["revision"], edit.dump());
+  ASSERT_EQ(edited.status, 200) << edited.body;
+  const auto edited_catalog = proc::catalog::parse(edited.body);
+  EXPECT_EQ(edited_catalog["apps"][2], edit);
+  const auto appended = proc::save_catalog_app(file.string(), edited_catalog["revision"], R"({"name":"000 New","index":-1})");
+  ASSERT_EQ(appended.status, 200) << appended.body;
+  const auto appended_catalog = proc::catalog::parse(appended.body);
+  ASSERT_EQ(appended_catalog["apps"].size(), 4);
+  const auto new_app = appended_catalog["apps"][3];
+  EXPECT_EQ(new_app["name"], "000 New");
+  const auto deleted = proc::delete_catalog_app(file.string(), appended_catalog["revision"], APP_UUID_C);
+  ASSERT_EQ(deleted.status, 200) << deleted.body;
+  const auto before_restart = bytes();
   proc::proc = proc::proc_t {};
   const auto restarted = read();
-  EXPECT_EQ(restarted["apps"][1]["uuid"], uuid);
-  EXPECT_EQ(restarted["apps"][1]["id"], id);
+  EXPECT_EQ(restarted["apps"], json::array({original["apps"][1], edit, new_app}));
+  const auto runtime = proc::proc.apps_snapshot();
+  ASSERT_EQ(runtime.size(), restarted["apps"].size());
+  for (std::size_t i = 0; i < runtime.size(); ++i) {
+    EXPECT_EQ(runtime[i].uuid, restarted["apps"][i]["uuid"].get<std::string>());
+    EXPECT_EQ(runtime[i].id, restarted["apps"][i]["id"].get<std::string>());
+  }
+  EXPECT_EQ(restarted["miranda-app-identity"], appended_catalog["miranda-app-identity"]);
+  EXPECT_EQ(restarted["miranda-app-identity"]["allocated-ids"]["8"], APP_UUID_C);
+  EXPECT_EQ(restarted["miranda-app-identity"]["allocated-ids"]["9"], "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  EXPECT_EQ(restarted["env"], initial["env"]);
+  EXPECT_EQ(restarted["foreign"], initial["foreign"]);
+  EXPECT_EQ(proc::proc.get_env().at("AA_ORDER_ALIAS").to_string(), "configured");
+  EXPECT_EQ(bytes(), before_restart);
+}
+
+TEST_F(AppCatalogTransactionTest, CurrentOrderIsAnExactByteAndRuntimeNoOpForEveryCatalogSize) {
+  using proc::catalog::json;
+  for (const auto &names : std::vector<std::vector<std::string>> {{"Second", "First"}, {"Only"}, {}}) {
+    SCOPED_TRACE(names.size());
+    writeAppsJson(file, names);
+    const auto current = read();
+    auto order = json::array();
+    for (const auto &app : current["apps"]) {
+      order.push_back(app.at("uuid"));
+    }
+    const auto original = "\n" + bytes() + " \n";
+    std::ofstream {file, std::ios::binary} << original;
+    const auto previous = proc::proc.published_snapshot();
+    const auto revision = exact_revision(original);
+    ASSERT_NE(revision, previous->catalog_revision);
+    const auto result = reorder(revision, order);
+    ASSERT_EQ(result.status, 200) << result.body;
+    const auto unchanged = proc::catalog::parse(result.body);
+    EXPECT_EQ(unchanged["revision"], revision);
+    EXPECT_EQ(unchanged["apps"], current["apps"]);
+    EXPECT_EQ(bytes(), original);
+    EXPECT_EQ(proc::proc.published_snapshot(), previous);
+  }
+}
+
+TEST_F(AppCatalogTransactionTest, RejectsIncompleteInvalidOrAmbiguousOrderWithoutPublication) {
+  using proc::catalog::json;
+  const std::string lowercase = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const std::string uppercase = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA";
+  auto tree = proc::catalog::parse(bytes());
+  tree["apps"][0]["uuid"] = lowercase;
+  tree["apps"][1]["uuid"] = APP_UUID_B;
+  std::ofstream {file} << tree.dump();
+  const auto current = read();
+  const auto original = bytes();
+  const auto revision = current["revision"].get<std::string>();
+  const auto previous = proc::proc.published_snapshot();
+  const auto expect_bad_request = [&](const std::string &body) {
+    SCOPED_TRACE(body);
+    const auto rejected = proc::reorder_catalog_apps(file.string(), revision, body);
+    EXPECT_EQ(rejected.status, 400) << rejected.body;
+    const auto error = proc::catalog::parse(rejected.body);
+    EXPECT_EQ(error["status"], false);
+    EXPECT_FALSE(error.contains("apps"));
+    EXPECT_FALSE(error.contains("revision"));
+    EXPECT_EQ(bytes(), original);
+    EXPECT_EQ(proc::proc.published_snapshot(), previous);
+  };
+  for (const auto &invalid : {
+         json::array(),
+         json::array({APP_UUID_B}),
+         json::array({lowercase, APP_UUID_B, APP_UUID_C}),
+         json::array({lowercase, lowercase}),
+         json::array({lowercase, uppercase}),
+         json::array({lowercase, APP_UUID_C}),
+         json::array({lowercase, proc::catalog::desktop_uuid}),
+         json::array({lowercase, "malformed"}),
+         json::array({lowercase, 7})
+       }) {
+    expect_bad_request(json {{"order", invalid}}.dump());
+  }
+  for (const auto *invalid : {"{}", "[]", R"({"order":"text"})", R"({"order":[],"extra":false})", R"({"order":[],"order":[]})", R"({"order":[})"}) {
+    expect_bad_request(invalid);
+  }
+  const auto valid = json {{"order", json::array({APP_UUID_B, uppercase})}}.dump();
+  expect_bad_request(valid + '\0' + "{}");
+  EXPECT_EQ(proc::reorder_catalog_apps(file.string(), "", valid).status, 428);
+  const auto accepted = proc::reorder_catalog_apps(file.string(), revision, valid);
+  ASSERT_EQ(accepted.status, 200) << accepted.body;
+  EXPECT_EQ(proc::catalog::parse(accepted.body)["apps"][1]["uuid"], lowercase);
+}
+
+TEST_F(AppCatalogTransactionTest, RequiresDurableNormalizedIdentitiesBeforeReordering) {
+  using proc::catalog::json;
+  const auto legacy = bytes();
+  const auto previous = proc::proc.published_snapshot();
+  const auto conflict = reorder(exact_revision(legacy), json::array());
+  EXPECT_EQ(conflict.status, 409) << conflict.body;
+  EXPECT_NE(conflict.body.find("reload"), std::string::npos);
+  EXPECT_FALSE(proc::catalog::parse(conflict.body).contains("apps"));
+  EXPECT_EQ(bytes(), legacy);
+  EXPECT_EQ(proc::proc.published_snapshot(), previous);
+
+  const auto normalized = read();
+  const auto order = json::array({normalized["apps"][1]["uuid"], normalized["apps"][0]["uuid"]});
+  auto incomplete = proc::catalog::parse(bytes());
+  incomplete.erase("miranda-app-identity");
+  const auto incomplete_bytes = incomplete.dump();
+  std::ofstream {file, std::ios::binary} << incomplete_bytes;
+  const auto before = proc::proc.published_snapshot();
+  EXPECT_EQ(reorder(exact_revision(incomplete_bytes), order).status, 409);
+  EXPECT_EQ(bytes(), incomplete_bytes);
+  EXPECT_EQ(proc::proc.published_snapshot(), before);
+  const auto restored = read();
+  ASSERT_EQ(restored["apps"], normalized["apps"]);
+  const auto reordered = reorder(restored["revision"], order);
+  ASSERT_EQ(reordered.status, 200) << reordered.body;
+  EXPECT_EQ(proc::catalog::parse(reordered.body)["apps"], json::array({normalized["apps"][1], normalized["apps"][0]}));
+}
+
+TEST_F(AppCatalogTransactionTest, ExternalCatalogRequiresReloadBeforeAChangedOrderButAllowsAnExactNoOp) {
+  using proc::catalog::json;
+  const auto initial = read();
+  auto external = proc::catalog::parse(bytes());
+  external["apps"][0]["name"] = "Externally updated";
+  const auto external_bytes = external.dump();
+  std::ofstream {file, std::ios::binary} << external_bytes;
+  const auto previous = proc::proc.published_snapshot();
+  EXPECT_EQ(reorder(initial["revision"], json::array()).status, 409);
+  const auto revision = exact_revision(external_bytes);
+  const auto current = json::array({initial["apps"][0]["uuid"], initial["apps"][1]["uuid"]});
+  const auto unchanged = reorder(revision, current);
+  ASSERT_EQ(unchanged.status, 200) << unchanged.body;
+  EXPECT_EQ(proc::catalog::parse(unchanged.body)["revision"], revision);
+  const auto reversed = json::array({initial["apps"][1]["uuid"], initial["apps"][0]["uuid"]});
+  const auto rejected = reorder(revision, reversed);
+  EXPECT_EQ(rejected.status, 409);
+  EXPECT_NE(rejected.body.find("reload"), std::string::npos);
+  EXPECT_EQ(bytes(), external_bytes);
+  EXPECT_EQ(proc::proc.published_snapshot(), previous);
+  const auto reloaded = read();
+  ASSERT_EQ(reloaded["revision"], revision);
+  const auto changed = reorder(revision, reversed);
+  ASSERT_EQ(changed.status, 200) << changed.body;
+  ASSERT_EQ(proc::proc.apps_snapshot().at(1).name, "Externally updated");
+}
+
+TEST_F(AppCatalogTransactionTest, ReorderRacesWithOtherCatalogMutationsAtTheSameRevision) {
+  using proc::catalog::json;
+  enum class mutation_e {
+    reorder,
+    edit,
+    erase
+  };
+  auto owner = rtsp_stream::test_support::start_owner();
+  for (const auto mutation : {mutation_e::reorder, mutation_e::edit, mutation_e::erase}) {
+    SCOPED_TRACE(static_cast<int>(mutation));
+    writeAppsJson(file, {"One", "Two", "Three"});
+    const auto initial = read();
+    const auto &apps = initial["apps"];
+    const auto revision = initial["revision"].get<std::string>();
+    const auto first_order = json::array({apps[1]["uuid"], apps[2]["uuid"], apps[0]["uuid"]});
+    const auto other_order = json::array({apps[2]["uuid"], apps[0]["uuid"], apps[1]["uuid"]});
+    auto renamed = apps[0];
+    renamed["name"] = "Edited";
+    std::promise<void> start;
+    auto ready = start.get_future().share();
+    proc::catalog_response first, other;
+    std::jthread first_tab {[&]() {
+      ready.wait();
+      first = reorder(revision, first_order);
+    }};
+    std::jthread other_tab {[&]() {
+      ready.wait();
+      switch (mutation) {
+        case mutation_e::reorder:
+          other = reorder(revision, other_order);
+          break;
+        case mutation_e::edit:
+          other = proc::save_catalog_app(file.string(), revision, renamed.dump());
+          break;
+        case mutation_e::erase:
+          other = proc::delete_catalog_app(file.string(), revision, apps[1]["uuid"]);
+          break;
+      }
+    }};
+    start.set_value();
+    first_tab.join();
+    other_tab.join();
+    ASSERT_TRUE((first.status == 200 && other.status == 409) || (first.status == 409 && other.status == 200)) << first.body << other.body;
+    auto expected = json::array({apps[1], apps[2], apps[0]});
+    if (other.status == 200) {
+      switch (mutation) {
+        case mutation_e::reorder:
+          expected = json::array({apps[2], apps[0], apps[1]});
+          break;
+        case mutation_e::edit:
+          expected = json::array({renamed, apps[1], apps[2]});
+          break;
+        case mutation_e::erase:
+          expected = json::array({apps[0], apps[2]});
+          break;
+      }
+    }
+    const auto committed = proc::catalog::parse(first.status == 200 ? first.body : other.body);
+    EXPECT_EQ(committed["apps"], expected);
+    const auto saved_bytes = bytes();
+    EXPECT_EQ(proc::catalog::parse(saved_bytes)["apps"], expected);
+    EXPECT_EQ(committed["revision"], exact_revision(saved_bytes));
+    const auto published = proc::proc.published_snapshot();
+    EXPECT_EQ(published->catalog_revision, committed["revision"].get<std::string>());
+    ASSERT_EQ(published->apps->size(), expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(published->apps->at(i).uuid, expected[i]["uuid"].get<std::string>());
+    }
+  }
 }
 
 TEST_F(AppCatalogTransactionTest, VirtualDisplayPreferenceRetainsIdentityAndRejectsInvalidEditsAtomically) {
@@ -1144,6 +1455,19 @@ TEST_F(AppCatalogTransactionTest, StaleSaveAndDeleteAreRejectedAgainstExactBytes
   EXPECT_EQ(proc::save_catalog_app(file.string(), "", edit.dump()).status, 428);
   EXPECT_EQ(proc::delete_catalog_app(file.string(), "", second_tab["apps"][0]["uuid"]).status, 428);
   EXPECT_EQ(bytes(), committed);
+}
+
+TEST_F(AppCatalogTransactionTest, MalformedCreateIsAClientErrorAndRetainsBytesAndRuntime) {
+  const auto initial = read();
+  const auto original = bytes();
+  const auto previous = proc::proc.published_snapshot();
+  for (const auto *edit : {R"({"index":-1})", R"({"index":-1,"name":12})", R"({"index":-1,"name":"New","image-path":12})"}) {
+    SCOPED_TRACE(edit);
+    const auto result = proc::save_catalog_app(file.string(), initial["revision"], edit);
+    EXPECT_EQ(result.status, 400) << result.body;
+    EXPECT_EQ(bytes(), original);
+    EXPECT_EQ(proc::proc.published_snapshot(), previous);
+  }
 }
 
 TEST_F(AppCatalogTransactionTest, SameMtimeAndDifferentPathsDoNotSuppressChangedContent) {
@@ -1204,13 +1528,38 @@ TEST_F(AppCatalogTransactionTest, PreallocatedCatalogPublicationPreservesTheActu
   const auto instance = proc::proc.lifetime_snapshot().instance;
   const auto claim = proc::proc.claim_source(instance, 701);
   ASSERT_TRUE(claim);
+  const auto previous = proc::proc.published_snapshot();
+  const auto active = proc::proc.active_identity();
+  const auto app_name = proc::proc.get_env().at("SUNSHINE_APP_NAME").to_string();
+  const auto app_id = proc::proc.get_env().at("SUNSHINE_APP_ID").to_string();
+  proc::test_support::set_execute_entry_hook([]() {
+    ADD_FAILURE() << "Catalog mutation entered application execution";
+  });
+  proc::test_support::set_legacy_restore_hook([]() {
+    ADD_FAILURE() << "Catalog mutation entered display restoration";
+  });
+  const auto assert_claim = [&]() {
+    const auto published = proc::proc.published_snapshot();
+    EXPECT_EQ(published->managed_source_instance, instance);
+    EXPECT_EQ(published->managed_source_generation, 701u);
+    EXPECT_EQ(published->lifetime.instance, instance);
+    EXPECT_EQ(published->lifetime.tracked, previous->lifetime.tracked);
+    EXPECT_EQ(published->lifetime.placeholder, previous->lifetime.placeholder);
+    EXPECT_EQ(published->app_name, previous->app_name);
+    EXPECT_EQ(proc::proc.active_identity(), active);
+    EXPECT_EQ(proc::proc.get_env().at("SUNSHINE_APP_NAME").to_string(), app_name);
+    EXPECT_EQ(proc::proc.get_env().at("SUNSHINE_APP_ID").to_string(), app_id);
+  };
+  const auto moved = reorder(initial["revision"], proc::catalog::json::array({initial["apps"][1]["uuid"], target["uuid"]}));
+  ASSERT_EQ(moved.status, 200) << moved.body;
+  const auto reordered = proc::catalog::parse(moved.body);
+  EXPECT_EQ(proc::proc.apps_snapshot().at(1).uuid, active.second);
+  assert_claim();
   auto edit = target;
   edit["name"] = "Changed while claimed";
-  const auto result = proc::save_catalog_app(file.string(), initial["revision"], edit.dump());
+  const auto result = proc::save_catalog_app(file.string(), reordered["revision"], edit.dump());
   ASSERT_EQ(result.status, 200) << result.body;
-  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_instance, instance);
-  EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 701u);
-  EXPECT_EQ(proc::proc.published_snapshot()->lifetime.instance, instance);
+  assert_claim();
   ASSERT_TRUE(proc::proc.restore_source_claim(*claim));
   EXPECT_EQ(proc::proc.published_snapshot()->managed_source_generation, 0u);
 }
@@ -1220,6 +1569,8 @@ TEST_F(AppCatalogTransactionTest, NativeSecurityAndReplacementFailuresRetainByte
   const auto initial = read();
   const auto original = bytes();
   const auto identity = proc::proc.apps_snapshot()[0].uuid;
+  const auto previous = proc::proc.published_snapshot();
+  const auto order = proc::catalog::json::array({initial["apps"][1]["uuid"], initial["apps"][0]["uuid"]});
   auto edit = initial["apps"][0];
   edit["name"] = "Must not publish";
   for (const auto stage : {http::test_support::state_security_stage_e::restore, http::test_support::state_security_stage_e::verify}) {
@@ -1230,16 +1581,20 @@ TEST_F(AppCatalogTransactionTest, NativeSecurityAndReplacementFailuresRetainByte
       }
     });
     EXPECT_EQ(proc::save_catalog_app(file.string(), initial["revision"], edit.dump()).status, 500);
+    EXPECT_EQ(reorder(initial["revision"], order).status, 500);
     EXPECT_EQ(bytes(), original);
     EXPECT_EQ(proc::proc.apps_snapshot()[0].uuid, identity);
+    EXPECT_EQ(proc::proc.published_snapshot(), previous);
     http::test_support::set_state_security_hook({});
   }
   http::test_support::set_state_replace_hook([](const auto &, const auto &, const auto &) {
     return std::optional<std::uint32_t> {5};
   });
   EXPECT_EQ(proc::save_catalog_app(file.string(), initial["revision"], edit.dump()).status, 500);
+  EXPECT_EQ(reorder(initial["revision"], order).status, 500);
   EXPECT_EQ(bytes(), original);
   EXPECT_EQ(proc::proc.apps_snapshot()[0].name, "Desktop");
+  EXPECT_EQ(proc::proc.published_snapshot(), previous);
 }
 
 TEST_F(AppCatalogTransactionTest, UnwritableLegacyInputNeverAdvertisesTransientIdentity) {
@@ -1248,6 +1603,12 @@ TEST_F(AppCatalogTransactionTest, UnwritableLegacyInputNeverAdvertisesTransientI
     return std::optional<std::uint32_t> {0x4000};
   });
   EXPECT_EQ(proc::read_catalog(file.string()).status, 500);
+  EXPECT_EQ(bytes(), original);
+  EXPECT_TRUE(proc::proc.apps_snapshot().empty());
+  http::test_support::set_state_attributes_hook({});
+  const auto reorder_attempt = reorder(exact_revision(original), proc::catalog::json::array());
+  EXPECT_EQ(reorder_attempt.status, 409);
+  EXPECT_FALSE(proc::catalog::parse(reorder_attempt.body).contains("apps"));
   EXPECT_EQ(bytes(), original);
   EXPECT_TRUE(proc::proc.apps_snapshot().empty());
 }
@@ -1358,6 +1719,29 @@ namespace {
     }
   };
 }  // namespace
+
+TEST_F(AppCatalogTransactionTest, ReorderPreservesThePublishedEnvironmentAndEvaluatedContexts) {
+  using proc::catalog::json;
+  native_variable_scope initial_base {"P4C_ORDER_BASE", "published"};
+  writeAppsJson(file, {"Active placeholder", "$(P4C_ORDER_BASE)"});
+  const auto initial = read();
+  auto session = std::make_shared<rtsp_stream::launch_session_t>();
+  session->surround_info = 2;
+  const auto id = std::stoi(initial["apps"][0]["id"].get<std::string>());
+  ASSERT_EQ(proc::proc.execute(id, session), 0);
+  ASSERT_EQ(proc::proc.get_env().at("P4C_ORDER_BASE").to_string(), "published");
+  ASSERT_EQ(proc::proc.apps_snapshot().at(1).name, "published");
+  const auto active = proc::proc.active_identity();
+  native_variable_scope updated_base {"P4C_ORDER_BASE", "later"};
+  const auto result = reorder(initial["revision"], json::array({initial["apps"][1]["uuid"], initial["apps"][0]["uuid"]}));
+  ASSERT_EQ(result.status, 200) << result.body;
+  EXPECT_EQ(native_variable_scope::read("P4C_ORDER_BASE"), "later");
+  EXPECT_EQ(proc::proc.get_env().at("P4C_ORDER_BASE").to_string(), "published");
+  EXPECT_EQ(proc::proc.get_env().at("SUNSHINE_APP_NAME").to_string(), "Active placeholder");
+  EXPECT_EQ(proc::proc.apps_snapshot().at(0).name, "published");
+  EXPECT_EQ(proc::proc.published_snapshot()->apps->at(0).name, "published");
+  EXPECT_EQ(proc::proc.active_identity(), active);
+}
 
 TEST_F(AppCatalogTransactionTest, OwnedPreparationNeverMutatesParentEnvironmentOnRejectedOrSuccessfulInput) {
   native_variable_scope marker {"P1C_REVIEW_MARKER", "parent"};
@@ -1471,6 +1855,15 @@ TEST_F(AppCatalogTransactionTest, RealExitedChildCleanupSerializesWithProcessLan
   session->surround_info = 2;
   ASSERT_EQ(proc::proc.execute(id, session), 0);
   ASSERT_TRUE(proc::proc.wait_for_exit_for_testing(std::chrono::seconds {2}));
+  const auto before_reorder = proc::proc.published_snapshot();
+  proc::test_support::set_undo_environment_hook([](const auto &) {
+    ADD_FAILURE() << "Reorder ran the exited application's undo command";
+  });
+  const auto order = proc::catalog::json::array({initial["apps"][0]["uuid"]});
+  EXPECT_EQ(reorder("stale", order).status, 409);
+  EXPECT_EQ(reorder(initial["revision"], order).status, 200);
+  EXPECT_EQ(proc::proc.published_snapshot(), before_reorder);
+  proc::test_support::set_undo_environment_hook({});
   auto owner = rtsp_stream::test_support::start_owner();
   std::promise<void> consuming;
   std::promise<void> release;

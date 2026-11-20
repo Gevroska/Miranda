@@ -255,6 +255,9 @@ namespace proc {
      */
     void publish_apps_and_env(proc_t &other, const state_guard_t &guard) noexcept;
 
+    /** @brief Publish an app-order-only change without replacing the evaluated environment. */
+    void publish_app_order(std::vector<ctx_t> &apps, const state_guard_t &guard) noexcept;
+
     /**
      * @brief Publish prepared content-cache identity without allocation.
      */
@@ -384,6 +387,11 @@ namespace proc {
    * @brief Delete a UUID target while retaining its numeric allocation and any active copied context.
    */
   catalog_response delete_catalog_app(const std::string &file, const std::string &revision, const std::string &uuid);
+  /**
+   * @brief Persist a complete UUID order from a JSON request body at the expected durable catalog revision.
+   * @note A changed order requires that revision to identify the already published runtime catalog.
+   */
+  catalog_response reorder_catalog_apps(const std::string &file, const std::string &revision, const std::string &order);
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {

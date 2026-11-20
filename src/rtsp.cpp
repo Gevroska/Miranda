@@ -1594,8 +1594,10 @@ namespace rtsp_stream {
           });
           try {
             proc::proc.publish_operation(true);
-            job();
-            proc::proc.refresh_published();
+            job.operation();
+            if (job.lifetime == process_lifetime_e::observe) {
+              proc::proc.refresh_published();
+            }
             proc::proc.publish_operation(false);
           } catch (...) {
             try {
@@ -1609,19 +1611,20 @@ namespace rtsp_stream {
     }
 
     /** @brief Internal enqueue is owner-only and remains available to accepted work during shutdown. */
-    void queue_process(std::function<void()> operation) {
-      process_jobs.emplace_back(std::move(operation));
+    void queue_process(std::function<void()> operation, process_lifetime_e lifetime = process_lifetime_e::observe) {
+      process_jobs.push_back({std::move(operation), lifetime});
       poll_process();
       arm_source_timer();
     }
 
-    std::future<void> post_process(std::function<void()> operation) {
+    std::future<void> post_process(std::function<void()> operation, process_lifetime_e lifetime = process_lifetime_e::observe) {
       auto task = std::make_shared<std::packaged_task<void()>>(std::move(operation));
       auto result = task->get_future();
       if (on_owner()) {
         queue_process([task]() {
           (*task)();
-        });
+        },
+                      lifetime);
         return result;
       }
       std::unique_lock lock {lifecycle_mutex};
@@ -1646,14 +1649,15 @@ namespace rtsp_stream {
         auto failed_post = util::fail_guard([&]() {
           --pending_process_posts;
         });
-        asio::post(io_context, [this, task]() {
+        asio::post(io_context, [this, task, lifetime]() {
           --pending_process_posts;
 #ifdef SUNSHINE_TESTS
           notify_owner("process_operation_queued");
 #endif
           queue_process([task]() {
             (*task)();
-          });
+          },
+                        lifetime);
         });
         failed_post.disable();
       }
@@ -2333,7 +2337,14 @@ namespace rtsp_stream {
     bool source_timer_failed = false;  ///< Independent owner-loop draining survives persistent timer-registration failure.
     std::optional<source_record_t> source;  ///< The sole owner of source accounting; metadata owns no capture pin.
     std::shared_ptr<preflight_t> preflight;  ///< Reservation and owned refresh continuation; no backend effect yet.
-    std::deque<std::function<void()>> process_jobs;  ///< Owner-ordered process/catalog mutations and observations.
+
+    /** @brief One operation in the owner-ordered process/catalog FIFO. */
+    struct process_job_t {
+      std::function<void()> operation;  ///< Work performed off the owner.
+      process_lifetime_e lifetime;  ///< Completion observation policy.
+    };
+
+    std::deque<process_job_t> process_jobs;  ///< Owner-ordered process/catalog mutations and observations.
     std::optional<std::future<void>> process_work;  ///< Sole in-flight process operation, always polled.
     std::atomic_bool liveness_queued {false};
     std::unique_ptr<recovery_record_t> recovery;  ///< Exact backend and optional startup proof remain owned across blocked states.
@@ -2494,7 +2505,7 @@ namespace rtsp_stream {
     });
   }
 
-  void catalog_operation(std::function<void()> operation) {
+  void catalog_operation(std::function<void()> operation, process_lifetime_e lifetime) {
     if (process_worker_context) {
       operation();
       return;
@@ -2506,7 +2517,7 @@ namespace rtsp_stream {
       operation();
       return;
     }
-    process_operation(std::move(operation)).get();
+    server.post_process(std::move(operation), lifetime).get();
   }
 
   std::future<void> process_operation(std::function<void()> operation) {

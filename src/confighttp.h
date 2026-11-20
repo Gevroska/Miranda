@@ -36,6 +36,11 @@ namespace confighttp {
   // Main server start function
   void start();
 
+  /**
+   * @brief Register the application catalog and cover routes on the configuration HTTPS listener.
+   * @param server The configuration HTTPS server.
+   */
+  void configure_app_catalog_routes(https_server_t &server);
   void print_req(const req_https_t &request);
   void send_response(const resp_https_t &response, const nlohmann::json &output_tree);
   void send_unauthorized(const resp_https_t &response, const req_https_t &request);
