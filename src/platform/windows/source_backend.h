@@ -86,7 +86,8 @@ namespace platf::source_backend {
    * @brief Retained reconstruction of one exact startup episode; this never represents a source.
    * @details Coordinator operations and an owner offer exclude one another without blocking the
    * owner. After adoption coordinator/caller aliases are inert. B, authorization and the exact
-   * startup proof survive coordinator destruction. Completion and gate release remain unavailable.
+   * startup proof survive coordinator destruction. Only the adopted owner can complete the actual
+   * B episode and check release of that same exclusion; copied observations grant no authority.
    */
   class recovery_context_t {
   public:
@@ -129,6 +130,21 @@ namespace platf::source_backend {
     std::shared_ptr<rtsp_stream::source_backend_t> offered_backend() const;
     bool reconstruct();
     bool fence();
+    enum class completion_phase_e {
+      not_completed,
+      release_pending,
+      released
+    };
+    /** @brief Complete the retained concrete B once; latch committed effects before publication. */
+    bool complete_owned(std::uint64_t generation);
+    /** @brief Check only the original startup exclusion after verified completion; never repeat B. */
+    bool release_startup(std::uint64_t generation);
+    /** @brief Copy the nonthrowing committed-effects latch; it never confers caller custody. */
+    completion_phase_e completion_phase() const noexcept;
+    /** @brief Return the original proof only for the exact authorized adopted episode. */
+    std::shared_ptr<source_startup::recovery_proof_t> retained_startup_proof(std::uint64_t generation) const noexcept;
+    /** @brief Latch the released effect immediately after the original gate opens. */
+    void finish_startup_release() noexcept;
     std::unique_ptr<state_t> state_;
   };
 

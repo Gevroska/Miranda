@@ -545,6 +545,23 @@ TEST_F(SourceStartupTest, DeletingOrEmptyingPreviouslyObservedOwnedIntentCannotI
   }
 }
 
+TEST_F(SourceStartupTest, FreshClearCoordinatorCannotReplaceAnUnresolvedRetainedOwnedProofOrItsGate) {
+  input.owned = encoded(pending_owned().dump());
+  auto coordinator = make();
+  EXPECT_EQ(coordinator->inspect().disposition, disposition_e::owned_requires_authority);
+  auto context = coordinator->reconstruct({});
+  ASSERT_TRUE(context);
+  EXPECT_FALSE(context->reconstructed());
+  coordinator.reset();
+  input = {};
+  auto replacement = make();
+  EXPECT_EQ(replacement->inspect().disposition, disposition_e::blocked);
+  EXPECT_FALSE(replacement->release_for_ordinary());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  EXPECT_FALSE(reset_persistence());
+  EXPECT_EQ(context->generation(), 17u);
+}
+
 TEST_F(SourceStartupTest, GateFencesOrdinarySchedulerAndAllUnmanagedMutationEntryPoints) {
   auto persistence = test_make_watched_persistence();
   auto manager = std::make_unique<counting_manager_t>();

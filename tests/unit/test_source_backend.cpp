@@ -442,5 +442,21 @@ namespace {
       EXPECT_TRUE(value->complete(5));
     }
   }
+
+  TEST_F(SourceBackendTest, InertRecoveryContextCopiesCannotCompleteOrActivateTheConcreteDispatcher) {
+    const auto value = backend();
+    auto context = test_recovery_context(value, 17);
+    auto alias = context;
+    EXPECT_TRUE(context->reconstructed());
+    EXPECT_EQ(alias->generation(), 17u);
+    EXPECT_EQ(alias->status().generation, 0u);
+    EXPECT_FALSE(alias->status().restoration_ready);
+    EXPECT_FALSE(alias->status().source);
+    EXPECT_FALSE(value->complete(17));
+    context.reset();
+    EXPECT_EQ(callbacks, 0u);
+    EXPECT_EQ(api->reads, 0u);
+    EXPECT_EQ(value->status().generation, 0u);
+  }
 }  // namespace
 #endif

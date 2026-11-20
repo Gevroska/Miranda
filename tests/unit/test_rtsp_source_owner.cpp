@@ -1385,6 +1385,35 @@ namespace {
     EXPECT_FALSE(source_snapshot().source);
   }
 
+  TEST_F(RtspRecoveryAdoptionTest, InertContextAndCopiedCompletedFlagsCannotGrantRealCompletionOrReleaseAuthority) {
+    auto context = recovery(0, true, true);
+    const auto generation = context->generation();
+    auto alias = context;
+    ASSERT_TRUE(adopt_source_recovery(context));
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().awaiting_completion && source_snapshot().cleanup_blocked;
+    }));
+    // An arbitrary implementation's success and copied readiness remain observations. The
+    // owner-only context operation has neither concrete B nor the original startup proof.
+    EXPECT_TRUE(adopted_backend->complete(generation));
+    adopted_backend->restoration_finished();
+    for (unsigned int count = 0; count < 3; ++count) {
+      retry_source_cleanup();
+    }
+    ASSERT_TRUE(until([]() {
+      return source_snapshot().cleanup_blocked;
+    }));
+    EXPECT_TRUE(source_snapshot().busy);
+    EXPECT_TRUE(source_snapshot().recovery_pending);
+    EXPECT_FALSE(adopt_source_recovery(alias));
+    EXPECT_EQ(test_support::source_generation_floor(), generation);
+    EXPECT_EQ(adopted_backend->completes, 1);
+    EXPECT_EQ(adopted_backend->begins, 0);
+    EXPECT_EQ(adopted_backend->cleanups, 0);
+    EXPECT_FALSE(set_source_backend({}));
+    EXPECT_FALSE(launch_session_raise(token()));
+  }
+
   TEST_F(RtspRecoveryAdoptionTest, RefusalPreservesContextAndFloorForUnreconstructedZeroMaxAndOldGenerations) {
     const auto floor = test_support::source_generation_floor();
     for (auto generation : {std::uint64_t {0}, floor, UINT64_MAX}) {

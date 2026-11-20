@@ -18,6 +18,10 @@
 #include <tuple>
 #include <vector>
 
+#ifdef SUNSHINE_TESTS
+  #include <functional>
+#endif
+
 // lib includes
 #include <boost/algorithm/string.hpp>
 #include <display_device/audio_context_interface.h>
@@ -30,6 +34,10 @@
 #include "audio.h"
 #include "platform/common.h"
 #include "rtsp.h"
+
+#ifdef SUNSHINE_TESTS
+  #include "utility.h"
+#endif
 
 // platform-specific includes
 #ifdef _WIN32
@@ -56,6 +64,24 @@ namespace display_device {
     std::atomic_bool startup_excluded {false};  ///< Copied gate, independent of native manager lifetime.
     std::atomic_bool startup_legacy_tracked {false};  ///< Preserve default behavior until startup inspection participates.
     std::atomic_bool startup_legacy_pending {false};  ///< Updated by the ordinary persistence authority after adoption.
+
+  #ifdef SUNSHINE_TESTS
+    std::mutex owned_restore_observer_mutex;
+    std::function<void(std::uint64_t, const std::atomic_uint64_t &)> owned_restore_observer;  ///< Observe actual callback finalization without changing its state or locks.
+
+    void observe_owned_restore_callback(std::uint64_t revision, const std::atomic_uint64_t &current) noexcept {
+      try {
+        std::function<void(std::uint64_t, const std::atomic_uint64_t &)> observer;
+        {
+          std::lock_guard lock {owned_restore_observer_mutex};
+          observer = owned_restore_observer;
+        }
+        if (observer) {
+          observer(revision, current);
+        }
+      } catch (...) {}
+    }
+  #endif
 
     void publish_ordinary_persistence(bool pending) {
       if (startup_legacy_tracked.load()) {
@@ -2047,6 +2073,13 @@ namespace display_device {
       options.m_execution = SchedulerOptions::Execution::ScheduledOnly;
     }
     state_->scheduler->schedule([state = state_.get(), revision](auto &manager, auto &stop) {
+  #ifdef SUNSHINE_TESTS
+      // A function-scope observer runs after the existing production status guards naturally
+      // leave scope, while RetryScheduler still owns its actual callback invocation mutex.
+      auto observed = util::fail_guard([&]() {
+        observe_owned_restore_callback(revision, state->revision);
+      });
+  #endif
       try {
         if (state->revision != revision) {
           stop.requestStop();
@@ -2244,21 +2277,28 @@ namespace display_device {
 
   bool owned_display_configuration_t::complete(std::uint64_t generation) {
     std::lock_guard command {state_->command_mutex};
-    if (!state_->valid_generation(generation)) {
+    if (!state_->valid_generation(generation) || !state_->scheduler) {
       return false;
     }
     {
       std::lock_guard lock {state_->status_mutex};
-      if (state_->status.phase != owned_display_phase_e::restored || !state_->status.source_released || state_->status.unavailable_settings_pending) {
+      if (state_->status.phase != owned_display_phase_e::restored || !state_->status.source_released || state_->status.unavailable_settings_pending || state_->status.restore_retry_required) {
         return false;
       }
     }
+    ++state_->revision;
     state_->scheduler->stop();
+    // stop() joins callbacks, which acquire status_mutex themselves. Recheck only after that
+    // fence, and acquire every required lock before the journal's irreversible checked clear.
+    {
+      std::lock_guard lock {state_->status_mutex};
+      if (!state_->valid_generation(generation) || state_->status.generation != generation || state_->status.phase != owned_display_phase_e::restored || !state_->status.source_released || state_->status.unavailable_settings_pending || state_->status.restore_retry_required || !state_->journal->source_retired()) {
+        return false;
+      }
+    }
     if (!state_->journal->complete()) {
       return false;
     }
-    std::lock_guard lock {state_->status_mutex};
-    state_->status.phase = owned_display_phase_e::restored;
     state_->reservation.reset();
     return true;
   }
@@ -2333,6 +2373,14 @@ namespace display_device {
   std::shared_ptr<SettingsPersistenceInterface> test_make_watched_persistence() {
     return std::make_shared<watched_settings_persistence_t>(std::make_shared<memory_settings_persistence_t>());
   }
+
+  #ifdef _WIN32
+  /** @brief Observe actual restore callback finalization; drain callbacks before releasing captured test state. */
+  void test_set_owned_restore_observer(std::function<void(std::uint64_t, const std::atomic_uint64_t &)> observer) {
+    std::lock_guard lock {owned_restore_observer_mutex};
+    owned_restore_observer = std::move(observer);
+  }
+  #endif
 
   void test_install_settings_manager(std::unique_ptr<SettingsManagerInterface> manager, const std::shared_ptr<SettingsPersistenceInterface> &persistence) {
     std::lock_guard lock {DD_DATA.mutex};

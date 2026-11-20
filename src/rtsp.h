@@ -212,7 +212,7 @@ namespace rtsp_stream {
     std::size_t capture_pins {};  ///< Explicit actual-resource lifetimes.
     bool cleanup_blocked = false;  ///< Failed restoration/removal/retirement requires an explicit retry.
     bool recovery_pending = false;  ///< A retired backend still owns physical recovery independently of a source.
-    bool awaiting_completion = false;  ///< Adopted restoration/retirement finished; startup completion remains unavailable.
+    bool awaiting_completion = false;  ///< Adopted restoration/retirement finished; its completion result is still pending.
   };
 
   /** @brief Install an inert-by-default, allocation-only factory at a quiescent boundary; reject replacement while owned. */
@@ -222,7 +222,7 @@ namespace rtsp_stream {
    * @brief Atomically adopt the exact reconstructed startup context on a live, quiescent owner.
    * @details Consumes the caller reference only after custody and the generation floor commit.
    * Rejection retains the identical context and floor. Adopted failures remain busy and retained;
-   * this inactive seam cannot complete B or release the startup gate. The owner object must
+   * only matching completion and checked original-gate release results end custody. The owner object must
    * outlive the retained episode; stopping its executor drains work but retains this custody.
    * Object/process destruction remains explicit abandonment until shutdown integration exists.
    */
@@ -387,6 +387,15 @@ namespace rtsp_stream {
     std::uint64_t source_generation_floor();
     /** @brief Inject revision exhaustion only while no recovery operation is in flight. */
     bool set_recovery_revision(std::uint64_t revision);
+    /** @brief Synthetic corruption of one completed worker result; never changes retained context effects. */
+    enum class recovery_result_fault_e {
+      generation,
+      revision,
+      operation,
+      exception
+    };
+    /** @brief Fault the next recovery result after its real operation and before owner consumption. */
+    void fault_next_recovery_result(recovery_result_fault_e fault);
     /** @brief Inspect retained recovery/process futures and queued process jobs without consuming them. */
     bool pending_owner_work();
     /** @brief Discard an inactive fixture after its owner has stopped; never a production completion. */

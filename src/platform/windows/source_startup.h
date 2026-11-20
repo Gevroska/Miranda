@@ -75,7 +75,8 @@ namespace platf::source_startup {
    * neither refusal nor destruction releases it. B recovery retains its own independent reservation.
    * Owned pending state requires independently held authorization and explicit reconstruction of
    * its actual B episode. This component never initializes ordinary display management, creates a
-   * source, manufactures authority, completes the startup gate or registers a production backend.
+   * source, manufactures authority or registers a production backend. Only a retained adopted
+   * context can discharge its original owned obligation after verified B completion.
    */
   class coordinator_t {
   public:
@@ -129,6 +130,9 @@ namespace platf::source_startup {
 #endif
 
   private:
+    friend class source_backend::recovery_context_t;
+    /** @brief Freshly check both immutable stores and release only the context's original gate. */
+    static bool release_recovery(source_backend::recovery_context_t &context, std::uint64_t generation);
     struct state_t;
     status_t inspect_locked();
     std::unique_ptr<state_t> state_;

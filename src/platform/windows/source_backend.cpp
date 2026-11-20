@@ -21,6 +21,7 @@
 
 // local includes
 #include "capture_binding.h"
+#include "source_startup.h"
 #include "src/platform/common.h"
 #include "src/video.h"
 #include "utf_utils.h"
@@ -628,6 +629,21 @@ namespace platf::source_backend {
         return true;
       }
 
+      /** @brief Owner-only completion of the exact reconstructed B under its original authority. */
+      bool complete_reconstruction(std::uint64_t generation, const std::shared_ptr<recovery_authorization_t> &authorization) {
+        if (!recovery_only_ || !generation || generation != generation_ || !authorization || authorization != recovery_authorization_ || effects_ != effects_e::owned || !owned_ || !retired_ || lease_ || recovery_transport_pending_ || removed_waiting_close_) {
+          return false;
+        }
+        const auto journal = owned_->journal();
+        const auto current = owned_->status();
+        if (!journal || journal->record().generation != generation || journal->record().deployment != authority_.deployment || !journal->validate(authority_) || !journal->source_retired() || current.generation != generation || current.phase != owned_phase_e::restored || !current.source_released || current.unavailable_settings_pending || current.restore_retry_required || diagnostics().liveness) {
+          return false;
+        }
+        // The context latches success immediately on return. Keep B and independent authority
+        // alive; no publication, status lock, logging or allocation follows the checked commit.
+        return owned_->complete(generation);
+      }
+
       bool retry_recovery(std::uint64_t generation) override {
         if (!generation || generation != generation_ || !retired_) {
           return false;
@@ -849,7 +865,7 @@ namespace platf::source_backend {
       diagnostics_t diagnostics_;  ///< Independent failure observations retained through cleanup retries.
       bool episode_live_ = false;  ///< Admission exclusion lasts until actual recovery completion.
       bool episode_virtual_ = false;  ///< Cross-kind recovery cannot be transferred implicitly.
-      std::atomic_bool recovery_only_ {false};  ///< Reconstruction cannot admit, begin, probe, publish readiness or complete startup.
+      std::atomic_bool recovery_only_ {false};  ///< Reconstruction denies admission, begin, probe, capture readiness and generic completion.
     };
   }  // namespace
 
@@ -875,6 +891,7 @@ namespace platf::source_backend {
     std::shared_ptr<recovery_authorization_t> authorization;  ///< Independent held guarantee, retained before B construction.
     std::shared_ptr<rtsp_stream::source_backend_t> backend;  ///< Destroy before authorization/exclusion if the retained context is finally abandoned.
     std::atomic_bool reconstructed {false};  ///< Successful reconstruction is distinct from source readiness or recovery completion.
+    std::atomic<completion_phase_e> completion {completion_phase_e::not_completed};  ///< Preallocated committed-effects latch, observed by aliases without entering work.
   };
 
   recovery_context_t::recovery_context_t(options_t options, std::shared_ptr<rtsp_stream::source_backend_t> backend, std::string expected_bytes, std::uint64_t generation, std::shared_ptr<source_startup::recovery_proof_t> proof):
@@ -898,7 +915,11 @@ namespace platf::source_backend {
   }
 
   rtsp_stream::source_backend_status_t recovery_context_t::status() const {
-    return state_->backend->status();
+    auto result = state_->backend->status();
+    if (completion_phase() == completion_phase_e::released) {
+      result.recovery_pending = false;
+    }
+    return result;
   }
 
   diagnostics_t recovery_context_t::diagnostics() const {
@@ -982,6 +1003,43 @@ namespace platf::source_backend {
       backend.reconstruction_failure({sudovda::errc_t::journal_failed, sudovda::operation_t::journal});
       return false;
     }
+  }
+
+  recovery_context_t::completion_phase_e recovery_context_t::completion_phase() const noexcept {
+    return state_->completion.load();
+  }
+
+  std::shared_ptr<source_startup::recovery_proof_t> recovery_context_t::retained_startup_proof(std::uint64_t generation) const noexcept {
+    if (!generation || generation != state_->generation || state_->custody != state_t::custody_e::adopted || !state_->reconstructed || !state_->authorization) {
+      return {};
+    }
+    return state_->proof;
+  }
+
+  bool recovery_context_t::complete_owned(std::uint64_t generation) {
+    if (!retained_startup_proof(generation)) {
+      return false;
+    }
+    if (completion_phase() != completion_phase_e::not_completed) {
+      return true;
+    }
+    auto *backend = dynamic_cast<backend_t *>(state_->backend.get());
+    if (!backend || !backend->complete_reconstruction(generation, state_->authorization)) {
+      return false;
+    }
+    state_->completion.store(completion_phase_e::release_pending);
+    return true;
+  }
+
+  bool recovery_context_t::release_startup(std::uint64_t generation) {
+    if (!retained_startup_proof(generation)) {
+      return false;
+    }
+    return completion_phase() == completion_phase_e::released || source_startup::coordinator_t::release_recovery(*this, generation);
+  }
+
+  void recovery_context_t::finish_startup_release() noexcept {
+    state_->completion.store(completion_phase_e::released);
   }
 
   std::optional<bool> physical_source_available() {

@@ -328,6 +328,9 @@ namespace platf::source_startup {
     bool prior_uncertainty {};  ///< Earlier uncertainty cannot be erased by reinspection.
     std::optional<std::string> pending_bytes;  ///< Original observed bytes before B takes custody.
     std::shared_ptr<display_device::ordinary_startup_exclusion_t> exclusion;  ///< Exact gate, never released by destruction.
+#ifdef SUNSHINE_TESTS
+    std::function<coordinator_t::test_storage_t()> test_read;  ///< Retained native-read boundary; survives coordinator destruction.
+#endif
   };
 
   struct coordinator_t::state_t {
@@ -342,7 +345,6 @@ namespace platf::source_startup {
     std::shared_ptr<source_backend::authority_verifier_t> recovery_verifier;  ///< Refuse competing reconstruction inputs.
     std::optional<storage_t> inspection;  ///< Guards live only through the explicit inspection/release operation.
 #ifdef SUNSHINE_TESTS
-    std::function<test_storage_t()> test_read;
     std::optional<source_backend::test_dependencies_t> test_dependencies;
 #endif
   };
@@ -368,8 +370,8 @@ namespace platf::source_startup {
           throw std::runtime_error {"Retained owned recovery could not be fenced for inspection"};
         }
 #ifdef SUNSHINE_TESTS
-        if (state_->test_read) {
-          const auto input = state_->test_read();
+        if (state_->proof->test_read) {
+          const auto input = state_->proof->test_read();
           state_->inspection.emplace();
           state_->inspection->owned = {input.owned.access, input.owned.bytes};
           state_->inspection->ordinary = {input.ordinary.access, input.ordinary.bytes};
@@ -451,6 +453,38 @@ namespace platf::source_startup {
     return released;
   }
 
+  bool coordinator_t::release_recovery(source_backend::recovery_context_t &context, std::uint64_t generation) {
+    if (context.completion_phase() != source_backend::recovery_context_t::completion_phase_e::release_pending) {
+      return false;
+    }
+    const auto proof = context.retained_startup_proof(generation);
+    if (!proof || !proof->exclusion || !proof->recovery_proof_required || proof->prior_uncertainty || !proof->pending_bytes) {
+      return false;
+    }
+    // This is a fresh checked read, deliberately independent of obsolete coordinator custody
+    // and sticky inspection classification. Keep its handles through the exact gate decision.
+    storage_t storage;
+#ifdef SUNSHINE_TESTS
+    if (proof->test_read) {
+      const auto input = proof->test_read();
+      storage.owned = {input.owned.access, input.owned.bytes};
+      storage.ordinary = {input.ordinary.access, input.ordinary.bytes};
+      storage.residue = input.transaction_residue;
+    } else
+#endif
+    {
+      storage = read_storage(proof->paths);
+    }
+    const auto current = classify(storage);
+    if (!clear(current.owned) || !clear(current.ordinary) || storage.residue || !proof->exclusion->release_to_ordinary(false, proof->paths.ordinary_state)) {
+      return false;
+    }
+    // Nothing fallible may separate opening the original gate from recording the effect.
+    proof->exclusion.reset();
+    context.finish_startup_release();
+    return true;
+  }
+
   std::shared_ptr<source_backend::recovery_context_t> coordinator_t::reconstruct(source_backend::options_t options) {
     std::lock_guard operation {state_->operation};
     if (options.journal_path != state_->proof->paths.owned_journal || (state_->recovery && options.authority != state_->recovery_verifier)) {
@@ -499,7 +533,7 @@ namespace platf::source_startup {
 #ifdef SUNSHINE_TESTS
   std::unique_ptr<coordinator_t> coordinator_t::test_make(paths_t paths, std::function<test_storage_t()> read, source_backend::test_dependencies_t dependencies) {
     auto result = std::make_unique<coordinator_t>(std::move(paths));
-    result->state_->test_read = std::move(read);
+    result->state_->proof->test_read = std::move(read);
     result->state_->test_dependencies = std::move(dependencies);
     return result;
   }

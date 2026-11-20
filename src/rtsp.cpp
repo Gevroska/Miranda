@@ -523,20 +523,25 @@ namespace rtsp_stream {
       restoring,
       removal_ready,
       retired,
-      awaiting_completion
+      awaiting_completion,
+      release_pending
     };
     enum class recovery_operation_e {
       observe,
       restore,
       retire,
       retry_retired,
-      complete
+      complete,
+      complete_adopted,
+      release_startup
     };
     enum class recovery_outcome_e {
       pending,
       removal_ready,
       restored,
       completed,
+      release_pending,
+      released,
       blocked
     };
 
@@ -547,7 +552,7 @@ namespace rtsp_stream {
       recovery_outcome_e outcome;
     };
 
-    /** @brief Sole retained recovery, including failed and completion-withheld startup custody. */
+    /** @brief Sole retained recovery, including failed and completion/release-pending startup custody. */
     struct recovery_record_t {
 #ifdef _WIN32
       std::shared_ptr<platf::source_backend::recovery_context_t> startup;  ///< Exact startup proof outlives operation-lane ownership.
@@ -556,7 +561,7 @@ namespace rtsp_stream {
       std::uint64_t generation {}, revision {};  ///< Exact generation and checked operation revision.
       recovery_stage_e stage = recovery_stage_e::retired;  ///< Outstanding restoration, retirement or completion boundary.
       recovery_operation_e operation = recovery_operation_e::observe;  ///< Tag required when consuming the sole future.
-      bool adopted = false;  ///< Adopted episodes can neither roll over nor complete in this slice.
+      bool adopted = false;  ///< Adopted episodes retain their original context and cannot roll over.
       bool blocked = false, retry_requested = false;  ///< Explicit retry coalesces while one operation is in flight.
       std::optional<std::future<recovery_result_t>> work;  ///< Never destroyed while an operation is still running.
       std::chrono::steady_clock::time_point next_progress {};  ///< Polling deadline advances after work finishes.
@@ -642,7 +647,7 @@ namespace rtsp_stream {
 
     /** @brief Ensure retained-app exit and backend progress are observed even without media workers. */
     void arm_source_timer() {
-      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty() && !(recovery && recovery->work) && (!recovery || stopping || recovery->blocked || recovery->stage == recovery_stage_e::awaiting_completion))) {
+      if (source_timer_armed || (!source && !preflight && !process_work && process_jobs.empty() && !(recovery && recovery->work) && (!recovery || stopping || recovery->blocked))) {
         return;
       }
       try {
@@ -660,7 +665,7 @@ namespace rtsp_stream {
             poll_preflight();
             poll_source();
             poll_retired_recovery();
-            if (source || preflight || process_work || !process_jobs.empty() || (recovery && !stopping && !recovery->blocked && recovery->stage != recovery_stage_e::awaiting_completion) || (recovery && recovery->work)) {
+            if (source || preflight || process_work || !process_jobs.empty() || (recovery && !stopping && !recovery->blocked) || (recovery && recovery->work)) {
               arm_source_timer();
             }
           }
@@ -1260,21 +1265,25 @@ namespace rtsp_stream {
       });
     }
 
-    /** @brief Serialize tagged recovery work off-owner; startup custody stops before B completion. */
+    /** @brief Serialize one tagged future through restoration, completion and original-gate release. */
     void poll_retired_recovery() {
       if (recovery && recovery->work) {
         if (recovery->work->wait_for(0ms) != std::future_status::ready) {
           return;
         }
-        const auto result = recovery->work->get();
+        std::optional<recovery_result_t> received;
+        try {
+          received = recovery->work->get();
+        } catch (...) {}
         recovery->work.reset();
-        if (result.generation != recovery->generation || result.revision != recovery->revision || result.operation != recovery->operation) {
+        if (!received || received->generation != recovery->generation || received->revision != recovery->revision || received->operation != recovery->operation) {
           recovery->blocked = true;
           finish_stop();
           return;
         }
+        const auto &result = *received;
         recovery->next_progress = source_progress_now() + 100ms;
-        if (result.outcome == recovery_outcome_e::completed && !recovery->adopted) {
+        if ((result.outcome == recovery_outcome_e::completed && !recovery->adopted && result.operation == recovery_operation_e::complete) || (result.outcome == recovery_outcome_e::released && recovery->adopted && result.operation == recovery_operation_e::release_startup)) {
           recovery.reset();
           published_recovery_generation = 0;
         } else if (result.outcome == recovery_outcome_e::blocked) {
@@ -1284,6 +1293,10 @@ namespace rtsp_stream {
           if (recovery->adopted) {
             recovery->retry_requested = false;
           }
+        } else if (result.outcome == recovery_outcome_e::release_pending && recovery->adopted) {
+          recovery->stage = recovery_stage_e::release_pending;
+          recovery->retry_requested = false;
+          recovery->next_progress = {};
         } else if (result.outcome == recovery_outcome_e::removal_ready) {
           recovery->stage = recovery_stage_e::removal_ready;
           recovery->next_progress = {};
@@ -1293,7 +1306,7 @@ namespace rtsp_stream {
           return;
         }
       }
-      if (source || preflight || stopping || !recovery || recovery->blocked || recovery->stage == recovery_stage_e::awaiting_completion || source_progress_now() < recovery->next_progress) {
+      if (source || preflight || stopping || !recovery || recovery->blocked || source_progress_now() < recovery->next_progress) {
         return;
       }
       if (recovery->revision == UINT64_MAX) {
@@ -1304,19 +1317,35 @@ namespace rtsp_stream {
       const auto backend = recovery->backend;
       const auto generation = recovery->generation;
       const auto adopted = recovery->adopted;
-      const auto state = backend->status();
-      if (state.generation != generation || state.heartbeat_failed) {
-        recovery->blocked = true;
-        return;
-      }
       auto operation = recovery_operation_e::observe;
-      if (std::exchange(recovery->retry_requested, false)) {
-        operation = state.source_released ? recovery_operation_e::retry_retired : recovery->stage == recovery_stage_e::removal_ready ? recovery_operation_e::retire :
-                                                                                                                                       recovery_operation_e::restore;
-      } else if (adopted && recovery->stage == recovery_stage_e::removal_ready) {
-        operation = recovery_operation_e::retire;
-      } else if (!adopted && state.source_released && !state.recovery_pending && !state.recovery_retry_required) {
-        operation = recovery_operation_e::complete;
+#ifdef _WIN32
+      const auto startup = recovery->startup;
+      const bool completed_owned = startup && startup->completion_phase() != platf::source_backend::recovery_context_t::completion_phase_e::not_completed;
+      if (adopted && completed_owned) {
+        // Context state remains authoritative after stale/failed publication. Do not touch B,
+        // status, progress, restoration or retirement again once its clear was committed.
+        recovery->stage = recovery_stage_e::release_pending;
+        recovery->retry_requested = false;
+        operation = recovery_operation_e::release_startup;
+      } else
+#endif
+      {
+        const auto state = backend->status();
+        if (state.generation != generation || state.heartbeat_failed) {
+          recovery->blocked = true;
+          return;
+        }
+        if (adopted && recovery->stage == recovery_stage_e::awaiting_completion) {
+          recovery->retry_requested = false;
+          operation = recovery_operation_e::complete_adopted;
+        } else if (std::exchange(recovery->retry_requested, false)) {
+          operation = state.source_released ? recovery_operation_e::retry_retired : recovery->stage == recovery_stage_e::removal_ready ? recovery_operation_e::retire :
+                                                                                                                                         recovery_operation_e::restore;
+        } else if (adopted && recovery->stage == recovery_stage_e::removal_ready) {
+          operation = recovery_operation_e::retire;
+        } else if (!adopted && state.source_released && !state.recovery_pending && !state.recovery_retry_required) {
+          operation = recovery_operation_e::complete;
+        }
       }
       const auto revision = ++recovery->revision;
       recovery->operation = operation;
@@ -1325,6 +1354,10 @@ namespace rtsp_stream {
         notify_owner("recovery_before_dispatch");
 #endif
         recovery->work.emplace(std::async(std::launch::async, [backend, generation, revision, operation, adopted
+#ifdef _WIN32
+                                                               ,
+                                                               startup
+#endif
 #ifdef SUNSHINE_TESTS
                                                                ,
                                                                this
@@ -1333,34 +1366,77 @@ namespace rtsp_stream {
           auto outcome = recovery_outcome_e::blocked;
           try {
             bool ok = true;
-            if (operation == recovery_operation_e::restore)
-              ok = backend->restore(generation, 0ms);
-            else if (operation == recovery_operation_e::retire)
-              ok = backend->cleanup_and_retire(generation);
-            else if (operation == recovery_operation_e::retry_retired)
-              ok = backend->retry_recovery(generation);
-            else if (operation == recovery_operation_e::complete)
-              ok = !adopted && backend->complete(generation);
-            if (ok && operation == recovery_operation_e::complete) {
-              outcome = recovery_outcome_e::completed;
-            } else if (ok) {
-#ifdef SUNSHINE_TESTS
-              if (operation == recovery_operation_e::observe)
-                notify_owner("recovery_observation_before_progress");
-#endif
-              backend->progress(generation);
-              const auto current = backend->status();
-              if (current.generation == generation && !current.heartbeat_failed && !current.recovery_retry_required && current.phase != source_backend_status_t::phase_e::failed) {
-                if (adopted && current.source_released && current.restoration_ready)
-                  outcome = recovery_outcome_e::restored;
-                else if (adopted && !current.source_released && current.phase == source_backend_status_t::phase_e::removal_ready)
-                  outcome = recovery_outcome_e::removal_ready;
-                else if (adopted || current.source_released)
-                  outcome = recovery_outcome_e::pending;
+#ifdef _WIN32
+            if (operation == recovery_operation_e::complete_adopted) {
+  #ifdef SUNSHINE_TESTS
+              notify_owner("recovery_completion_before_entry");
+  #endif
+              if (startup && startup->complete_owned(generation)) {
+                outcome = recovery_outcome_e::release_pending;
               }
+            } else if (operation == recovery_operation_e::release_startup) {
+  #ifdef SUNSHINE_TESTS
+              notify_owner("recovery_release_before_entry");
+  #endif
+              if (startup && startup->release_startup(generation)) {
+                outcome = recovery_outcome_e::released;
+              }
+            } else {
+#endif
+              if (operation == recovery_operation_e::restore)
+                ok = backend->restore(generation, 0ms);
+              else if (operation == recovery_operation_e::retire)
+                ok = backend->cleanup_and_retire(generation);
+              else if (operation == recovery_operation_e::retry_retired)
+                ok = backend->retry_recovery(generation);
+              else if (operation == recovery_operation_e::complete)
+                ok = !adopted && backend->complete(generation);
+              if (ok && operation == recovery_operation_e::complete) {
+                outcome = recovery_outcome_e::completed;
+              } else if (ok) {
+#ifdef SUNSHINE_TESTS
+                if (operation == recovery_operation_e::observe)
+                  notify_owner("recovery_observation_before_progress");
+#endif
+                backend->progress(generation);
+                const auto current = backend->status();
+                if (current.generation == generation && !current.heartbeat_failed && !current.recovery_retry_required && current.phase != source_backend_status_t::phase_e::failed) {
+                  if (adopted && current.source_released && current.restoration_ready)
+                    outcome = recovery_outcome_e::restored;
+                  else if (adopted && !current.source_released && current.phase == source_backend_status_t::phase_e::removal_ready)
+                    outcome = recovery_outcome_e::removal_ready;
+                  else if (adopted || current.source_released)
+                    outcome = recovery_outcome_e::pending;
+                }
+              }
+#ifdef _WIN32
             }
-          } catch (...) {}
-          return recovery_result_t {generation, revision, operation, outcome};
+#endif
+#ifdef SUNSHINE_TESTS
+            if (operation == recovery_operation_e::complete_adopted || operation == recovery_operation_e::release_startup) {
+              notify_owner("recovery_effect_before_publication");
+            }
+#endif
+          } catch (...) {
+            outcome = recovery_outcome_e::blocked;
+          }
+          auto result = recovery_result_t {generation, revision, operation, outcome};
+#ifdef SUNSHINE_TESTS
+          switch (recovery_result_fault.exchange(0)) {
+            case 1:
+              result.generation = 0;
+              break;
+            case 2:
+              result.revision = 0;
+              break;
+            case 3:
+              result.operation = recovery_operation_e::observe;
+              break;
+            case 4:
+              throw std::runtime_error {"injected recovery result failure"};
+          }
+#endif
+          return result;
         }));
       } catch (...) {
         // Custody is already committed. Dispatch failure retains the actual context and gate.
@@ -1683,7 +1759,7 @@ namespace rtsp_stream {
       asio::post(io_context, [this, generation, retired_generation]() {
         if (source && source->generation == generation) {
           retry_cleanup();
-        } else if (!source && recovery && recovery->generation == retired_generation && recovery->stage != recovery_stage_e::awaiting_completion && recovery->revision != UINT64_MAX) {
+        } else if (!source && recovery && recovery->generation == retired_generation && recovery->revision != UINT64_MAX) {
           recovery->blocked = false;
           recovery->retry_requested = true;
           recovery->next_progress = {};
@@ -2205,6 +2281,7 @@ namespace rtsp_stream {
       owner_hook = {};
       source_progress_clock = {};
       source_timer_failed = false;
+      recovery_result_fault = 0;
     }
 
     bool test_pending_owner_work() const {
@@ -2222,6 +2299,8 @@ namespace rtsp_stream {
       recovery->revision = revision;
       return true;
     }
+
+    std::atomic_uint recovery_result_fault {};  ///< Test-only result publication fault, consumed after actual work.
 
     bool test_discard_recovery() {
       if (running || (recovery && recovery->work)) {
@@ -2621,6 +2700,10 @@ namespace rtsp_stream {
       return server.sync([revision]() {
         return server.test_recovery_revision(revision);
       });
+    }
+
+    void fault_next_recovery_result(recovery_result_fault_e fault) {
+      server.recovery_result_fault = static_cast<unsigned int>(fault) + 1;
     }
 
     bool pending_owner_work() {
