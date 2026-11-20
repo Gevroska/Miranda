@@ -11,6 +11,7 @@
   #include <future>
   #include <mutex>
   #include <stdexcept>
+  #include <utility>
 
   // platform includes
   // WinSock2.h must precede Windows.h from libdisplaydevice.
@@ -166,16 +167,33 @@ namespace {
 
   class denying_authority_t final: public authority_verifier_t {
   public:
-    bool throws = false;
+    enum class outcome_e {
+      denied,
+      exception,
+      null_grant,
+      nonowning
+    };
+    outcome_e outcome = outcome_e::denied;
     unsigned int calls = 0;
 
-    std::expected<platf::sudovda::recovery_authority_t, platf::sudovda::failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
+    std::expected<std::shared_ptr<recovery_authorization_t>, platf::sudovda::failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t, const std::shared_ptr<recovery_authorization_t> &current) override {
       ++calls;
-      if (throws) {
-        throw std::runtime_error {"inert qualification failure"};
+      EXPECT_FALSE(current);
+      switch (outcome) {
+        case outcome_e::exception:
+          throw std::runtime_error {"inert qualification failure"};
+        case outcome_e::null_grant:
+          return std::shared_ptr<recovery_authorization_t> {};
+        case outcome_e::nonowning:
+          return std::shared_ptr<recovery_authorization_t> {std::shared_ptr<recovery_authorization_t> {}, borrowed_.get()};
+        case outcome_e::denied:
+          return std::unexpected(platf::sudovda::failure_t {platf::sudovda::errc_t::ownership_unverified, platf::sudovda::operation_t::journal});
       }
-      return std::unexpected(platf::sudovda::failure_t {platf::sudovda::errc_t::ownership_unverified, platf::sudovda::operation_t::journal});
+      std::unreachable();
     }
+
+  private:
+    std::shared_ptr<recovery_authorization_t> borrowed_ = test_recovery_authorization({"nonowning-fixture", true, true}, std::make_shared<int>(0));
   };
 
   class SourceBackendTest: public BaseTest {
@@ -422,13 +440,14 @@ namespace {
     EXPECT_TRUE(value->complete(2));
   }
 
-  TEST_F(SourceBackendTest, DeniedOrThrowingVerifierCannotCreateIntentAndStillHasANonzeroRetirementFence) {
-    for (const bool throws : {false, true}) {
+  TEST_F(SourceBackendTest, VerifierWithoutAnOwningGrantCannotCreateIntentAndStillHasANonzeroRetirementFence) {
+    using outcome_e = denying_authority_t::outcome_e;
+    for (const auto outcome : {outcome_e::denied, outcome_e::exception, outcome_e::null_grant, outcome_e::nonowning}) {
       const auto authority = std::make_shared<denying_authority_t>();
-      authority->throws = throws;
+      authority->outcome = outcome;
       const auto value = backend({{}, authority});
       EXPECT_EQ(authority->calls, 0U);
-      if (throws) {
+      if (outcome == outcome_e::exception) {
         EXPECT_THROW(value->begin(request(true), 5, 1), std::runtime_error);
       } else {
         EXPECT_FALSE(value->begin(request(true), 5, 1));

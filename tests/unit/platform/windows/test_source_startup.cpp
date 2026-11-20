@@ -290,9 +290,9 @@ TEST_F(SourceStartupTest, ExpectedOwnedPendingIsDistinctFromPriorUncertainty) {
 TEST_F(SourceStartupTest, MissingAndDefaultDeniedRecoveryAuthorityEnterNeitherBNorDriver) {
   class fresh_only_verifier_t final: public platf::source_backend::authority_verifier_t {
   public:
-    std::expected<platf::sudovda::recovery_authority_t, platf::sudovda::failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
+    std::expected<std::shared_ptr<platf::source_backend::recovery_authorization_t>, platf::sudovda::failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t, const std::shared_ptr<platf::source_backend::recovery_authorization_t> &) override {
       ADD_FAILURE() << "A fresh-source verifier does not grant recovery authority";
-      return platf::sudovda::recovery_authority_t {"startup-fixture", true, true};
+      return std::unexpected(platf::sudovda::failure_t {platf::sudovda::errc_t::ownership_unverified, platf::sudovda::operation_t::journal});
     }
   };
 

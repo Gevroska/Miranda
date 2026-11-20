@@ -54,6 +54,7 @@ namespace display_device {
 
 namespace {
   using namespace display_device;
+  using platf::source_backend::recovery_authorization_t;
   using namespace platf::sudovda;
   using namespace std::chrono_literals;
 
@@ -427,20 +428,25 @@ namespace {
 
   class model_heartbeat_t final: public heartbeat_t {
   public:
-    explicit model_heartbeat_t(std::shared_ptr<display_model_t> model):
-        model_ {std::move(model)} {}
+    explicit model_heartbeat_t(std::shared_ptr<display_model_t> model, std::optional<std::weak_ptr<void>> authorization):
+        model_ {std::move(model)},
+        authorization_ {std::move(authorization)} {}
 
     ~model_heartbeat_t() override {
       stop();
     }
 
     void stop() noexcept override {
+      if (authorization_) {
+        EXPECT_FALSE(authorization_->expired()) << "Heartbeat stop";
+      }
       std::lock_guard lock {model_->mutex};
       model_->tick = {};
     }
 
   private:
     std::shared_ptr<display_model_t> model_;
+    std::optional<std::weak_ptr<void>> authorization_;
   };
 
   class model_audio_t final: public AudioContextInterface {
@@ -465,14 +471,21 @@ namespace {
 
   class model_system_t final: public system_t {
   public:
-    explicit model_system_t(std::shared_ptr<display_model_t> model):
-        model_ {std::move(model)} {}
+    explicit model_system_t(std::shared_ptr<display_model_t> model, std::optional<std::weak_ptr<void>> authorization = {}):
+        model_ {std::move(model)},
+        authorization_ {std::move(authorization)} {}
 
     std::expected<void, failure_t> open() override {
+      if (authorization_) {
+        EXPECT_FALSE(authorization_->expired()) << "Driver open";
+      }
       return {};
     }
 
     std::expected<void, failure_t> close() override {
+      if (authorization_) {
+        EXPECT_FALSE(authorization_->expired()) << "Driver close";
+      }
       std::lock_guard lock {model_->mutex};
       ++model_->transport_closes;
       if (model_->close_failure) {
@@ -482,6 +495,9 @@ namespace {
     }
 
     std::expected<std::size_t, failure_t> ioctl(DWORD code, std::span<const std::byte> input, std::span<std::byte> output) override {
+      if (authorization_) {
+        EXPECT_FALSE(authorization_->expired()) << "Driver command " << code;
+      }
       std::lock_guard lock {model_->mutex};
       if (code == wire::version) {
         if (model_->protocol_failure) {
@@ -571,21 +587,76 @@ namespace {
         throw std::runtime_error {"inert heartbeat creation failure"};
       }
       model_->tick = std::move(callback);
-      return std::make_unique<model_heartbeat_t>(model_);
+      return std::make_unique<model_heartbeat_t>(model_, authorization_);
     }
 
     void wait_for_enumeration(std::chrono::milliseconds) override {}
 
   private:
     std::shared_ptr<display_model_t> model_;
+    std::optional<std::weak_ptr<void>> authorization_;
   };
 
   /** @brief Explicit fake verifier; supplies no production provisioning implementation. */
   class fixture_authority_t final: public platf::source_backend::authority_verifier_t {
   public:
-    std::expected<recovery_authority_t, failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
-      return recovery_authority_t {"transaction-fixture", true, true};
+    enum class outcome_e {
+      admitted,
+      denied,
+      exception,
+      substituted,
+      aliased_control_block,
+      aliased_object
+    };
+
+    explicit fixture_authority_t(std::filesystem::path path):
+        path_ {std::move(path)} {}
+
+    outcome_e outcome = outcome_e::admitted;
+    unsigned int issues {};
+    std::uint64_t generation {};
+    std::string monitor_uuid;
+    std::weak_ptr<void> lifetime;
+    recovery_authorization_t *alias_target = nullptr;  ///< Separately owned by the test that returns a different grant object.
+
+    std::expected<std::shared_ptr<recovery_authorization_t>, failure_t> verify(const std::filesystem::path &journal_path, const display_policy::source_request_t &request, std::uint64_t requested_generation, const std::shared_ptr<recovery_authorization_t> &current) override {
+      EXPECT_EQ(journal_path, path_);
+      EXPECT_EQ(static_cast<bool>(current), !lifetime.expired());
+      if (current) {
+        EXPECT_FALSE(current.owner_before(issued_) || issued_.owner_before(current)) << "Rollover must present the original grant";
+      }
+      generation = requested_generation;
+      monitor_uuid = request.monitor_uuid;
+      switch (outcome) {
+        case outcome_e::denied:
+          return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+        case outcome_e::exception:
+          throw std::runtime_error {"inert rollover qualification failure"};
+        case outcome_e::substituted:
+          return platf::source_backend::test_recovery_authorization({"transaction-fixture", true, true}, std::make_shared<int>(0));
+        case outcome_e::aliased_control_block:
+          return std::shared_ptr<recovery_authorization_t> {std::make_shared<int>(0), current.get()};
+        case outcome_e::aliased_object:
+          return std::shared_ptr<recovery_authorization_t> {current, alias_target};
+        case outcome_e::admitted:
+          {
+            if (current) {
+              return current;
+            }
+            auto held = std::make_shared<int>(0);
+            lifetime = held;
+            auto grant = platf::source_backend::test_recovery_authorization({"transaction-fixture", true, true}, std::move(held));
+            issued_ = grant;
+            ++issues;
+            return grant;
+          }
+      }
+      std::unreachable();
     }
+
+  private:
+    std::filesystem::path path_;
+    std::weak_ptr<recovery_authorization_t> issued_;
   };
 
   class OwnedDisplayTest: public BaseTest {
@@ -599,9 +670,11 @@ namespace {
     const recovery_authority_t authority {"transaction-fixture", true, true};
     bool owner_boundaries = false;
     owned_display_configuration_t *concrete_transaction = nullptr;  ///< Fixture-only view while the concrete backend retains B.
+    std::shared_ptr<fixture_authority_t> fresh_verifier;
 
     std::shared_ptr<rtsp_stream::source_backend_t> concrete_backend(bool fail_readback_allocation = false) {
       model->capture_metadata = true;
+      fresh_verifier = std::make_shared<fixture_authority_t>(path);
       platf::source_backend::test_dependencies_t dependencies;
       dependencies.make_api = [this, fail_readback_allocation]() -> std::shared_ptr<WinApiLayerInterface> {
         if (fail_readback_allocation) {
@@ -620,10 +693,11 @@ namespace {
       dependencies.render_adapter = [](const auto &) {
         return std::optional {display_adapter};
       };
-      dependencies.make_system = [this]() {
-        return std::make_unique<model_system_t>(model);
+      dependencies.make_system = [this, verifier = fresh_verifier]() {
+        return std::make_unique<model_system_t>(model, verifier->lifetime);
       };
-      dependencies.begin_owned = [this](const auto &file, const auto &identity, auto generation, const auto &qualification) {
+      dependencies.begin_owned = [this, verifier = fresh_verifier](const auto &file, const auto &identity, auto generation, const auto &qualification) {
+        EXPECT_FALSE(verifier->lifetime.expired()) << "B begin";
         auto result = owned_display_configuration_t::test_begin(file, identity, generation, qualification, api, devices);
         if (result) {
           (*result)->test_set_retry_interval(10ms);
@@ -637,7 +711,7 @@ namespace {
           return pin ? 200 : 503;
         };
       }
-      return platf::source_backend::test_make_backend({path, std::make_shared<fixture_authority_t>()}, std::move(dependencies));
+      return platf::source_backend::test_make_backend({path, fresh_verifier}, std::move(dependencies));
     }
 
     display_policy::source_request_t concrete_request(bool second = false) {
@@ -660,6 +734,28 @@ namespace {
         std::this_thread::sleep_for(5ms);
       }
       return false;
+    }
+
+    void deny_manager_load_after_commit(std::uint64_t generation, std::unique_ptr<void, decltype(&CloseHandle)> &reader) {
+      using stage_t = http::test_support::state_file_stage_e;
+      http::test_support::set_state_file_hook([this, generation, &reader](auto stage, const auto &destination, const auto &, const auto &) -> std::optional<std::uint32_t> {
+        if (stage != stage_t::verify || destination != path || reader) {
+          return std::nullopt;
+        }
+        std::ifstream file {destination, std::ios::binary};
+        const auto record = nlohmann::json::parse(file, nullptr, false);
+        file.close();
+        if (record.is_object() && record.value<std::uint64_t>("generation", 0) == generation) {
+          EXPECT_FALSE(fresh_verifier->lifetime.expired());
+          // This reader permits verification of the committed bytes. The manager's next read
+          // obtains a delete-capable journal guard, which this reader prevents.
+          const auto handle = CreateFileW(destination.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+          if (handle != INVALID_HANDLE_VALUE) {
+            reader.reset(handle);
+          }
+        }
+        return std::nullopt;
+      });
     }
 
     void SetUp() override {
@@ -1033,8 +1129,9 @@ namespace {
     unsigned int calls {};
     bool denied {};
     std::weak_ptr<void> lifetime;
+    recovery_authorization_t *nonowning_grant = nullptr;  ///< A live object owned independently by the test.
 
-    std::expected<recovery_authority_t, failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t) override {
+    std::expected<std::shared_ptr<recovery_authorization_t>, failure_t> verify(const std::filesystem::path &, const display_policy::source_request_t &, std::uint64_t, const std::shared_ptr<recovery_authorization_t> &) override {
       ADD_FAILURE() << "Recovery must not synthesize a fresh source request";
       return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
     }
@@ -1043,6 +1140,9 @@ namespace {
       ++calls;
       if (denied) {
         return std::unexpected(failure_t {errc_t::ownership_unverified, operation_t::journal});
+      }
+      if (nonowning_grant) {
+        return std::shared_ptr<recovery_authorization_t> {std::shared_ptr<recovery_authorization_t> {}, nonowning_grant};
       }
       auto held = std::make_shared<int>(0);
       lifetime = held;
@@ -2855,6 +2955,64 @@ TEST_F(OwnedReconstructionTest, DeniedAuthorityRetainsOneContextBeforeBAndRetrie
   EXPECT_EQ(driver_calls, 0u);
 }
 
+TEST_F(OwnedReconstructionTest, OwnerlessGrantRefusesBeforeBAndRetainedContextRequalifiesWithOwningGrant) {
+  ASSERT_TRUE(crash_episode());
+  const auto original = journal_bytes();
+  const auto closes = model->transport_closes;
+  const auto mutations = model->settings_mutations;
+  model->api_unavailable = true;
+  auto held = std::make_shared<int>(0);
+  const std::weak_ptr<void> borrowed_lifetime = held;
+  auto external_owner = platf::source_backend::test_recovery_authorization(authority, std::move(held));
+  verifier->lifetime = borrowed_lifetime;
+  verifier->nonowning_grant = external_owner.get();
+  auto reset_borrowed = util::fail_guard([&]() {
+    verifier->nonowning_grant = nullptr;
+  });
+  make_startup();
+  ASSERT_TRUE(reconstruct());
+  ASSERT_FALSE(context->reconstructed());
+  ASSERT_TRUE(context->diagnostics().acquisition);
+  EXPECT_EQ(context->diagnostics().acquisition->code, errc_t::ownership_unverified);
+  EXPECT_EQ(context->generation(), 1u);
+  EXPECT_EQ(verifier->calls, 1u);
+  EXPECT_EQ(b_calls, 0u);
+  EXPECT_EQ(driver_calls, 0u);
+  EXPECT_EQ(model->settings_mutations, mutations);
+  EXPECT_EQ(model->transport_closes, closes);
+  EXPECT_EQ(model->removals, 0u);
+  EXPECT_EQ(journal_bytes(), original);
+  EXPECT_FALSE(startup->release_for_ordinary());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+
+  const auto retained = context;
+  verifier->nonowning_grant = nullptr;
+  external_owner.reset();
+  ASSERT_TRUE(borrowed_lifetime.expired());
+  ASSERT_EQ(reconstruct(), retained);
+  ASSERT_TRUE(context->reconstructed());
+  EXPECT_EQ(verifier->calls, 2u);
+  EXPECT_EQ(b_calls, 1u);
+  EXPECT_EQ(driver_calls, 1u);
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_FALSE(context->status().source);
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+  {
+    std::lock_guard lock {model->mutex};
+    model->api_unavailable = false;
+  }
+  const auto backend = platf::source_backend::test_recovery_backend(*context);
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_EQ(model->transport_closes, closes + 1);
+  EXPECT_EQ(model->removals, 1u);
+  EXPECT_TRUE(journal_data().at("source_retired").get<bool>());
+  EXPECT_FALSE(verifier->lifetime.expired());
+  EXPECT_FALSE(backend->complete(1));
+  EXPECT_FALSE(startup->release_for_ordinary());
+  EXPECT_TRUE(ordinary_startup_recovery().mutation_excluded);
+}
+
 TEST_F(OwnedReconstructionTest, ArmedPresentRetainsExactSettingsAndRequiresRealCloseReceiptBeforeRetirement) {
   ASSERT_TRUE(crash_episode());
   const auto original = journal_data();
@@ -4439,6 +4597,51 @@ TEST_F(OwnedDisplayTest, ConcreteBackendBindsObservedVirtualSourceAndRevalidates
   EXPECT_EQ(model->removals, 1U);
 }
 
+TEST_F(OwnedDisplayTest, ConcreteBackendDropsGrantAfterVerifiedPreIntentFailure) {
+  model->query_failure = true;
+  const auto backend = concrete_backend();
+  EXPECT_FALSE(backend->begin(concrete_request(), 1, 1));
+  const auto diagnostics = platf::source_backend::test_diagnostics(*backend);
+  ASSERT_TRUE(diagnostics.acquisition);
+  EXPECT_EQ(diagnostics.acquisition->code, errc_t::enumeration_failed);
+  EXPECT_EQ(fresh_verifier->issues, 1U);
+  EXPECT_TRUE(fresh_verifier->lifetime.expired());
+  EXPECT_FALSE(std::filesystem::exists(path));
+  EXPECT_EQ(model->additions, 0U);
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  EXPECT_TRUE(backend->complete(1));
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendRetainsGrantWhenCommittedIntentReturnsNoManager) {
+  std::unique_ptr<void, decltype(&CloseHandle)> reader {nullptr, &CloseHandle};
+  auto backend = concrete_backend();
+  auto reset_hook = util::fail_guard([]() {
+    http::test_support::set_state_file_hook({});
+  });
+  deny_manager_load_after_commit(1, reader);
+  EXPECT_FALSE(backend->begin(concrete_request(), 1, 1));
+  ASSERT_TRUE(reader);
+  reader.reset();
+  const auto diagnostics = platf::source_backend::test_diagnostics(*backend);
+  ASSERT_TRUE(diagnostics.acquisition);
+  EXPECT_EQ(diagnostics.acquisition->code, errc_t::journal_failed);
+  const auto journal = ownership_journal_t::load(path, authority);
+  ASSERT_TRUE(journal);
+  EXPECT_EQ((*journal)->record().generation, 1U);
+  EXPECT_FALSE((*journal)->add_was_armed());
+  EXPECT_EQ(model->additions, 0U);
+  const auto lifetime = fresh_verifier->lifetime;
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_FALSE(backend->restore(1, 0ms));
+  EXPECT_FALSE(backend->cleanup_and_retire(1));
+  EXPECT_FALSE(backend->complete(1));
+  EXPECT_FALSE(lifetime.expired());
+  backend.reset();
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_TRUE((*journal)->validate(authority));
+}
+
 TEST_F(OwnedDisplayTest, ConcreteBackendArmedFailedAddKeepsHeartbeatUntilRestorationAndIssuedReceipt) {
   model->add_failure = true;
   const auto backend = concrete_backend();
@@ -4474,6 +4677,7 @@ TEST_F(OwnedDisplayTest, ConcreteBackendExceptionAfterIntentRetiresOnlyWithTheAd
   EXPECT_FALSE(backend->status().source_released);
   EXPECT_EQ(model->removals, 0U);
   EXPECT_FALSE(model->tick);
+  EXPECT_FALSE(fresh_verifier->lifetime.expired());
   ASSERT_TRUE(backend->restore(9, 0ms));
   ASSERT_TRUE(backend->cleanup_and_retire(9));
   EXPECT_TRUE(backend->status().source_released);
@@ -4481,7 +4685,9 @@ TEST_F(OwnedDisplayTest, ConcreteBackendExceptionAfterIntentRetiresOnlyWithTheAd
   EXPECT_TRUE(concrete_until(backend, 9, [](const auto &state) {
     return !state.recovery_pending;
   }));
+  EXPECT_FALSE(fresh_verifier->lifetime.expired());
   EXPECT_TRUE(backend->complete(9));
+  EXPECT_TRUE(fresh_verifier->lifetime.expired());
 }
 
 TEST_F(OwnedDisplayTest, ConcreteBackendUnarmedAcquisitionDenialRequiresRealUnarmedReceipt) {
@@ -4530,6 +4736,7 @@ TEST_F(OwnedDisplayTest, ConcreteBackendStickyHeartbeatAndCleanupFailureRetainSe
   EXPECT_TRUE(backend->status().heartbeat_failed);
   ASSERT_TRUE(backend->restore(1, 0ms));
   EXPECT_FALSE(backend->cleanup_and_retire(1));
+  EXPECT_FALSE(fresh_verifier->lifetime.expired());
   EXPECT_FALSE(backend->status().source_released);
   const auto diagnostics = platf::source_backend::test_diagnostics(*backend);
   EXPECT_FALSE(diagnostics.acquisition);
@@ -4545,6 +4752,7 @@ TEST_F(OwnedDisplayTest, ConcreteBackendStickyHeartbeatAndCleanupFailureRetainSe
     return !state.recovery_pending;
   }));
   EXPECT_TRUE(backend->complete(1));
+  EXPECT_TRUE(fresh_verifier->lifetime.expired());
 }
 
 TEST_F(OwnedDisplayTest, ConcreteBackendRejectsNativeDuringRetiredVirtualRecoveryAndRollsActualNextGuid) {
@@ -4593,14 +4801,45 @@ TEST_F(OwnedDisplayTest, ConcreteBackendRejectsNativeDuringRetiredVirtualRecover
   EXPECT_FALSE(backend->admits(native));
   EXPECT_FALSE(backend->begin(native, 2, 2));
   EXPECT_EQ(backend->status().generation, 1U);
-  EXPECT_TRUE(backend->admits(concrete_request(true)));
-  ASSERT_TRUE(backend->begin(concrete_request(true), 3, 3));
+  const auto lifetime = fresh_verifier->lifetime;
+  const auto other_grant = platf::source_backend::test_recovery_authorization(authority, std::make_shared<int>(0));
+  fresh_verifier->alias_target = other_grant.get();
+  using outcome_e = fixture_authority_t::outcome_e;
+  std::uint64_t next_generation = 2;
+  const auto next_request = concrete_request(true);
+  for (const auto outcome : {outcome_e::denied, outcome_e::exception, outcome_e::substituted, outcome_e::aliased_control_block, outcome_e::aliased_object}) {
+    fresh_verifier->outcome = outcome;
+    ASSERT_TRUE(backend->admits(next_request));
+    if (outcome == outcome_e::exception) {
+      EXPECT_THROW(backend->begin(next_request, next_generation, next_generation), std::runtime_error);
+    } else {
+      ASSERT_FALSE(backend->begin(next_request, next_generation, next_generation));
+    }
+    EXPECT_EQ(fresh_verifier->generation, next_generation);
+    EXPECT_EQ(fresh_verifier->monitor_uuid, next_request.monitor_uuid);
+    EXPECT_EQ(concrete_transaction->journal(), first_journal);
+    EXPECT_EQ(concrete_transaction->status().generation, 1U);
+    EXPECT_TRUE(first_journal->validate(authority));
+    EXPECT_FALSE(lifetime.expired());
+    EXPECT_EQ(model->additions, 1U);
+    ASSERT_TRUE(backend->restore(next_generation, 0ms));
+    ASSERT_TRUE(backend->cleanup_and_retire(next_generation));
+    EXPECT_TRUE(backend->status().recovery_pending);
+    EXPECT_FALSE(backend->admits(native));
+    ++next_generation;
+  }
+  fresh_verifier->alias_target = nullptr;
+  fresh_verifier->outcome = outcome_e::admitted;
+  ASSERT_TRUE(backend->admits(next_request));
+  ASSERT_TRUE(backend->begin(next_request, next_generation, next_generation));
+  EXPECT_EQ(fresh_verifier->issues, 1U);
+  EXPECT_FALSE(lifetime.expired());
   ASSERT_TRUE(backend->status().source);
   EXPECT_EQ(backend->status().source->monitor_uuid, concrete_request(true).monitor_uuid);
   EXPECT_EQ(backend->status().source->device_id, "virtual2");
   const auto second_journal = concrete_transaction->journal();
   EXPECT_TRUE(IsEqualGUID(second_journal->record().identity, second_identity));
-  EXPECT_EQ(second_journal->record().generation, 3U);
+  EXPECT_EQ(second_journal->record().generation, next_generation);
   EXPECT_FALSE(second_journal->source_retired());
   const auto carried = second_journal->settings();
   ASSERT_TRUE(carried);
@@ -4610,16 +4849,16 @@ TEST_F(OwnedDisplayTest, ConcreteBackendRejectsNativeDuringRetiredVirtualRecover
   EXPECT_EQ(carried_state.m_modified.m_original_primary_device, "dock");
   EXPECT_TRUE(carried_state.m_modified.m_original_modes.contains("dock"));
   backend->progress(1);
-  EXPECT_EQ(backend->status().generation, 3U);
+  EXPECT_EQ(backend->status().generation, next_generation);
   {
     std::lock_guard lock {model->mutex};
     EXPECT_EQ(model->removals, 1U);
     EXPECT_EQ(model->active, (ActiveTopology {{"virtual2"}}));
     model->present.insert("dock");
   }
-  ASSERT_TRUE(backend->restore(3, 0ms));
-  ASSERT_TRUE(backend->cleanup_and_retire(3));
-  EXPECT_TRUE(concrete_until(backend, 3, [](const auto &state) {
+  ASSERT_TRUE(backend->restore(next_generation, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(next_generation));
+  EXPECT_TRUE(concrete_until(backend, next_generation, [](const auto &state) {
     return !state.recovery_pending;
   }));
   EXPECT_TRUE(second_journal->source_retired());
@@ -4635,7 +4874,45 @@ TEST_F(OwnedDisplayTest, ConcreteBackendRejectsNativeDuringRetiredVirtualRecover
     EXPECT_FALSE(model->present.contains("virtual1"));
     EXPECT_FALSE(model->present.contains("virtual2"));
   }
-  EXPECT_TRUE(backend->complete(3));
+  EXPECT_TRUE(backend->complete(next_generation));
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendRetainsOriginalGrantWhenRotatedManagerCannotLoad) {
+  std::unique_ptr<void, decltype(&CloseHandle)> reader {nullptr, &CloseHandle};
+  auto backend = concrete_backend();
+  auto reset_hook = util::fail_guard([]() {
+    http::test_support::set_state_file_hook({});
+  });
+  ASSERT_TRUE(backend->begin(concrete_request(), 1, 1));
+  ASSERT_NE(concrete_transaction, nullptr);
+  const auto first_journal = concrete_transaction->journal();
+  const auto lifetime = fresh_verifier->lifetime;
+  ASSERT_TRUE(backend->restore(1, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  ASSERT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+    return state.restoration_ready;
+  }));
+  deny_manager_load_after_commit(2, reader);
+  EXPECT_FALSE(backend->begin(concrete_request(true), 2, 2));
+  ASSERT_TRUE(reader);
+  reader.reset();
+  const auto journal = concrete_transaction->journal();
+  EXPECT_NE(journal, first_journal);
+  EXPECT_FALSE(first_journal->validate(authority));
+  EXPECT_TRUE(journal->validate(authority));
+  EXPECT_EQ(journal->record().generation, 2U);
+  EXPECT_FALSE(journal->add_was_armed());
+  EXPECT_EQ(model->additions, 1U);
+  EXPECT_EQ(fresh_verifier->issues, 1U);
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_FALSE(backend->restore(2, 0ms));
+  EXPECT_FALSE(backend->cleanup_and_retire(2));
+  EXPECT_FALSE(backend->complete(2));
+  EXPECT_FALSE(lifetime.expired());
+  backend.reset();
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_TRUE(journal->validate(authority));
 }
 
 TEST_F(OwnedDisplayTest, ConcreteBackendRetriesCloseAfterRemovalWithoutRepeatingRemovalOrFabricatingReceipt) {
@@ -4659,6 +4936,7 @@ TEST_F(OwnedDisplayTest, ConcreteBackendRetriesCloseAfterRemovalWithoutRepeating
     EXPECT_FALSE(backend->status().source_released);
     ASSERT_TRUE(platf::source_backend::test_diagnostics(*backend).cleanup);
     EXPECT_EQ(platf::source_backend::test_diagnostics(*backend).cleanup->code, errc_t::close_failed);
+    EXPECT_FALSE(fresh_verifier->lifetime.expired());
     {
       std::lock_guard lock {model->mutex};
       model->close_failure = false;
@@ -4669,8 +4947,87 @@ TEST_F(OwnedDisplayTest, ConcreteBackendRetriesCloseAfterRemovalWithoutRepeating
     EXPECT_TRUE(concrete_until(backend, 1, [](const auto &state) {
       return !state.recovery_pending;
     }));
+    EXPECT_FALSE(fresh_verifier->lifetime.expired());
     EXPECT_TRUE(backend->complete(1));
+    EXPECT_TRUE(fresh_verifier->lifetime.expired());
   }
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendHoldsGrantThroughDelayedRestoreAndVerifiedClearBeforeFreshAdmission) {
+  using phase_e = rtsp_stream::source_backend_status_t::phase_e;
+  std::atomic_uint restore_observations {};
+  unsigned int clear_attempts {};
+  bool refuse_clear = true;
+  const auto backend = concrete_backend();
+  ASSERT_TRUE(backend->begin(concrete_request(), 1, 1));
+  const auto first_lifetime = fresh_verifier->lifetime;
+  auto reset_hooks = util::fail_guard([]() {
+    test_set_owned_restore_observer({});
+    http::test_support::set_state_replace_hook({});
+  });
+  test_set_owned_restore_observer([first_lifetime, &restore_observations](auto, const auto &) {
+    EXPECT_FALSE(first_lifetime.expired()) << "Scheduled B restoration";
+    ++restore_observations;
+  });
+  ASSERT_TRUE(backend->restore(1, 10ms));
+  EXPECT_FALSE(backend->complete(1));
+  ASSERT_TRUE(concrete_until(backend, 1, [&](const auto &state) {
+    return state.phase == phase_e::removal_ready && restore_observations > 0;
+  }));
+  ASSERT_TRUE(backend->cleanup_and_retire(1));
+  ASSERT_TRUE(concrete_until(backend, 1, [](const auto &state) {
+    return state.restoration_ready;
+  }));
+  http::test_support::set_state_replace_hook([&](const auto &destination, const auto &temporary, const auto &) -> std::optional<std::uint32_t> {
+    if (destination == path && std::filesystem::file_size(temporary) == 0) {
+      EXPECT_FALSE(first_lifetime.expired()) << "Checked B clear";
+      ++clear_attempts;
+      if (refuse_clear) {
+        return ERROR_ACCESS_DENIED;
+      }
+    }
+    return std::nullopt;
+  });
+  EXPECT_FALSE(backend->complete(1));
+  EXPECT_EQ(clear_attempts, 1U);
+  EXPECT_FALSE(first_lifetime.expired());
+  EXPECT_GT(std::filesystem::file_size(path), 0U);
+  refuse_clear = false;
+  ASSERT_TRUE(backend->complete(1));
+  EXPECT_EQ(clear_attempts, 2U);
+  EXPECT_TRUE(first_lifetime.expired());
+  EXPECT_EQ(std::filesystem::file_size(path), 0U);
+  test_set_owned_restore_observer({});
+  http::test_support::set_state_replace_hook({});
+
+  ASSERT_TRUE(backend->begin(concrete_request(true), 2, 2));
+  const auto second_lifetime = fresh_verifier->lifetime;
+  EXPECT_EQ(fresh_verifier->issues, 2U);
+  EXPECT_TRUE(first_lifetime.owner_before(second_lifetime) || second_lifetime.owner_before(first_lifetime));
+  EXPECT_FALSE(second_lifetime.expired());
+  ASSERT_TRUE(backend->restore(2, 0ms));
+  ASSERT_TRUE(backend->cleanup_and_retire(2));
+  ASSERT_TRUE(concrete_until(backend, 2, [](const auto &state) {
+    return state.restoration_ready;
+  }));
+  EXPECT_TRUE(backend->complete(2));
+  EXPECT_TRUE(second_lifetime.expired());
+}
+
+TEST_F(OwnedDisplayTest, ConcreteBackendAbandonmentHoldsGrantThroughHeartbeatAndTransportDestruction) {
+  auto backend = concrete_backend();
+  ASSERT_TRUE(backend->begin(concrete_request(), 1, 1));
+  const auto lifetime = fresh_verifier->lifetime;
+  EXPECT_FALSE(lifetime.expired());
+  backend.reset();
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_FALSE(model->tick);
+  EXPECT_EQ(model->transport_closes, 1U);
+  EXPECT_EQ(model->removals, 0U);
+  const auto journal = ownership_journal_t::load(path, authority);
+  ASSERT_TRUE(journal);
+  EXPECT_TRUE((*journal)->add_was_armed());
+  EXPECT_FALSE((*journal)->source_retired());
 }
 
 namespace {
