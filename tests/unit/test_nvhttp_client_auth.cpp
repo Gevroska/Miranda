@@ -1265,6 +1265,7 @@ TEST_F(ClientAuthorizationTest, NativePersistenceOutcomesPreserveOrPublishRealAu
 TEST_F(ClientAuthorizationTest, ReservationsFailExplicitlyInvalidateHeldTokensAndClaimAnnounceOnce) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
   const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  ASSERT_TRUE(nvhttp::current_client(uuid, credentials.x509));
   int prepared = 0;
   auto denied = permission_launch(uuid, credentials.x509);
   EXPECT_EQ(rtsp_stream::prepare_launch(denied, [&]() {
