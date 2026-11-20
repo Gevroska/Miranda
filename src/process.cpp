@@ -821,6 +821,12 @@ namespace proc {
     _apps.swap(other._apps);
   }
 
+  void proc_t::publish_app_order(std::vector<ctx_t> &apps, const state_guard_t &guard) noexcept {
+    assert(guard.lifetime == _state_mutex && guard.lock.owns_lock());
+    static_assert(noexcept(_apps.swap(apps)));
+    _apps.swap(apps);
+  }
+
   void proc_t::publish_catalog_revision(std::string &path, std::string &revision, const state_guard_t &guard) noexcept {
     assert(guard.lifetime == _state_mutex && guard.lock.owns_lock());
     static_assert(noexcept(_catalog_path.swap(path)) && noexcept(_catalog_revision.swap(revision)));
@@ -1291,7 +1297,7 @@ namespace proc {
     /**
      * @brief Execute process lane -> process state -> state-file preparation, replacement and nonthrowing publication.
      */
-    catalog_response transact_catalog_now(const std::string &file, const std::optional<std::string> &expected, const std::function<void(catalog::json &)> &mutation) {
+    catalog_response transact_catalog_now(const std::string &file, const std::optional<std::string> &expected, const std::function<void(catalog::json &)> &mutation, const std::optional<std::string> &order = std::nullopt) {
       catalog_response response;
       try {
         // The owner orders this lane; only the worker acquires process state and the state-file guard.
@@ -1299,9 +1305,12 @@ namespace proc {
         auto path = std::filesystem::absolute(file).lexically_normal().string();
         std::string revision;
         std::optional<proc_t> prepared;
+        std::optional<std::vector<ctx_t>> reordered_apps;
         std::shared_ptr<const published_snapshot_t> publication;
         bool ready = false;
-        const auto active = proc.active_identity();
+        // Polling for a live identity can run application cleanup. Reordering only needs the confirmed pair.
+        const auto previous = order ? proc.published_snapshot() : nullptr;
+        const auto active = previous ? std::pair {previous->lifetime.appid, previous->lifetime.app_uuid} : proc.active_identity();
         const auto success = http::update_state_file_bytes(file, [&](const std::string &original) -> std::optional<std::string> {
           try {
             const auto current_revision = util::hex(crypto::hash(original)).to_string();
@@ -1311,15 +1320,44 @@ namespace proc {
             auto tree = catalog::parse(original);
             catalog::validate(tree);
             const auto before = tree;
+            constexpr auto reload_identity = "Application catalog identities require normalization; reload before saving";
+            if (order && std::ranges::any_of(tree.at("apps"), [](const auto &app) {
+                  return !app.contains("id") || !app.contains("uuid") || app["uuid"] == "";
+                })) {
+              throw catalog::error {reload_identity, 409};
+            }
             catalog::normalize(tree, allocation_inputs(tree, active));
-            if (mutation) {
+            if (order) {
+              if (tree != before) {
+                throw catalog::error {reload_identity, 409};
+              }
+              const auto input = catalog::parse(*order);
+              if (!input.is_object() || input.size() != 1 || !input.contains("order")) {
+                throw catalog::error {"order: expected an object containing only the order array"};
+              }
+              auto &apps = tree.at("apps");
+              const auto positions = catalog::order_positions(apps, input.at("order"));
+              if (!std::ranges::is_sorted(positions)) {
+                // The administrator's catalog read anchors the durable rows to their evaluated contexts.
+                if (!proc.catalog_matches(path, current_revision)) {
+                  throw catalog::error {"Application catalog has not been loaded; reload before saving", 409};
+                }
+                auto ordered = catalog::json::array();
+                reordered_apps.emplace().reserve(positions.size());
+                for (const auto index : positions) {
+                  ordered.push_back(std::move(apps[index]));
+                  reordered_apps->push_back(previous->apps->at(index));
+                }
+                apps = std::move(ordered);
+              }
+            } else if (mutation) {
               mutation(tree);
               catalog::normalize(tree, allocation_inputs(tree, active));
             }
-            const auto changed = tree != before;
+            const bool changed = order ? reordered_apps.has_value() : tree != before;
             auto bytes = changed ? tree.dump(4) + "\n" : original;
-            revision = util::hex(crypto::hash(bytes)).to_string();
-            if (!proc.catalog_matches(path, revision)) {
+            revision = changed ? util::hex(crypto::hash(bytes)).to_string() : current_revision;
+            if (!order && !proc.catalog_matches(path, revision)) {
               prepared = parse_text(bytes);
               if (!prepared) {
                 throw catalog::error {"Application runtime settings could not be prepared"};
@@ -1348,15 +1386,21 @@ namespace proc {
               }
             }
             response = {200, tree.dump()};
-            // The process-state guard also fences claim changes. Preserve the exact published
-            // claim in this preallocated catalog snapshot rather than creating a claim-free view.
-            auto observation = std::make_shared<published_snapshot_t>(*proc.published_snapshot());
-            observation->lifetime = proc.lifetime_snapshot();
-            observation->app_name = proc.get_last_run_app_name();
-            observation->apps = std::make_shared<const std::vector<ctx_t>>(prepared ? prepared->apps_snapshot() : proc.apps_snapshot());
-            observation->catalog_path = path;
-            observation->catalog_revision = revision;
-            publication = std::move(observation);
+            if (!order || changed) {
+              // The process-state guard also fences claim changes. Preserve the exact published
+              // claim in this preallocated catalog snapshot rather than creating a claim-free view.
+              auto observation = std::make_shared<published_snapshot_t>(*(previous ? previous : proc.published_snapshot()));
+              if (reordered_apps) {
+                observation->apps = std::make_shared<const std::vector<ctx_t>>(*reordered_apps);
+              } else {
+                observation->lifetime = proc.lifetime_snapshot();
+                observation->app_name = proc.get_last_run_app_name();
+                observation->apps = std::make_shared<const std::vector<ctx_t>>(prepared ? prepared->apps_snapshot() : proc.apps_snapshot());
+              }
+              observation->catalog_path = path;
+              observation->catalog_revision = revision;
+              publication = std::move(observation);
+            }
             ready = true;
             return changed ? std::optional {std::move(bytes)} : std::nullopt;
           } catch (const catalog::error &error) {
@@ -1371,11 +1415,15 @@ namespace proc {
           }
           return response;
         }
-        if (prepared) {
-          proc.publish_apps_and_env(*prepared, state);
+        if (publication) {
+          if (reordered_apps) {
+            proc.publish_app_order(*reordered_apps, state);
+          } else if (prepared) {
+            proc.publish_apps_and_env(*prepared, state);
+          }
+          proc.publish_catalog_revision(path, revision, state);
+          proc.publish_snapshot(std::move(publication));
         }
-        proc.publish_catalog_revision(path, revision, state);
-        proc.publish_snapshot(std::move(publication));
       } catch (const catalog::error &error) {
         response = {error.status, catalog::json {{"status", false}, {"error", error.what()}}.dump()};
       } catch (const std::exception &) {
@@ -1384,17 +1432,19 @@ namespace proc {
       return response;
     }
 
-    catalog_response transact_catalog(std::string file, std::optional<std::string> expected, std::function<void(catalog::json &)> mutation) {
+    catalog_response transact_catalog(std::string file, std::optional<std::string> expected, std::function<void(catalog::json &)> mutation, std::optional<std::string> order = std::nullopt) {
       if (rtsp_stream::on_process_worker()) {
-        return transact_catalog_now(file, expected, mutation);
+        return transact_catalog_now(file, expected, mutation, order);
       }
-      auto task = std::make_shared<std::packaged_task<catalog_response()>>([file = std::move(file), expected = std::move(expected), mutation = std::move(mutation)]() {
-        return transact_catalog_now(file, expected, mutation);
+      const auto lifetime = order ? rtsp_stream::process_lifetime_e::preserve : rtsp_stream::process_lifetime_e::observe;
+      auto task = std::make_shared<std::packaged_task<catalog_response()>>([file = std::move(file), expected = std::move(expected), mutation = std::move(mutation), order = std::move(order)]() {
+        return transact_catalog_now(file, expected, mutation, order);
       });
       auto result = task->get_future();
       rtsp_stream::catalog_operation([task]() {
         (*task)();
-      });
+      },
+                                     lifetime);
       return result.get();
     }
 
@@ -1469,9 +1519,6 @@ namespace proc {
         apps.push_back(std::move(app));
       }
       catalog::validate(tree);
-      std::stable_sort(apps.begin(), apps.end(), [](const auto &left, const auto &right) {
-        return left.at("name").template get<std::string>() < right.at("name").template get<std::string>();
-      });
     });
   }
 
@@ -1493,6 +1540,13 @@ namespace proc {
       }
       apps.erase(it);
     });
+  }
+
+  catalog_response reorder_catalog_apps(const std::string &file, const std::string &revision, const std::string &order) {
+    if (revision.empty()) {
+      return {428, R"({"status":false,"error":"Application catalog revision is required"})"};
+    }
+    return transact_catalog(file, revision, {}, order);
   }
 
   void refresh(const std::string &file_name) {

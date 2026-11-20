@@ -275,12 +275,19 @@ namespace rtsp_stream {
    */
   bool authorize_operation(std::string_view uuid, std::string_view cert, permissions::mask_t required, std::function<void()> operation);
 
+  /** @brief Process lifetime publication policy for the completion of a serialized job. */
+  enum class process_lifetime_e {
+    observe,  ///< Refresh the process observation after an operation that may affect it.
+    preserve  ///< Keep the existing observation and leave polling to regular liveness checks.
+  };
+
   /**
    * @brief Order owned catalog work on the process FIFO and await outside the owner.
    * @param operation Must never wait for the owner or a control worker.
+   * @param lifetime Whether completion should observe the current process lifetime.
    * @note The quiescent legacy owner/startup path may execute directly. A busy owner must use an explicit continuation.
    */
-  void catalog_operation(std::function<void()> operation);
+  void catalog_operation(std::function<void()> operation, process_lifetime_e lifetime = process_lifetime_e::observe);
   /** @brief Queue an owned process/catalog operation in the owner's FIFO; wait only outside the owner. */
   std::future<void> process_operation(std::function<void()> operation);
   /** @brief Whether the current caller is the owner; blocking process/catalog wrappers reject owner waits. */
