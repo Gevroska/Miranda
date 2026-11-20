@@ -14,4 +14,6 @@ Independent review and locked formatting passed. The incremental Windows UCRT64 
 
 The same build passed the separate native recovery test whose callback now keeps its signal alive through delayed dispatch. The earlier recovery failures remain recorded with their original evidence.
 
+The full Windows run completed 1,427 cases with 1,409 passes, 13 skips and five failures. All five new and two expanded HTTPS cases, all nine managed HTTPS cases and both concrete owner cases passed. The five failures were two existing httpbin CURL7 download failures and three recovery adoption cases. One adoption case repeated a startup reconstruction refusal. Two others exceeded their cleanup or shutdown waits. The causes of the three adoption failures remain open.
+
 Current Artemis and Moonlight application acceptance, measured refresh rates, driver-backed Virtual operation and mixed-client streaming remain pending. Fractional-rate conversion, QR pairing, shortcuts and application management have separate acceptance criteria.
