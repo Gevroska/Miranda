@@ -5146,14 +5146,16 @@ TEST_F(ConcreteSourceRecoveryOwnerTest, PublicRetryRestartsStoppedNativeRestorat
   const auto generation = first->source_generation;
   ASSERT_TRUE(native_persistence->load());
   EXPECT_FALSE(native_persistence->load()->empty());
-  std::promise<void> entered, release;
+  auto entered_signal = std::make_shared<std::promise<void>>();
+  auto entered = entered_signal->get_future();
+  std::promise<void> release;
   const auto gate = release.get_future().share();
   auto first_attempt = std::make_shared<std::atomic_bool>(true);
   {
     std::lock_guard lock {model->mutex};
-    model->api_check_hook = [first_attempt, gate, &entered]() {
+    model->api_check_hook = [first_attempt, gate, entered_signal]() {
       if (first_attempt->exchange(false)) {
-        entered.set_value();
+        entered_signal->set_value();
         EXPECT_EQ(gate.wait_for(2s), std::future_status::ready);
         throw std::runtime_error {"inert native restore failure"};
       }
@@ -5163,7 +5165,7 @@ TEST_F(ConcreteSourceRecoveryOwnerTest, PublicRetryRestartsStoppedNativeRestorat
     release.set_value();
   });
   rtsp_stream::launch_session_clear(first->id);
-  ASSERT_EQ(entered.get_future().wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(entered.wait_for(1s), std::future_status::ready);
   ASSERT_TRUE(owner_until([]() {
     const auto state = rtsp_stream::source_snapshot();
     return !state.managed && state.recovery_pending;
