@@ -2,7 +2,7 @@
 
 - Identifier and milestone: inactive P3E2 completion and checked-release slice, following [owner adoption](P3e2-owner-adoption.md).
 - Requirements: DEC-02, DEC-05, DEC-16, DEC-17, DEC-22, DEC-31 through DEC-33 and DEC-46.
-- Base revision: `62c437ee153854b54d47c14b53bd77814fef153b`.
+- Integrated source checkpoint `2eb9e57edd23219cf41469ff054348ba18fff3ad` builds on `f75e2377a8bc93c00c7f71a7994d069f7fe69d88`.
 - Observable outcome: the same adopted context, generation, concrete B, independently held authorization and startup proof continue through verified journal completion and fresh checked release of their original ordinary exclusion. RTSP admission stays blocked until the owner consumes the matching terminal result.
 - Scope: the Windows source backend and startup coordinator, B completion, RTSP recovery progression, and their existing component fixtures.
 - Exclusions: production provider/factory registration, bootstrap and shutdown integration, source/application claims, capture metadata/epochs, new intent or driver acquisition, driver/storage transaction changes, provisioning, physical streaming and hardware qualification. Actual owner-object/process destruction remains abandonment under the existing lifetime contract.
@@ -25,7 +25,7 @@ The sole tagged future retains generation/revision/operation matching, the gener
 
 The existing backend, checked storage reader, ordinary exclusion transition and RTSP operation lane are extended at their current interfaces. No parallel recovery subsystem or new authority provider is introduced. The test storage reader moves with the private proof so injected native boundaries can survive coordinator destruction without changing production reads.
 
-Test-only lifecycle barriers and one-result tag/exception faults exercise the actual context and owner handoff. Existing successful adoption cases advance through terminal release; their custody/failure coverage remains alongside new completion/release barriers. Independent source review accepted the first frozen candidate without an actionable production defect. The callback-observation and checked-reader corrections require renewed review of the actual integrated diff.
+Test-only lifecycle barriers and one-result tag and exception faults exercise the actual context and owner handoff. Existing successful adoption cases advance through terminal release and retain their custody and failure coverage. Independent review accepted the formatted integration, including the callback observation and the three checked-reader cases already present on its base.
 
 The real scheduled restoration callback has a test-only function-scope finalization observer. Its existing status guards naturally leave scope before the observer runs; the pinned scheduler still holds its invocation mutex until callback return. The observer can read the revision fence but cannot mutate B. A regression observes completion invalidate that revision, remain blocked on the actual callback, allow copied status reads, and clear only after callback finalization with the actual terminal predicates satisfied. Genuine unavailable, exceptional-retry and unretired callback outcomes refuse completion and retain the reservation.
 
@@ -35,17 +35,18 @@ The actual-journal fixture reads through the existing checked read-only byte tra
 
 ## Validation
 
-Forty-seven new cases and one renamed/updated unarmed case are **authored and unexecuted**, alongside updated successful adoption expectations. No formatting, compilation, test execution, VM operation, CI operation, integration or publication was performed for this slice.
+All 346 focused Windows native tests passed without skips. They include the 44 new cases and the renamed unarmed case, alongside existing adoption and managed-session regressions. The Windows UCRT64 application and tests and the Web production build passed on a verified source overlay.
+
+The first full run reached the five-minute campaign limit after 592 passes and one skip while the suite was still progressing. A repeat used the same executable and test deadlines with an eight-minute campaign limit. It ran all 1,404 cases in 309.705 seconds and recorded 1,390 passes, 12 skips and the two established external httpbin download failures with CURL7. All 45 new or renamed cases passed in both the focused checks and the completed full run.
 
 | Check / environment | Candidate | Result | Evidence / limitation |
 |---|---|---|---|
-| Source and whitespace inspection | Working candidate on the stated base | Inspected; whitespace check clean | This establishes source structure only. |
-| Actual journal/B/lease fixtures with injected native boundaries | Working candidate | Authored, unexecuted | Success variants, changed bytes, exact command-lane fencing, copied status during clear, and failed/uncertain versus verified-residue transactions. |
-| Checked release and owner fixtures | Working candidate | Authored, unexecuted | Read/path/obligation/residue/exception failures; exact gate, B reservation and ordinary-manager refusal; release-only retries, duplicate coalescing, dispatch/result/revision failure and final admission after matching terminal consumption. |
-| Stop and persistent timer-registration failure | Working candidate | Authored, unexecuted | Before entry, during actual clear, between phases, before accepted release entry and within checked release read. Existing observation/process drain cases retain their original deadlines. |
-| Formatting, native focused/full suites and hosted checks | Working candidate | Not run | Required on the integrated, independently reviewed candidate. Earlier base evidence does not qualify these changes. |
-| Production lifetime, clean target and physical streaming | None | Excluded, unqualified | No production recovery registration or hardware claim. |
+| Independent review, locked formatting and whitespace | Integrated source checkpoint | Passed | Published reader fixture and its three regressions are preserved. |
+| Native Windows component, startup and backend | Integrated source overlay | 207, 32 and 15 passed | Includes actual journal and callback boundaries, refusal of unsafe release, and release-only retries. Driver interfaces are injected. |
+| Native Windows owner, managed HTTPS and capture | Integrated source overlay | 59, 6 and 27 passed | Includes Stop during both recovery phases and admission after matching terminal release. |
+| Full local native suite | Integrated source overlay | 1,390 passed, 12 skipped, 2 external download failures | First run timed out at the campaign limit. The complete run reported only the established external failures. Hosted checks for this completion change remain pending. |
+| Production lifetime, installed driver and physical streaming | None | Unqualified | This slice adds no production recovery registration. |
 
 ## Delivery
 
-This is an inactive source candidate. The next actions are independent review, formatting and focused/full affected native validation of the integrated revision. Production lifetime integration and protected provisioning remain separate work; process loss cannot reconstruct this in-memory completion handoff from empty storage.
+This is an inactive source candidate. Protected provisioning and production lifetime integration remain pending. After process loss, an empty journal alone supplies insufficient authority to reconstruct the in-memory completion handoff.
