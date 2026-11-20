@@ -46,6 +46,7 @@
   #include <src/platform/windows/source_backend.h>
   #include <src/platform/windows/source_startup.h>
   #include <src/process.h>
+  #include <src/uuid.h>
 
 namespace display_device {
   /** @brief Observe the real callback after its production guards leave scope; retain no state references. */
@@ -760,9 +761,8 @@ namespace {
 
     void SetUp() override {
       BaseTest::SetUp();
-      path = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / (std::string {::testing::UnitTest::GetInstance()->current_test_info()->name()} + ".display.json");
-      std::error_code error;
-      std::filesystem::remove(path, error);
+      // An interrupted test can leave transaction siblings alongside its journal.
+      path = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / ("owned-" + uuid_util::uuid_t::generate().string() + ".display.json");
     }
 
     void TearDown() override {
@@ -1199,6 +1199,7 @@ namespace {
     void write_bytes(const std::string &bytes) {
       std::ofstream output {path, std::ios::binary | std::ios::trunc};
       output << bytes;
+      output.close();
       ASSERT_TRUE(output.good());
     }
 
@@ -1482,9 +1483,15 @@ namespace {
       if (!data["mapping"].is_null()) {
         data["mapping"]["generation"] = recovery_generation;
       }
-      write_bytes(data.dump());
+      ASSERT_NO_FATAL_FAILURE(write_bytes(data.dump()));
       make_startup(std::move(read));
-      ASSERT_TRUE(reconstruct());
+      const auto reconstructed = reconstruct();
+      if (!reconstructed) {
+        const auto observed = startup->status();
+        FAIL() << "Startup reconstruction refused. Disposition=" << static_cast<int>(observed.disposition)
+               << " owned=" << static_cast<int>(observed.owned) << " ordinary=" << static_cast<int>(observed.ordinary)
+               << " exclusion_held=" << observed.exclusion_held << " prior_uncertainty=" << observed.prior_uncertainty;
+      }
       ASSERT_TRUE(context->reconstructed());
     }
 
@@ -2743,7 +2750,7 @@ TEST_F(OwnedRecoveryAdoptionTest, RetiredActualBContinuesWithoutDriverReacquisit
 
 TEST_F(OwnedRecoveryAdoptionTest, OfferedAndAdoptedAliasesCannotInspectFenceOrReconstructB) {
   ASSERT_TRUE(crash_episode());
-  prepare_startup();
+  ASSERT_NO_FATAL_FAILURE(prepare_startup());
   auto alias = context;
   const auto before = startup->status();
   std::promise<void> offered, release_offer;
