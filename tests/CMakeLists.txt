@@ -32,6 +32,12 @@ if(SUNSHINE_LLVM_COVERAGE)
 else()
     set(CMAKE_CXX_FLAGS "-fprofile-arcs -ftest-coverage -ggdb -O0")
     set(CMAKE_C_FLAGS "-fprofile-arcs -ftest-coverage -ggdb -O0")
+    if(WIN32)
+        # Windows links winpthread without -pthread, which leaves GCC coverage updates non-atomic.
+        add_compile_options(
+                "$<$<COMPILE_LANG_AND_ID:C,GNU>:-fprofile-update=atomic>"
+                "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-fprofile-update=atomic>")
+    endif()
 endif()
 
 set(SUNSHINE_TEST_GCOV_ROOT

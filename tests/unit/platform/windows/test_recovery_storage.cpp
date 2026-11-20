@@ -137,13 +137,19 @@ namespace {
       ASSERT_EQ(CoCreateGuid(&guid), S_OK);
       ASSERT_NE(StringFromGUID2(guid, id.data(), id.size()), 0);
       const auto name = std::wstring {L"MirandaRecoveryStorageTest-"} + id.data();
-      const auto base = fs::temp_directory_path().make_preferred();
+      const auto temporary = fs::temp_directory_path().make_preferred();
       std::array<wchar_t, 16> filesystem {};
       std::array<wchar_t, MAX_PATH> volume {};
-      if (!GetVolumePathNameW(base.c_str(), volume.data(), volume.size()) || GetDriveTypeW(volume.data()) != DRIVE_FIXED || !GetVolumeInformationW(volume.data(), nullptr, 0, nullptr, nullptr, nullptr, filesystem.data(), filesystem.size()) || std::wstring_view {filesystem.data()} != L"NTFS") {
+      if (!GetVolumePathNameW(temporary.c_str(), volume.data(), volume.size()) || GetDriveTypeW(volume.data()) != DRIVE_FIXED || !GetVolumeInformationW(volume.data(), nullptr, 0, nullptr, nullptr, nullptr, filesystem.data(), filesystem.size()) || std::wstring_view {filesystem.data()} != L"NTFS") {
         GTEST_SKIP() << "A writable private fixture on a fixed NTFS drive is required";
       }
 
+      // TEMP can contain an 8.3 alias. The reader compares each directory with its normalized name.
+      std::array<wchar_t, MAX_PATH> long_path {};
+      const auto length = GetLongPathNameW(temporary.c_str(), long_path.data(), long_path.size());
+      ASSERT_GT(length, 0u) << GetLastError();
+      ASSERT_LT(length, long_path.size());
+      const fs::path base {long_path.data()};
       roots = {name, base / name, current_user_sid()};
       ASSERT_FALSE(roots.fixture_owner_sid.empty());
       ASSERT_TRUE(create_directory(roots.program_data, directory_sddl()));
@@ -407,6 +413,7 @@ namespace {
   }
 
   TEST_F(RecoveryStorageTest, DirectorySymlinkIsRefusedEvenWhenTheTargetHasTheManifestIdentity) {
+    ASSERT_TRUE(test::inspect(roots));
     const auto target = product_path() / L"RetainedDirectory";
     ASSERT_TRUE(MoveFileExW(recovery_path().c_str(), target.c_str(), 0));
     if (!CreateSymbolicLinkW(recovery_path().c_str(), target.c_str(), SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {

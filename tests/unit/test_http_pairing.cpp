@@ -28,6 +28,7 @@
 
 // lib includes
 #include <boost/property_tree/xml_parser.hpp>
+#include <openssl/x509v3.h>
 #include <Simple-Web-Server/client_http.hpp>
 #include <Simple-Web-Server/client_https.hpp>
 #include <Simple-Web-Server/crypto.hpp>
@@ -537,7 +538,7 @@ namespace {
     /**
      * @brief Complete the actual HTTP certificate phases from the client side.
      */
-    void complete_one_time_handshake(const otp_credentials_t &credentials, const std::string &id, const crypto::creds_t &client, const bool expect_saved) {
+    void complete_one_time_handshake(const otp_credentials_t &credentials, const std::string &id, const crypto::creds_t &client, const std::string_view expected_host_certificate, const bool expect_saved) {
       const auto decode_xml = [](const std::string &body) {
         boost::property_tree::ptree tree;
         std::istringstream input {body};
@@ -552,7 +553,7 @@ namespace {
       const auto certificate_phase = decode_xml(certificate_body);
       ASSERT_EQ(certificate_phase.get("root.paired", 0), 1);
       const auto server_pem = util::from_hex_vec(certificate_phase.get<std::string>("root.plaincert"), true);
-      ASSERT_TRUE(server_pem == PUBLIC_CERT);
+      ASSERT_TRUE(server_pem == expected_host_certificate);
       EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(client.x509));
 
       // The client derives its AES key from binary salt and verifies the server's signed secret.
@@ -874,25 +875,41 @@ TEST_F(PairingHttpHandlerTest, OneTimeSignedHandshakePersistsExactlyTwoZeroGrant
   std::filesystem::remove(state_file, cleanup_error);
   ASSERT_FALSE(cleanup_error);
 
+  // Use a different common name so hostname verification must match the DNS SAN on every OpenSSL version.
+  auto host = crypto::gen_creds("Sunshine OTP fixture host", 2048);
+  auto host_certificate = crypto::x509(host.x509);
+  const auto host_key = crypto::pkey(host.pkey);
+  ASSERT_TRUE(host_certificate);
+  ASSERT_TRUE(host_key);
+  util::safe_ptr<X509_EXTENSION, &X509_EXTENSION_free> localhost_san {
+    X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, "DNS:localhost")
+  };
+  ASSERT_TRUE(localhost_san);
+  ASSERT_EQ(X509_add_ext(host_certificate.get(), localhost_san.get(), -1), 1);
+  ASSERT_GT(X509_sign(host_certificate.get(), host_key.get(), EVP_sha256()), 0);
+  host.x509 = crypto::pem(host_certificate);
+  ASSERT_FALSE(host.x509.empty());
+  setup(host.pkey, host.x509);
+
   const auto first = test_utils::certificates::generate_ca_credentials("First OTP fixture client");
   const auto second = test_utils::certificates::generate_ca_credentials("Second OTP fixture client");
   const auto unrelated = test_utils::certificates::generate_ca_credentials("Unrelated OTP fixture client");
   const auto first_invitation = issue_one_time_pairing("First labelled client");
   ASSERT_TRUE(first_invitation);
-  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*first_invitation, "first-fixture", first, true));
+  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*first_invitation, "first-fixture", first, host.x509, true));
   EXPECT_EQ(get_all_clients().size(), 1);
 
   config::nvhttp.file_state = state_file + "/missing/state.json";
   const auto failed_save = issue_one_time_pairing({});
   ASSERT_TRUE(failed_save);
-  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*failed_save, "second-fixture", second, false));
+  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*failed_save, "second-fixture", second, host.x509, false));
   EXPECT_EQ(get_all_clients().size(), 1);
   EXPECT_FALSE(withdraw_one_time_pairing(failed_save->generation_id));
   config::nvhttp.file_state = state_file;
 
   const auto second_invitation = issue_one_time_pairing({});
   ASSERT_TRUE(second_invitation);
-  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*second_invitation, "second-fixture", second, true));
+  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*second_invitation, "second-fixture", second, host.x509, true));
   std::ifstream saved {state_file};
   ASSERT_TRUE(saved.good());
   const auto records = nlohmann::json::parse(saved).at("root").at("named_devices");
@@ -917,8 +934,8 @@ TEST_F(PairingHttpHandlerTest, OneTimeSignedHandshakePersistsExactlyTwoZeroGrant
   EXPECT_TRUE(get_cert_by_uuid(second_uuid) == crypto::pem(second_certificate));
   EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(unrelated.x509));
 
-  std::ofstream {host_cert_file} << PUBLIC_CERT << '\n';
-  std::ofstream {host_key_file} << PRIVATE_KEY << '\n';
+  std::ofstream {host_cert_file} << host.x509;
+  std::ofstream {host_key_file} << host.pkey;
   std::shared_ptr<SimpleWeb::ScopeRunner> scope;
   auto tls_server = nvhttp::test_support::make_https_server(host_cert_file, host_key_file, scope, true);
   bool host_audio = false;
