@@ -47,6 +47,7 @@
 #endif
 
 // local includes
+#include "app_catalog.h"
 #include "config.h"
 #include "confighttp.h"
 #include "crypto.h"
@@ -1336,6 +1337,50 @@ namespace confighttp {
   }
 
   /**
+   * @brief Save a complete application order using the revision returned by GET /api/apps.
+   * @param response The HTTP response object.
+   * @param request The authenticated JSON request with one If-Match header.
+   *
+   * @api_examples{/api/apps/order|:| PUT|:| {"order":["11111111-1111-1111-1111-111111111111"]}}
+   */
+  void reorderApps(const resp_https_t &response, const req_https_t &request) {
+    using enum SimpleWeb::StatusCode;
+    if (!authenticate(response, request) || !validate_csrf_token(response, request, get_client_id(request))) {
+      return;
+    }
+    if (request->header.count("Content-Type") > 1) {
+      bad_request(response, "Exactly one Content-Type header is required");
+      return;
+    }
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+
+    const auto [match, match_end] = request->header.equal_range("If-Match");
+    if (match != match_end && std::next(match) != match_end) {
+      bad_request(response, "Exactly one If-Match revision is required");
+      return;
+    }
+    const auto revision = match == match_end ? std::string {} : boost::trim_copy_if(match->second, boost::is_any_of(" \t"));
+    if (revision.empty()) {
+      response->write(client_error_precondition_required, R"({"status":false,"error":"Application catalog revision is required"})", {{"Content-Type", "application/json"}});
+      return;
+    }
+    if (revision.contains(',') || revision.contains('\0')) {
+      bad_request(response, "Invalid If-Match revision");
+      return;
+    }
+
+    const auto body = request->content.string();
+    if (body.contains('\0')) {
+      bad_request(response, "Invalid application order");
+      return;
+    }
+    const auto result = proc::reorder_catalog_apps(config::stream.file_apps, revision, body);
+    response->write(static_cast<SimpleWeb::StatusCode>(result.status), result.body, {{"Content-Type", "application/json"}});
+  }
+
+  /**
    * @brief Close the currently running application.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -1661,8 +1706,9 @@ namespace confighttp {
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    *
-   * @note{The index in the url path is the application index.}
+   * @note{The path selects an application by UUID or legacy zero-based index.}
    *
+   * @api_examples{/api/covers/11111111-1111-1111-1111-111111111111 |:| GET|:| null}
    * @api_examples{/api/covers/9999 |:| GET|:| null}
    */
   void getCover(const resp_https_t &response, const req_https_t &request) {
@@ -1673,25 +1719,51 @@ namespace confighttp {
     print_req(request);
 
     try {
-      const int index = std::stoi(request->path_match[1]);
+      auto index = 0;
+      std::optional<std::string> uuid;
+      if (request->path_match[1].matched) {
+        const auto selector = request->path_match[1].str();
+        const auto *end = selector.data() + selector.size();
+        const auto [ptr, ec] = std::from_chars(selector.data(), end, index);
+        if (ec != std::errc {} || ptr != end) {
+          bad_request(response, "Application cover index is out of range");
+          return;
+        }
+      } else {
+        uuid = proc::catalog::canonical_uuid(request->path_match[2].str());
+        if (!uuid) {
+          not_found(response, "Cover image not found");
+          return;
+        }
+      }
+
       const auto catalog = proc::read_catalog(config::stream.file_apps);
       if (catalog.status != 200) {
         response->write(static_cast<SimpleWeb::StatusCode>(catalog.status), catalog.body, {{"Content-Type", "application/json"}});
         return;
       }
-      auto file_tree = nlohmann::json::parse(catalog.body);
-      auto &apps = file_tree["apps"];
-      if (index < 0 || static_cast<std::size_t>(index) >= apps.size()) {
+      const auto file_tree = nlohmann::json::parse(catalog.body);
+      const auto &apps = file_tree.at("apps");
+      auto app = apps.end();
+      if (uuid) {
+        app = std::ranges::find_if(apps, [&uuid](const auto &entry) {
+          return entry.at("uuid") == *uuid;
+        });
+      } else if (static_cast<std::size_t>(index) < apps.size()) {
+        app = apps.begin() + index;
+      } else {
         bad_request(response, "Application cover index is out of range");
         return;
       }
-
-      auto &app = apps[index];
+      if (app == apps.end()) {
+        not_found(response, "Cover image not found");
+        return;
+      }
 
       // Get the image path from the app configuration
       std::string app_image_path;
-      if (app.contains("image-path") && !app["image-path"].is_null()) {
-        app_image_path = app["image-path"];
+      if (const auto image_path = app->find("image-path"); image_path != app->end() && !image_path->is_null()) {
+        app_image_path = *image_path;
       }
 
       // Use validate_app_image_path to resolve and validate the path
@@ -1700,7 +1772,7 @@ namespace confighttp {
 
       // Check if we got the default image path (means validation failed or no image configured)
       if (validated_path == DEFAULT_APP_IMAGE_PATH) {
-        BOOST_LOG(debug) << "Application at index " << index << " does not have a valid cover image";
+        BOOST_LOG(debug) << "Application does not have a valid cover image";
         not_found(response, "Cover image not found");
         return;
       }
@@ -1719,9 +1791,9 @@ namespace confighttp {
       headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
 
       response->write(SimpleWeb::StatusCode::success_ok, in, headers);
-    } catch (std::exception &e) {
+    } catch (const std::exception &e) {
       BOOST_LOG(warning) << "GetCover: "sv << e.what();
-      bad_request(response, e.what());
+      bad_request(response, "Unable to read cover image file");
     }
   }
 
@@ -2534,6 +2606,16 @@ namespace confighttp {
     }
   }
 
+  void configure_app_catalog_routes(https_server_t &server) {
+    server.resource["^/api/apps$"]["GET"] = getApps;
+    server.resource["^/api/apps$"]["POST"] = saveApp;
+    server.resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = deleteApp;
+    server.resource["^/api/apps/close$"]["POST"] = closeApp;
+    server.resource["^/api/apps/order$"]["PUT"] = reorderApps;
+    server.resource["^/api/covers/(?:([0-9]+)|([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}))$"]["GET"] = getCover;
+    server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
+  }
+
   /**
    * @brief Start the HTTPS configuration server.
    */
@@ -2570,10 +2652,7 @@ namespace confighttp {
 
     // rest api
     server.resource["^/api/browse$"]["GET"] = browseDirectory;
-    server.resource["^/api/apps$"]["GET"] = getApps;
-    server.resource["^/api/apps$"]["POST"] = saveApp;
-    server.resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = deleteApp;
-    server.resource["^/api/apps/close$"]["POST"] = closeApp;
+    configure_app_catalog_routes(server);
     server.resource["^/api/clients/list$"]["GET"] = getClients;
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;
     server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
@@ -2581,8 +2660,6 @@ namespace confighttp {
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
-    server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
-    server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     configure_pairing_invitation_routes(server);
     server.resource["^/api/password$"]["POST"] = savePassword;
     server.resource["^/api/pin$"]["DELETE"] = cancelPairing;

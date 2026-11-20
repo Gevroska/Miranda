@@ -45,10 +45,6 @@
 #endif
 
 namespace confighttp {
-  void getApps(const resp_https_t &response, const req_https_t &request);
-  void saveApp(const resp_https_t &response, const req_https_t &request);
-  void closeApp(const resp_https_t &response, const req_https_t &request);
-  void deleteApp(const resp_https_t &response, const req_https_t &request);
   /**
    * @brief Production device-administration route exercised by the existing HTTPS fixture.
    * @param response Response object.
@@ -209,12 +205,9 @@ protected:
     server->config.timeout_content = 300;
 
     server->resource["^/client-update-test$"]["POST"] = confighttp::updateClient;
-    server->resource["^/api/apps$"]["GET"] = confighttp::getApps;
-    server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
-    server->resource["^/api/apps/close$"]["POST"] = confighttp::closeApp;
+    confighttp::configure_app_catalog_routes(*server);
     confighttp::configure_pairing_invitation_routes(*server);
     nvhttp::test_support::set_otp_listener_running(true);
-    server->resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = confighttp::deleteApp;
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -372,6 +365,9 @@ protected:
     server->resource["^/pairing-test$"]["POST"] = confighttp::savePin;
     server->resource["^/portal-token-reset-test$"]["POST"] = confighttp::resetPortalToken;
     server->default_resource["GET"] = confighttp::getFallbackPage;
+    server->default_resource["PUT"] = [](const auto &response, const auto &) {
+      confighttp::bad_request(response);
+    };
 
     // Start server
     server_thread = std::jthread([this]() {
@@ -2442,6 +2438,11 @@ protected:
     }
     return result;
   }
+
+  static std::string file_bytes(const std::string &path) {
+    std::ifstream file {path, std::ios::binary};
+    return {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+  }
 };
 
 /**
@@ -2455,11 +2456,6 @@ protected:
   std::string previous_host_id;
   std::string previous_host_name;
   bool previous_fresh_state = false;
-
-  static std::string file_bytes(const std::string &path) {
-    std::ifstream file {path, std::ios::binary};
-    return {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
-  }
 
   void SetUp() override {
     previous_state_file = config::nvhttp.file_state;
@@ -2533,6 +2529,191 @@ TEST_P(AppShortcutCatalogApiTest, AuthorizedReadKeepsRevisionAndOverwritesOnlyRe
 }
 
 INSTANTIATE_TEST_SUITE_P(HostIdentity, AppShortcutCatalogApiTest, testing::Bool());
+
+/**
+ * @brief Exercise the production routes with two distinct applications and cover files.
+ */
+class AppOrderingApiTest: public AppCatalogApiTest {
+protected:
+  static constexpr auto first_uuid = "abcdabcd-1111-4111-8111-111111111111";
+  static constexpr auto first_uuid_upper = "ABCDABCD-1111-4111-8111-111111111111";
+  static constexpr auto second_uuid = "bbbbbbbb-2222-4222-8222-222222222222";
+  static constexpr auto order_path = "/api/apps/order";
+  static constexpr std::string_view first_png = "\x89PNG\r\n\x1a\nfirst";
+  static constexpr std::string_view second_png = "\x89PNG\r\n\x1a\nsecond";
+
+  void SetUp() override {
+    AppCatalogApiTest::SetUp();
+    const auto first_path = test_web_dir / "first.png";
+    const auto second_path = test_web_dir / "second.png";
+    std::ofstream {first_path, std::ios::binary} << first_png;
+    std::ofstream {second_path, std::ios::binary} << second_png;
+    const nlohmann::json apps = {
+      {"env", nlohmann::json::object()},
+      {"apps", {{{"name", "Same name"}, {"uuid", first_uuid}, {"image-path", first_path.string()}}, {{"name", "Same name"}, {"uuid", second_uuid}, {"image-path", second_path.string()}}}},
+    };
+    std::ofstream {config::stream.file_apps} << apps;
+  }
+
+  static std::string order(const char *first = second_uuid, const char *second = first_uuid) {
+    return nlohmann::json {{"order", {first, second}}}.dump();
+  }
+
+  static void expect_denied(const std::shared_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>::Response> &response, std::string_view status) {
+    EXPECT_TRUE(response->status_code.starts_with(status)) << response->status_code;
+    const auto bytes = response->content.string();
+    const auto body = nlohmann::json::parse(bytes, nullptr, false);
+    ASSERT_TRUE(body.is_object()) << bytes;
+    EXPECT_EQ(body.at("status"), false);
+    EXPECT_TRUE(body.at("error").is_string());
+    EXPECT_EQ(body.size(), body.contains("status_code") ? 3U : 2U);
+    EXPECT_LE(bytes.size(), 160U);
+    EXPECT_FALSE(bytes.contains(config::stream.file_apps));
+    EXPECT_FALSE(bytes.contains(first_uuid));
+    EXPECT_FALSE(bytes.contains(second_uuid));
+  }
+};
+
+TEST_F(AppOrderingApiTest, AuthenticatesBeforeReadingCatalogAndUsesExistingCsrfPolicy) {
+  const auto legacy_bytes = file_bytes(config::stream.file_apps);
+  expect_denied(client->request("PUT", order_path, order(), {{"Content-Type", "application/json"}}), "401");
+  EXPECT_EQ(file_bytes(config::stream.file_apps), legacy_bytes);
+
+  auto request_headers = headers(false);
+  const auto get = client->request("GET", "/api/apps", "", request_headers);
+  ASSERT_EQ(get->status_code, "200 OK");
+  const auto initial = nlohmann::json::parse(get->content.string());
+  request_headers.emplace("If-Match", initial.at("revision").get<std::string>());
+  request_headers.emplace("Origin", "https://example.invalid");
+  const auto committed_bytes = file_bytes(config::stream.file_apps);
+  expect_denied(client->request("PUT", order_path, order(), request_headers), "400");
+  request_headers.emplace("X-CSRF-Token", "invalid");
+  expect_denied(client->request("PUT", order_path, order(), request_headers), "400");
+  EXPECT_EQ(file_bytes(config::stream.file_apps), committed_bytes);
+
+  const auto token = client->request("GET", "/api/csrf-token", "", headers(false));
+  ASSERT_EQ(token->status_code, "200 OK");
+  request_headers.find("X-CSRF-Token")->second = nlohmann::json::parse(token->content.string()).at("csrf_token").get<std::string>();
+  const auto put = client->request("PUT", order_path, order(), request_headers);
+  ASSERT_EQ(put->status_code, "200 OK");
+  const auto reordered = nlohmann::json::parse(put->content.string());
+  EXPECT_TRUE(reordered.at("status").get<bool>());
+  EXPECT_NE(reordered.at("revision"), initial.at("revision"));
+  EXPECT_FALSE(reordered.contains("host_uuid"));
+  EXPECT_FALSE(reordered.contains("host_name"));
+  EXPECT_EQ(reordered.at("apps").at(0), initial.at("apps").at(1));
+  EXPECT_EQ(reordered.at("apps").at(1), initial.at("apps").at(0));
+  const auto reordered_bytes = file_bytes(config::stream.file_apps);
+  expect_denied(client->request("PUT", order_path, order(first_uuid, second_uuid), request_headers), "409");
+  EXPECT_EQ(file_bytes(config::stream.file_apps), reordered_bytes);
+}
+
+TEST_F(AppOrderingApiTest, RejectsInexactRouteRevisionMediaTypeAndInvalidOrder) {
+  auto request_headers = headers(false);
+  request_headers.emplace("Origin", "https://localhost");
+  const auto get = client->request("GET", "/api/apps", "", request_headers);
+  ASSERT_EQ(get->status_code, "200 OK");
+  const auto revision = nlohmann::json::parse(get->content.string()).at("revision").get<std::string>();
+  const auto committed_bytes = file_bytes(config::stream.file_apps);
+  const auto put = [&](const std::string &body) {
+    return client->request("PUT", order_path, body, request_headers);
+  };
+  const auto rejected_route = client->request("GET", order_path, "", request_headers);
+  EXPECT_EQ(rejected_route->status_code, "404 Not Found");
+  expect_denied(put(order()), "428");
+  request_headers.emplace("if-match", "");
+  expect_denied(put(order()), "428");
+  request_headers.find("If-Match")->second = " \t ";
+  expect_denied(put(order()), "428");
+  request_headers.find("If-Match")->second = revision;
+  request_headers.emplace("IF-MATCH", revision);
+  expect_denied(put(order()), "400");
+  request_headers.erase("If-Match");
+  request_headers.emplace("If-Match", revision + ", " + revision);
+  expect_denied(put(order()), "400");
+  request_headers.find("If-Match")->second = revision;
+  expect_denied(client->request("PUT", std::string {order_path} + "/", order(), request_headers), "400");
+
+  request_headers.find("Content-Type")->second = "text/plain";
+  expect_denied(put(order()), "400");
+  request_headers.erase("Content-Type");
+  expect_denied(put(order()), "400");
+  request_headers.emplace("Content-Type", "Application/JSON; charset=utf-8");
+  request_headers.emplace("content-type", "application/json");
+  expect_denied(put(order()), "400");
+  request_headers.erase("Content-Type");
+  request_headers.emplace("Content-Type", "Application/JSON; charset=utf-8");
+
+  for (const auto *body : {
+         "{",
+         "[]",
+         "{}",
+         R"({"order":"invalid"})",
+         R"({"order":[]})",
+         R"({"order":[1,false]})",
+         R"({"order":[],"application":[]})",
+         R"({"order":[],"order":[]})",
+         R"({"order":["abcdabcd-1111-4111-8111-111111111111"]})",
+         R"({"order":["abcdabcd-1111-4111-8111-111111111111","bbbbbbbb-2222-4222-8222-222222222222","cccccccc-3333-4333-8333-333333333333"]})",
+       }) {
+    SCOPED_TRACE(body);
+    expect_denied(put(body), "400");
+  }
+  expect_denied(put(order(first_uuid, first_uuid_upper)), "400");
+  expect_denied(put(order(first_uuid, "00000000-0000-0000-0000-000000000000")), "400");
+  expect_denied(put(order(first_uuid, "cccccccc-3333-4333-8333-333333333333")), "400");
+  auto nul_body = order();
+  nul_body.append("\0{}", 3);
+  expect_denied(put(nul_body), "400");
+  const auto unchanged = put(order(first_uuid, second_uuid));
+  ASSERT_EQ(unchanged->status_code, "200 OK");
+  EXPECT_EQ(nlohmann::json::parse(unchanged->content.string()).at("revision"), revision);
+  EXPECT_EQ(file_bytes(config::stream.file_apps), committed_bytes);
+}
+
+TEST_F(AppOrderingApiTest, UuidCoversKeepTheirBytesWhileLegacyIndexesFollowOrder) {
+  const auto first_url = std::string {"/api/covers/"} + first_uuid;
+  const auto second_url = std::string {"/api/covers/"} + second_uuid;
+  expect_denied(client->request("GET", first_url), "401");
+  EXPECT_TRUE(client->request("GET", "/api/covers/0")->status_code.starts_with("401"));
+
+  auto request_headers = headers(false);
+  const auto get = client->request("GET", "/api/apps", "", request_headers);
+  ASSERT_EQ(get->status_code, "200 OK");
+  const auto expect_cover = [&](const std::string &path, const std::string_view image) {
+    const auto response = client->request("GET", path, "", request_headers);
+    ASSERT_EQ(response->status_code, "200 OK") << path;
+    ASSERT_TRUE(response->header.contains("Content-Type"));
+    EXPECT_EQ(response->header.find("Content-Type")->second, "image/png");
+    assert_security_headers(response);
+    EXPECT_EQ(response->content.string(), image);
+  };
+  expect_cover(first_url, first_png);
+  expect_cover(second_url, second_png);
+  expect_cover("/api/covers/00", first_png);
+  expect_cover("/api/covers/1", second_png);
+
+  request_headers.emplace("Origin", "https://localhost");
+  request_headers.emplace("iF-mAtCh", nlohmann::json::parse(get->content.string()).at("revision").get<std::string>());
+  ASSERT_EQ(client->request("PUT", order_path, order(second_uuid, first_uuid_upper), request_headers)->status_code, "200 OK");
+  expect_cover(first_url, first_png);
+  expect_cover(std::string {"/api/covers/"} + first_uuid_upper, first_png);
+  expect_cover(second_url, second_png);
+  expect_cover("/api/covers/0", second_png);
+  expect_cover("/api/covers/1", first_png);
+  EXPECT_EQ(client->request("GET", "/api/covers/2", "", request_headers)->status_code, "400 Bad Request");
+  EXPECT_EQ(client->request("GET", "/api/covers/10000000000", "", request_headers)->status_code, "400 Bad Request");
+  for (const auto &path : {first_url + "/", first_url + "x", std::string {"/api/covers/0x"}, std::string {"/api/covers/abcdabcda1111-4111-8111-11111111111"}}) {
+    EXPECT_EQ(client->request("GET", path, "", request_headers)->status_code, "404 Not Found") << path;
+  }
+
+  std::ofstream {test_web_dir / "second.png", std::ios::binary} << "invalid PNG signature";
+  for (const auto &path : {second_url, std::string {"/api/covers/00000000-0000-0000-0000-000000000000"}, std::string {"/api/covers/cccccccc-3333-4333-8333-333333333333"}}) {
+    const auto missing = client->request("GET", path, "", request_headers);
+    EXPECT_EQ(missing->status_code, "404 Not Found");
+    EXPECT_EQ(nlohmann::json::parse(missing->content.string()), (nlohmann::json {{"error", "Cover image not found"}, {"status_code", 404}}));
+  }
+}
 
 TEST_F(AppCatalogApiTest, RevisionAndUuidPreconditionsRejectStaleTabsAndKeepUnknownFields) {
   const auto fetched = client->request("GET", "/api/apps", "", headers(false));
