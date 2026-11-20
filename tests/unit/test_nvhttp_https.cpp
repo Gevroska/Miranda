@@ -929,7 +929,9 @@ namespace {
     EXPECT_EQ(*nvhttp::shortcut_host_uuid(), host_uuid);
 
     start_server(true, true);
-    const auto metadata = exchange("/serverinfo?uniqueid=fixture");
+    auto client = connect_client(&credentials_a);
+    send(*client, "GET /serverinfo?uniqueid=fixture HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    const auto metadata = read_response(*client);
     EXPECT_TRUE(metadata.contains("status_code=\"200\""));
     EXPECT_TRUE(metadata.contains("<uniqueid>" + std::string {*nvhttp::shortcut_host_uuid()} + "</uniqueid>"));
     EXPECT_TRUE(metadata.contains("<hostname>Room &amp; Office</hostname>"));
