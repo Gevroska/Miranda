@@ -9,6 +9,7 @@
 
 // test includes
 #include "../tests_common.h"
+#include "../tests_log_checker.h"
 
 // standard includes
 #include <array>
@@ -53,6 +54,8 @@ namespace confighttp {
    * @param request Authenticated JSON request.
    */
   void updateClient(resp_https_t response, req_https_t request);
+  void configure_pairing_invitation_routes(SimpleWeb::Server<SimpleWeb::HTTPS> &server);
+  void expire_csrf_token_for_testing(std::string_view client_id);
 }  // namespace confighttp
 
 using namespace std::literals;
@@ -208,6 +211,8 @@ protected:
     server->resource["^/api/apps$"]["GET"] = confighttp::getApps;
     server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
     server->resource["^/api/apps/close$"]["POST"] = confighttp::closeApp;
+    confighttp::configure_pairing_invitation_routes(*server);
+    nvhttp::test_support::set_otp_listener_running(true);
     server->resource["^/api/apps/([0-9A-Fa-f-]{36})$"]["DELETE"] = confighttp::deleteApp;
 
     // Add a route to test authentication directly
@@ -408,6 +413,8 @@ protected:
     config::sunshine.locale = saved_locale;
     config::sunshine.csrf_allowed_origins = saved_csrf_allowed_origins;
     nvhttp::expire_pair_sessions(std::chrono::steady_clock::time_point::max());
+    nvhttp::test_support::set_otp_listener_running(false);
+    nvhttp::test_support::set_otp_random(nullptr);
 
     // Clean up test HTML file from WEB_DIR
     if (std::filesystem::exists(web_dir_test_file)) {
@@ -449,6 +456,13 @@ protected:
     const auto csp = response->header.find("Content-Security-Policy");
     ASSERT_NE(csp, response->header.end());
     ASSERT_EQ(csp->second, "frame-ancestors 'none';");
+  }
+
+  static void assert_uncached(const std::shared_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>::Response> &response) {
+    assert_security_headers(response);
+    const auto cache = response->header.find("Cache-Control");
+    ASSERT_NE(cache, response->header.end());
+    EXPECT_EQ(cache->second, "no-store");
   }
 
   static void assert_json_error_response(const std::shared_ptr<SimpleWeb::Client<SimpleWeb::HTTPS>::Response> &response, const std::string_view &expected_message, const std::string_view &expected_status_code) {
@@ -611,6 +625,192 @@ TEST_F(ConfigHttpTest, PairingMutationsRejectUnauthenticatedRestRequests) {
     headers
   );
   EXPECT_EQ(delete_response->status_code, "401 Unauthorized");
+}
+
+TEST_F(ConfigHttpTest, OneTimePairingAdministrationRequiresAuthenticationAndOneStoredCsrfHeader) {
+  const auto initial = nvhttp::issue_one_time_pairing({});
+  ASSERT_TRUE(initial);
+  SimpleWeb::CaseInsensitiveMultimap headers {{"Content-Type", "application/json"}};
+  const auto issue = [&](const std::string &path = "/api/otp") {
+    return client->request("POST", path, "{}", headers);
+  };
+  const auto withdraw = [&]() {
+    return client->request("DELETE", "/api/otp", nlohmann::json {{"generation", initial->generation_id}}.dump(), headers);
+  };
+  const auto verify_denial = [&](const auto &response, const std::string_view status) {
+    EXPECT_EQ(response->status_code, status);
+    assert_uncached(response);
+    EXPECT_FALSE(response->content.string().contains("passphrase"));
+  };
+  const auto username = config::sunshine.username;
+  config::sunshine.username.clear();
+  verify_denial(issue(), "307 Temporary Redirect");
+  config::sunshine.username = username;
+
+  verify_denial(issue(), "401 Unauthorized");
+  verify_denial(withdraw(), "401 Unauthorized");
+  headers.emplace("Authorization", "Basic");
+  verify_denial(issue(), "401 Unauthorized");
+  headers.erase("Authorization");
+  headers.emplace("Authorization", create_auth_header("testuser", "invalid-password"));
+  verify_denial(issue(), "401 Unauthorized");
+  headers.erase("Authorization");
+  headers.emplace("authorization", create_auth_header("testuser", "testpass"));
+  constexpr auto diagnostic_header = "synthetic-otp-admin-header-sentinel";
+  headers.emplace("X-Fixture-Diagnostic", diagnostic_header);
+  verify_denial(issue(), "400 Bad Request");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+  verify_denial(issue(), "400 Bad Request");
+  verify_denial(withdraw(), "400 Bad Request");
+
+  const auto token_response = client->request("GET", "/api/csrf-token", "", headers);
+  ASSERT_EQ(token_response->status_code, "200 OK");
+  assert_uncached(token_response);
+  const auto token = nlohmann::json::parse(token_response->content.string()).at("csrf_token").get<std::string>();
+  verify_denial(issue("/api/otp?csrf_token=" + token), "400 Bad Request");
+  headers.emplace("X-CSRF-Token", "fixture-wrong-token");
+  verify_denial(issue(), "400 Bad Request");
+  headers.emplace("x-csrf-token", token);
+  verify_denial(issue(), "400 Bad Request");
+  verify_denial(withdraw(), "400 Bad Request");
+  headers.erase("X-CSRF-Token");
+  headers.emplace("X-CSRF-Token", token);
+  confighttp::expire_csrf_token_for_testing("testuser");
+  verify_denial(issue(), "400 Bad Request");
+  verify_denial(withdraw(), "400 Bad Request");
+  EXPECT_TRUE(nvhttp::withdraw_one_time_pairing(initial->generation_id));
+  EXPECT_TRUE(log_checker::line_contains("test_sunshine.log", "not authorized"));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", diagnostic_header));
+}
+
+TEST_F(ConfigHttpTest, OneTimePairingAdministrationValidatesIssuanceAndWithdrawal) {
+  SimpleWeb::CaseInsensitiveMultimap headers {
+    {"Content-Type", "application/json; charset=utf-8"},
+    {"Authorization", create_auth_header("testuser", "testpass")},
+  };
+  const auto token_response = client->request("GET", "/api/csrf-token", "", headers);
+  ASSERT_EQ(token_response->status_code, "200 OK");
+  headers.emplace("X-CSRF-Token", nlohmann::json::parse(token_response->content.string()).at("csrf_token").get<std::string>());
+  const auto create = [&](const std::string &body) {
+    auto response = client->request("POST", "/api/otp", body, headers);
+    assert_uncached(response);
+    return response;
+  };
+  const auto withdraw = [&](const std::string &generation) {
+    auto response = client->request("DELETE", "/api/otp", nlohmann::json {{"generation", generation}}.dump(), headers);
+    assert_uncached(response);
+    return response;
+  };
+  const auto original_port = config::sunshine.port;
+  auto restore_port = util::fail_guard([&]() {
+    config::sunshine.port = original_port;
+  });
+  config::sunshine.port = 47989 - nvhttp::PORT_HTTP;
+  const auto initial = create("{}");
+  ASSERT_EQ(initial->status_code, "200 OK");
+  const auto initial_fields = nlohmann::json::parse(initial->content.string());
+  EXPECT_TRUE(initial_fields.at("status").get<bool>());
+  EXPECT_EQ(initial_fields.at("game_http_port").get<int>(), 47989);
+
+  const auto initial_generation = initial_fields.at("generation").get<std::string>();
+  const auto hidden_suffix = '\0' + std::string {"synthetic-otp-json-suffix"};
+  const auto malformed_issuance = create("{}" + hidden_suffix);
+  EXPECT_EQ(malformed_issuance->status_code, "400 Bad Request");
+  EXPECT_EQ(nlohmann::json::parse(malformed_issuance->content.string()).at("error"), "Invalid pairing invitation request");
+  const auto malformed_withdrawal = client->request(
+    "DELETE",
+    "/api/otp",
+    nlohmann::json {{"generation", initial_generation}}.dump() + hidden_suffix,
+    headers
+  );
+  EXPECT_EQ(malformed_withdrawal->status_code, "400 Bad Request");
+  assert_uncached(malformed_withdrawal);
+  EXPECT_EQ(nlohmann::json::parse(malformed_withdrawal->content.string()).at("error"), "Invalid pairing invitation request");
+
+  for (const auto &invalid : std::array {
+         std::string {"{\"name\":\"do-not-echo\""},
+         std::string {"null"},
+         std::string {R"({"name":false})"},
+         std::string {R"({"name":""})"},
+         std::string {R"({"name":"a","name":"b"})"},
+         std::string {R"({"name":"invalid\u0000label"})"},
+         std::string {R"({"generation":"unexpected"})"},
+         nlohmann::json {{"name", std::string(nvhttp::MAX_PAIRING_CLIENT_NAME_SIZE + 1, 'x')}}.dump(),
+         std::string(1025, ' '),
+       }) {
+    const auto rejected = create(invalid);
+    EXPECT_EQ(rejected->status_code, "400 Bad Request");
+    EXPECT_FALSE(rejected->content.string().contains("do-not-echo"));
+  }
+  headers.erase("Content-Type");
+  headers.emplace("Content-Type", "text/plain");
+  EXPECT_EQ(create("{}")->status_code, "400 Bad Request");
+  headers.erase("Content-Type");
+  headers.emplace("Content-Type", "application/json");
+  nvhttp::test_support::set_otp_random([](unsigned char *, int) {
+    return false;
+  });
+  EXPECT_EQ(create("{}")->status_code, "503 Service Unavailable");
+  nvhttp::test_support::set_otp_random(nullptr);
+  EXPECT_EQ(withdraw(initial_generation)->status_code, "200 OK");
+
+  config::sunshine.port = 48023 - nvhttp::PORT_HTTP;
+  const auto prior = create("{}");
+  ASSERT_EQ(prior->status_code, "200 OK");
+  const auto replacement = create(R"({"name":"Fixture device"})");
+  ASSERT_EQ(replacement->status_code, "200 OK");
+  const auto previous_generation = nlohmann::json::parse(prior->content.string()).at("generation").get<std::string>();
+  const auto issued = nlohmann::json::parse(replacement->content.string());
+  EXPECT_TRUE(nvhttp::is_valid_pairing_pin(issued.at("pin").get<std::string>()));
+  const auto passphrase = issued.at("passphrase").get<std::string>();
+  EXPECT_EQ(passphrase.size(), 32);
+  EXPECT_EQ(passphrase.find_first_not_of("0123456789abcdef"), std::string::npos);
+  EXPECT_EQ(issued.at("expires_in").get<int>(), 180);
+  EXPECT_EQ(issued.at("game_http_port").get<int>(), 48023);
+  EXPECT_EQ(withdraw(previous_generation)->status_code, "409 Conflict");
+  const auto generation = issued.at("generation").get<std::string>();
+  const auto withdrawn = withdraw(generation);
+  ASSERT_EQ(withdrawn->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(withdrawn->content.string()).at("status").get<bool>());
+  EXPECT_EQ(withdraw(generation)->status_code, "409 Conflict");
+}
+
+TEST_F(ConfigHttpTest, PairingPageDiagnosticsRedactMixedCaseCredentialsAndReferrerValues) {
+  const auto authorization = create_auth_header("testuser", "testpass");
+  constexpr auto proxy = "fixture-only-proxy-log-marker";
+  constexpr auto cookie = "fixture-only-cookie-log-marker";
+  constexpr auto csrf_header = "fixture-only-csrf-header-log-marker";
+  constexpr auto csrf_query = "fixture-only-csrf-query-log-marker";
+  constexpr auto pin = "fixture-only-pin-log-marker";
+  constexpr auto passphrase = "fixture-only-passphrase-log-marker";
+  constexpr auto proof = "fixture-only-otp-proof-log-marker";
+  constexpr auto referrer = "fixture-only-referrer-log-marker";
+  const SimpleWeb::CaseInsensitiveMultimap page_headers {
+    {"aUtHoRiZaTiOn", authorization},
+    {"pRoXy-AuThOrIzAtIoN", proxy},
+    {"cOoKiE", cookie},
+    {"x-CsRf-ToKeN", csrf_header},
+  };
+  const auto page = client->request(
+    "GET",
+    std::format("/page-test?CsRf_ToKeN={}&PiN={}&PaSsPhRaSe={}&OtPaUtH={}", csrf_query, pin, passphrase, proof),
+    "",
+    page_headers
+  );
+  ASSERT_EQ(page->status_code, "200 OK");
+
+  const SimpleWeb::CaseInsensitiveMultimap denied_headers {
+    {"Authorization", authorization},
+    {"Content-Type", "application/json"},
+    {"Referer", std::format("https://example.invalid/pin?token={}", referrer)},
+  };
+  const auto denied = client->request("POST", "/pairing-test", "{}", denied_headers);
+  ASSERT_EQ(denied->status_code, "400 Bad Request");
+  EXPECT_TRUE(log_checker::line_contains("test_sunshine.log", "DESTINATION :: /page-test"));
+  EXPECT_TRUE(log_checker::line_contains("test_sunshine.log", "CSRF protection blocked request from an untrusted origin"));
+  for (const auto value : std::array<std::string_view, 9> {authorization, proxy, cookie, csrf_header, csrf_query, pin, passphrase, proof, referrer}) {
+    EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", value));
+  }
 }
 
 TEST_F(ConfigHttpTest, PairingMutationsRejectCrossOriginRestRequestsWithoutCsrfToken) {
