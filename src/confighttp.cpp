@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <new>
 #include <optional>
@@ -26,6 +27,7 @@
 #include <boost/filesystem.hpp>
 #include <lizardbyte/common/env.h>
 #include <nlohmann/json.hpp>
+#include <openssl/crypto.h>
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
 
@@ -568,19 +570,49 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void print_req(const req_https_t &request) {
+    constexpr std::array sensitive_headers {
+      "Authorization"sv,
+      "Proxy-Authorization"sv,
+      "Cookie"sv,
+      "Set-Cookie"sv,
+      "X-CSRF-Token"sv,
+      "Referer"sv,
+    };
+    constexpr std::array sensitive_query_parameters {
+      "pin"sv,
+      "passphrase"sv,
+      "otp"sv,
+      "otpauth"sv,
+      "proof"sv,
+      "csrf_token"sv,
+      "csrf-token"sv,
+      "x-csrf-token"sv,
+      "token"sv,
+      "authorization"sv,
+      "generation"sv,
+      "generation_id"sv,
+      "pairing_id"sv,
+      "qr"sv,
+      "clientcert"sv,
+      "clientchallenge"sv,
+      "serverchallengeresp"sv,
+      "clientpairingsecret"sv,
+    };
+    const auto log_parameters = [](const args_t &parameters, const auto &sensitive_names) {
+      for (const auto &[name, value] : parameters) {
+        const bool redact = std::ranges::any_of(sensitive_names, [&](const auto candidate) {
+          return boost::iequals(name, candidate);
+        });
+        BOOST_LOG(debug) << name << " -- " << (redact ? "CREDENTIALS REDACTED"sv : std::string_view {value});
+      }
+    };
+
     BOOST_LOG(debug) << "METHOD :: "sv << request->method;
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
-    for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
-    }
-
+    log_parameters(request->header, sensitive_headers);
     BOOST_LOG(debug) << " [--] "sv;
-
-    for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
-    }
-
+    log_parameters(request->parse_query_string(), sensitive_query_parameters);
     BOOST_LOG(debug) << " [--] "sv;
   }
 
@@ -598,11 +630,24 @@ namespace confighttp {
   }
 
   /**
+   * @brief Send an uncached JSON response for pairing invitation and CSRF-token operations.
+   */
+  void send_pairing_admin_response(const resp_https_t &response, const nlohmann::json &output_tree, const SimpleWeb::StatusCode code = SimpleWeb::StatusCode::success_ok) {
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", "application/json"},
+      {"X-Frame-Options", "DENY"},
+      {"Content-Security-Policy", "frame-ancestors 'none';"},
+      {"Cache-Control", "no-store"},
+    };
+    response->write(code, output_tree.dump(), headers);
+  }
+
+  /**
    * @brief Send a 401 Unauthorized response.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    */
-  void send_unauthorized(const resp_https_t &response, const req_https_t &request) {
+  void send_unauthorized(const resp_https_t &response, const req_https_t &request, const bool no_store) {
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
     BOOST_LOG(info) << "Web UI: ["sv << address << "] -- not authorized"sv;
 
@@ -613,14 +658,21 @@ namespace confighttp {
     tree["status"] = false;
     tree["error"] = "Unauthorized";
 
-    const SimpleWeb::CaseInsensitiveMultimap headers {
+    SimpleWeb::CaseInsensitiveMultimap headers {
       {"Content-Type", "application/json"},
       {"WWW-Authenticate", R"(Basic realm="Sunshine Gamestream Host", charset="UTF-8")"},
       {"X-Frame-Options", "DENY"},
       {"Content-Security-Policy", "frame-ancestors 'none';"}
     };
+    if (no_store) {
+      headers.emplace("Cache-Control", "no-store");
+    }
 
     response->write(code, tree.dump(), headers);
+  }
+
+  void send_unauthorized(const resp_https_t &response, const req_https_t &request) {
+    send_unauthorized(response, request, false);
   }
 
   /**
@@ -629,15 +681,22 @@ namespace confighttp {
    * @param request The HTTP request object.
    * @param path The path to redirect to.
    */
-  void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path) {
+  void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path, const bool no_store) {
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
     BOOST_LOG(info) << "Web UI: ["sv << address << "] -- not authorized"sv;
-    const SimpleWeb::CaseInsensitiveMultimap headers {
+    SimpleWeb::CaseInsensitiveMultimap headers {
       {"Location", path},
       {"X-Frame-Options", "DENY"},
       {"Content-Security-Policy", "frame-ancestors 'none';"}
     };
+    if (no_store) {
+      headers.emplace("Cache-Control", "no-store");
+    }
     response->write(SimpleWeb::StatusCode::redirection_temporary_redirect, headers);
+  }
+
+  void send_redirect(const resp_https_t &response, const req_https_t &request, const char *path) {
+    send_redirect(response, request, path, false);
   }
 
   /**
@@ -646,35 +705,43 @@ namespace confighttp {
    * @param request The HTTP request object.
    * @return True if the user is authenticated, false otherwise.
    */
-  bool authenticate(const resp_https_t &response, const req_https_t &request) {
+  bool authenticate(const resp_https_t &response, const req_https_t &request, const bool no_store) {
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
 
     if (const auto ip_type = net::from_address(address); ip_type > http::origin_web_ui_allowed) {
       BOOST_LOG(info) << "Web UI: ["sv << address << "] -- denied"sv;
-      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      if (no_store) {
+        send_pairing_admin_response(response, {{"status", false}, {"error", "Forbidden"}}, SimpleWeb::StatusCode::client_error_forbidden);
+      } else {
+        response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      }
       return false;
     }
 
     // If credentials are shown, redirect the user to a /welcome page
     if (config::sunshine.username.empty()) {
-      send_redirect(response, request, "/welcome");
+      send_redirect(response, request, "/welcome", no_store);
       return false;
     }
 
     auto fg = util::fail_guard([&]() {
-      send_unauthorized(response, request);
+      send_unauthorized(response, request, no_store);
     });
 
     const auto auth = request->header.find("authorization");
-    if (auth == request->header.end()) {
+    if (auth == request->header.end() || request->header.count("Authorization") != 1) {
       return false;
     }
 
     const auto &rawAuth = auth->second;
-    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr("Basic "sv.length()));
+    constexpr auto scheme = "Basic "sv;
+    if (rawAuth.size() <= scheme.size() || !boost::istarts_with(rawAuth, scheme)) {
+      return false;
+    }
+    auto authData = SimpleWeb::Crypto::Base64::decode(rawAuth.substr(scheme.size()));
 
-    const auto index = static_cast<int>(authData.find(':'));
-    if (index >= authData.size() - 1) {
+    const auto index = authData.find(':');
+    if (index == std::string::npos || index + 1 == authData.size()) {
       return false;
     }
 
@@ -687,6 +754,10 @@ namespace confighttp {
 
     fg.disable();
     return true;
+  }
+
+  bool authenticate(const resp_https_t &response, const req_https_t &request) {
+    return authenticate(response, request, false);
   }
 
   /**
@@ -730,6 +801,13 @@ namespace confighttp {
     headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
 
     response->write(code, tree.dump(), headers);
+  }
+
+  /**
+   * @brief Send a fixed, uncached error for a pairing invitation operation.
+   */
+  void pairing_admin_error(const resp_https_t &response, const SimpleWeb::StatusCode code, const std::string_view message) {
+    send_pairing_admin_response(response, {{"status", false}, {"status_code", code}, {"error", message}}, code);
   }
 
   /**
@@ -813,36 +891,57 @@ namespace confighttp {
    * @param request The HTTP request object.
    * @param client_id A unique identifier for the client.
    * @param provided_token The token string to validate.
+   * @param no_store Whether to return an uncached pairing administration error.
    * @return True if the token is valid, false otherwise.
    */
-  bool validate_stored_csrf_token(const resp_https_t &response, const req_https_t &request, const std::string_view client_id, const std::string_view provided_token) {
+  bool validate_stored_csrf_token(const resp_https_t &response, const req_https_t &request, const std::string_view client_id, const std::string_view provided_token, const bool no_store = false) {
+    const auto reject = [&](const char *message) {
+      if (no_store) {
+        pairing_admin_error(response, SimpleWeb::StatusCode::client_error_bad_request, "Invalid CSRF token");
+      } else {
+        bad_request(response, message);
+      }
+    };
     std::scoped_lock lock(csrf_tokens_mutex);
     const auto token_it = csrf_tokens.find(client_id);
 
     if (token_it == csrf_tokens.end()) {
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: no token found for client"sv;
-      bad_request(response, "Invalid CSRF token");
+      reject("Invalid CSRF token");
       return false;
     }
 
-    if (const auto now = std::chrono::steady_clock::now(); token_it->second.expiration < now) {
+    if (const auto now = std::chrono::steady_clock::now(); token_it->second.expiration <= now) {
       csrf_tokens.erase(token_it);
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token expired"sv;
-      bad_request(response, "CSRF token expired");
+      reject("CSRF token expired");
       return false;
     }
 
-    if (token_it->second.token != provided_token) {
+    const auto &token = token_it->second.token;
+    if (token.size() != provided_token.size() || CRYPTO_memcmp(token.data(), provided_token.data(), token.size()) != 0) {
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token mismatch"sv;
-      bad_request(response, "Invalid CSRF token");
+      reject("Invalid CSRF token");
       return false;
     }
 
     return true;
   }
+
+#ifdef SUNSHINE_TESTS
+  /**
+   * @brief Expire the stored token for an isolated native administration fixture.
+   */
+  void expire_csrf_token_for_testing(const std::string_view client_id) {
+    std::scoped_lock lock {csrf_tokens_mutex};
+    if (const auto it = csrf_tokens.find(client_id); it != csrf_tokens.end()) {
+      it->second.expiration = std::chrono::steady_clock::time_point::min();
+    }
+  }
+#endif
 
   /**
    * @brief Validate CSRF token.
@@ -884,7 +983,6 @@ namespace confighttp {
 
     // A browser-like request arrived with an Origin/Referer that doesn't match an allowed origin.
     // Require a CSRF token.
-    const std::string_view blocked_origin = (origin_it != request->header.end()) ? origin_it->second : referer_it->second;
     // Extract token from X-CSRF-Token header
     const auto header_it = request->header.find("X-CSRF-Token");
     if (header_it == request->header.end()) {
@@ -893,7 +991,7 @@ namespace confighttp {
       const auto query_it = query_params.find("csrf_token");
       if (query_it == query_params.end()) {
         auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
+        BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from an untrusted origin"sv;
         BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Sunshine configuration"sv;
         bad_request(response, "Missing CSRF token");
         return false;
@@ -1042,18 +1140,120 @@ namespace confighttp {
    * @api_examples{/api/csrf-token|:| GET|:| null}
    */
   void getCSRFToken(const resp_https_t &response, const req_https_t &request) {
-    if (!authenticate(response, request)) {
+    if (!authenticate(response, request, true)) {
       return;
     }
-
-    print_req(request);
 
     std::string client_id = get_client_id(request);
     std::string token = generate_csrf_token(client_id);
 
     nlohmann::json output_tree;
     output_tree["csrf_token"] = token;
-    send_response(response, output_tree);
+    send_pairing_admin_response(response, output_tree);
+  }
+
+  /**
+   * @brief Issue or withdraw an Artemis invitation for an authenticated administrator.
+   *
+   * @api_examples{/api/otp|:| POST|:| {"name":"Example client"}}
+   * @api_examples{/api/otp|:| DELETE|:| {"generation":"0123456789abcdef0123456789abcdef"}}
+   */
+  void modifyPairingInvitation(const resp_https_t &response, const req_https_t &request) {
+    using enum SimpleWeb::StatusCode;
+    if (!authenticate(response, request, true)) {
+      return;
+    }
+
+    const auto [token, token_end] = request->header.equal_range("X-CSRF-Token");
+    if (token == token_end || std::next(token) != token_end) {
+      pairing_admin_error(response, client_error_bad_request, "Exactly one CSRF token header is required");
+      return;
+    }
+    if (!validate_stored_csrf_token(response, request, get_client_id(request), token->second, true)) {
+      return;
+    }
+
+    const auto [media, media_end] = request->header.equal_range("Content-Type");
+    if (media == media_end || std::next(media) != media_end || !boost::iequals(boost::trim_copy(media->second.substr(0, media->second.find(';'))), "application/json"sv)) {
+      pairing_admin_error(response, client_error_bad_request, "Expected application/json");
+      return;
+    }
+    // One 128-byte name remains within this limit even when every byte is escaped.
+    constexpr std::size_t max_body_size = 1024;
+    if (request->content.size() > max_body_size) {
+      pairing_admin_error(response, client_error_bad_request, "Pairing invitation request is too large");
+      return;
+    }
+    const auto body = request->content.string();
+    if (body.contains('\0')) {
+      pairing_admin_error(response, client_error_bad_request, "Invalid pairing invitation request");
+      return;
+    }
+
+    bool key_seen = false;
+    bool multiple_keys = false;
+    auto one_key = [&](int, nlohmann::json::parse_event_t event, nlohmann::json &) {
+      if (event == nlohmann::json::parse_event_t::key) {
+        multiple_keys |= std::exchange(key_seen, true);
+      }
+      return true;
+    };
+    const auto input = nlohmann::json::parse(body, one_key, false);
+    if (!input.is_object() || multiple_keys) {
+      pairing_admin_error(response, client_error_bad_request, "Invalid pairing invitation request");
+      return;
+    }
+
+    if (request->method == "DELETE") {
+      const auto generation = input.find("generation");
+      if (generation == input.end() || !generation->is_string() || !nvhttp::is_valid_pairing_id(generation->get_ref<const std::string &>())) {
+        pairing_admin_error(response, client_error_bad_request, "Invalid invitation generation");
+        return;
+      }
+      if (!nvhttp::withdraw_one_time_pairing(generation->get_ref<const std::string &>())) {
+        pairing_admin_error(response, client_error_conflict, "Pairing invitation is no longer outstanding");
+        return;
+      }
+      send_pairing_admin_response(response, {{"status", true}});
+      return;
+    }
+
+    std::string name;
+    if (!input.empty()) {
+      const auto label = input.find("name");
+      if (label == input.end() || !label->is_string() || !nvhttp::is_valid_otp_pairing_name(label->get_ref<const std::string &>())) {
+        pairing_admin_error(response, client_error_bad_request, "Invalid pairing invitation name");
+        return;
+      }
+      name = label->get<std::string>();
+    }
+
+    auto invitation = nvhttp::issue_one_time_pairing(std::move(name));
+    if (!invitation) {
+      pairing_admin_error(response, server_error_service_unavailable, "Pairing invitation is unavailable");
+      return;
+    }
+    auto scrub_credentials = util::fail_guard([&]() {
+      OPENSSL_cleanse(invitation->pin.data(), invitation->pin.size());
+      OPENSSL_cleanse(invitation->passphrase.data(), invitation->passphrase.size());
+    });
+    send_pairing_admin_response(response, {
+                                            {"status", true},
+                                            {"pin", invitation->pin},
+                                            {"passphrase", invitation->passphrase},
+                                            {"generation", invitation->generation_id},
+                                            {"expires_in", invitation->expires_in.count()},
+                                            {"game_http_port", net::map_port(nvhttp::PORT_HTTP)},
+                                          });
+  }
+
+  /**
+   * @brief Register the configuration pairing invitation routes for production and the native fixture.
+   */
+  void configure_pairing_invitation_routes(https_server_t &server) {
+    server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
+    server.resource["^/api/otp$"]["POST"] = modifyPairingInvitation;
+    server.resource["^/api/otp$"]["DELETE"] = modifyPairingInvitation;
   }
 
   /**
@@ -1694,8 +1894,6 @@ namespace confighttp {
       return;
     }
 
-    print_req(request);
-
     nlohmann::json output_tree;
     output_tree["pairings"] = nlohmann::json::array();
     for (const auto &pairing : nvhttp::get_pending_pairings()) {
@@ -1732,8 +1930,6 @@ namespace confighttp {
       return;
     }
 
-    print_req(request);
-
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
@@ -1747,9 +1943,8 @@ namespace confighttp {
       nlohmann::json output_tree;
       output_tree["status"] = nvhttp::cancel_pairing(pairing_id);
       send_response(response, output_tree);
-    } catch (nlohmann::json::exception &e) {
-      BOOST_LOG(warning) << "CancelPairing: "sv << e.what();
-      bad_request(response, e.what());
+    } catch (const nlohmann::json::exception &) {
+      bad_request(response, "Invalid pairing cancellation request");
     }
   }
 
@@ -1783,8 +1978,6 @@ namespace confighttp {
       return;
     }
 
-    print_req(request);
-
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
@@ -1808,9 +2001,8 @@ namespace confighttp {
 
       output_tree["status"] = nvhttp::pin(pairing_id, pin, name);
       send_response(response, output_tree);
-    } catch (std::exception &e) {
-      BOOST_LOG(warning) << "SavePin: "sv << e.what();
-      bad_request(response, e.what());
+    } catch (const std::exception &) {
+      bad_request(response, "Invalid PIN approval request");
     }
   }
 
@@ -2384,7 +2576,7 @@ namespace confighttp {
     server.resource["^/api/configLocale$"]["GET"] = getLocale;
     server.resource["^/api/covers/([0-9]+)$"]["GET"] = getCover;
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
-    server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
+    configure_pairing_invitation_routes(server);
     server.resource["^/api/password$"]["POST"] = savePassword;
     server.resource["^/api/pin$"]["DELETE"] = cancelPairing;
     server.resource["^/api/pin$"]["GET"] = getPendingPairings;

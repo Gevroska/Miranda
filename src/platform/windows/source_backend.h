@@ -26,10 +26,10 @@ namespace platf::source_startup {
 
 namespace platf::source_backend {
   /**
-   * @brief Opaque lifetime of independently established recovery authorization.
+   * @brief Opaque lifetime of independently established Virtual source authorization.
    * @details A provider must retain protected storage/write access, the independent deployment
    * identity and exclusive driver control until this object is destroyed. It must not revoke or
-   * release those guarantees while any recovery callback, heartbeat or cleanup can still run.
+   * release those guarantees while any display callback, heartbeat or cleanup can still run.
    * The protected constructor is a provider contract, not a journal/path/Boolean-based issuer.
    * There is no production provider in this component.
    */
@@ -39,12 +39,14 @@ namespace platf::source_backend {
     recovery_authorization_t(const recovery_authorization_t &) = delete;
     recovery_authorization_t &operator=(const recovery_authorization_t &) = delete;
 
+    /** @brief Immutable deployment metadata for the owned-display transaction. */
+    const sudovda::recovery_authority_t &authority() const noexcept;
+
   protected:
     /** @brief Bind independently obtained deployment metadata to this provider's held lifetime. */
     explicit recovery_authorization_t(sudovda::recovery_authority_t authority);
 
   private:
-    friend class recovery_context_t;
     const sudovda::recovery_authority_t authority_;
   };
 
@@ -57,8 +59,12 @@ namespace platf::source_backend {
   class authority_verifier_t {
   public:
     virtual ~authority_verifier_t() = default;
-    /** @brief Qualify this journal location and requested source before B intent or driver access. */
-    virtual std::expected<sudovda::recovery_authority_t, sudovda::failure_t> verify(const std::filesystem::path &journal_path, const display_policy::source_request_t &request, std::uint64_t generation) = 0;
+    /**
+     * @brief Qualify this journal location and requested source before B intent or driver access.
+     * @details Return an owning grant for fresh admission. If current is present, qualify the
+     * new request under that deployment session and return the same grant with shared ownership.
+     */
+    virtual std::expected<std::shared_ptr<recovery_authorization_t>, sudovda::failure_t> verify(const std::filesystem::path &journal_path, const display_policy::source_request_t &request, std::uint64_t generation, const std::shared_ptr<recovery_authorization_t> &current) = 0;
     /** @brief Default-deny recovery qualification without manufacturing a fresh source request. */
     virtual std::expected<std::shared_ptr<recovery_authorization_t>, sudovda::failure_t> verify_recovery(const std::filesystem::path &journal_path);
   };

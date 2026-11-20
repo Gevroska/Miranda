@@ -51,12 +51,71 @@
       </div>
       <div v-if="status" :class="`alert alert-${status.type}`" role="alert">{{ status.message }}</div>
     </form>
+
+    <section class="card p-4 mb-4 mx-auto" aria-labelledby="artemis-pairing-title">
+      <h2 id="artemis-pairing-title" class="h4">{{ $t('pin.artemis_title') }}</h2>
+      <p>{{ $t('pin.artemis_address_help') }}</p>
+      <div class="row g-3 mb-3">
+        <div class="col-sm-8">
+          <label for="artemis-host" class="form-label">{{ $t('pin.artemis_host') }}</label>
+          <input id="artemis-host" v-model="artemisHost" class="form-control" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" />
+        </div>
+        <div class="col-sm-4">
+          <label for="artemis-port" class="form-label">{{ $t('pin.artemis_port') }}</label>
+          <input id="artemis-port" v-model="artemisPortOverride" class="form-control" type="text" inputmode="numeric" autocomplete="off" :placeholder="artemisGamePort || undefined" />
+        </div>
+      </div>
+      <div class="d-flex flex-wrap gap-2">
+        <button type="button" class="btn btn-primary" :disabled="!!artemisOperation" @click="generateArtemisInvitation">
+          {{ $t('pin.artemis_generate') }}
+        </button>
+        <button type="button" class="btn btn-outline-danger" :disabled="!artemisInvitation || !!artemisOperation" @click="withdrawArtemisInvitation">
+          {{ $t('pin.artemis_withdraw') }}
+        </button>
+      </div>
+      <div v-if="artemisStatus" :class="`alert alert-${artemisStatus.type} mt-3 mb-0`" role="status">
+        {{ $t(artemisStatus.message) }}
+      </div>
+      <div v-if="artemisInvitation?.credentials" class="mt-3">
+        <p>{{ $t('pin.artemis_instructions') }}</p>
+        <p>{{ $t('pin.artemis_expires_in', {seconds: artemisSecondsLeft}) }}</p>
+        <dl class="row">
+          <dt class="col-sm-3">{{ $t('navbar.pin') }}</dt>
+          <dd id="artemis-pin" class="col-sm-9"><code>{{ artemisInvitation.credentials.pin }}</code></dd>
+          <dt class="col-sm-3">{{ $t('pin.artemis_passphrase') }}</dt>
+          <dd id="artemis-passphrase" class="col-sm-9"><code>{{ artemisInvitation.credentials.passphrase }}</code></dd>
+        </dl>
+        <div v-if="artemisLink" class="d-flex flex-column align-items-start gap-2">
+          <a id="artemis-link" class="btn btn-outline-primary" :href="artemisLink" referrerpolicy="no-referrer" @click="guardArtemisLink">
+            {{ $t('pin.artemis_open_link') }}
+          </a>
+          <img
+            v-if="artemisQrImage"
+            :key="artemisQrRevision"
+            ref="artemisQr"
+            class="img-fluid"
+            :src="artemisQrImage"
+            :alt="$t('pin.artemis_qr_alt')"
+            @error="handleArtemisQrError"
+          />
+          <p v-else class="alert alert-warning mb-0">{{ $t('pin.artemis_qr_failure') }}</p>
+        </div>
+        <p v-else class="alert alert-warning mb-0">{{ $t('pin.artemis_invalid_address') }}</p>
+      </div>
+    </section>
   </div>
 </template>
 
 <script>
   import Navbar from './Navbar.vue'
   import { apiFetch } from './fetch_utils'
+  import {
+    artemisPairingLink,
+    artemisQrDataUrl,
+    defaultArtemisHost,
+    mutateArtemisInvitation,
+    parseArtemisInvitation,
+  } from './artemis_pairing'
   import {
     Forward,
     Hash,
@@ -77,6 +136,17 @@
     inject: ['i18n'],
     data() {
       return {
+        artemisHost: defaultArtemisHost(window.location.hostname),
+        artemisPortOverride: '',
+        artemisGamePort: null,
+        artemisInvitation: null,
+        artemisLink: '',
+        artemisOperation: null,
+        artemisQrImage: '',
+        artemisQrRevision: 0,
+        artemisSecondsLeft: 0,
+        artemisStatus: null,
+        artemisTimer: null,
         name: '',
         pendingPairings: [],
         pin: '',
@@ -85,12 +155,21 @@
         status: null,
       };
     },
+    watch: {
+      artemisHost: 'updateArtemisDisplay',
+      artemisPortOverride: 'updateArtemisDisplay',
+    },
     mounted() {
       this.loadPendingPairings();
       this.refreshTimer = window.setInterval(() => this.loadPendingPairings(), 2000);
+      document.addEventListener('visibilitychange', this.updateArtemisCountdown);
+      window.addEventListener('pagehide', this.resetArtemis);
     },
     beforeUnmount() {
       window.clearInterval(this.refreshTimer);
+      document.removeEventListener('visibilitychange', this.updateArtemisCountdown);
+      window.removeEventListener('pagehide', this.resetArtemis);
+      this.resetArtemis();
     },
     methods: {
       /**
@@ -167,7 +246,145 @@
           ? {type: 'success', message: this.i18n.t('pin.cancel_success')}
           : {type: 'danger', message: this.i18n.t('pin.cancel_failure')};
         await this.loadPendingPairings();
-      }
+      },
+
+      async generateArtemisInvitation() {
+        if (this.artemisOperation) {
+          return;
+        }
+        const operation = this.beginArtemisOperation();
+        try {
+          const {response, startedAt} = await mutateArtemisInvitation('POST', {}, operation.signal);
+          operation.signal.throwIfAborted();
+          const invitation = response.ok ? parseArtemisInvitation(await response.json(), startedAt) : null;
+          operation.signal.throwIfAborted();
+          if (!invitation) {
+            this.artemisStatus = {type: 'danger', message: 'pin.artemis_generate_failure'};
+            return;
+          }
+          this.artemisGamePort = invitation.port;
+          this.artemisInvitation = invitation;
+          this.updateArtemisDisplay();
+        } catch {
+          if (!operation.signal.aborted) {
+            this.artemisStatus = {type: 'danger', message: 'pin.artemis_generate_failure'};
+          }
+        } finally {
+          if (this.artemisOperation === operation) {
+            this.artemisOperation = null;
+          }
+        }
+      },
+
+      async withdrawArtemisInvitation() {
+        this.updateArtemisCountdown();
+        if (!this.artemisInvitation || this.artemisOperation) {
+          return;
+        }
+        const {generation} = this.artemisInvitation;
+        const operation = this.beginArtemisOperation();
+        try {
+          const {response} = await mutateArtemisInvitation('DELETE', {generation}, operation.signal);
+          operation.signal.throwIfAborted();
+          const withdrawn = response.ok && (await response.json())?.status === true;
+          operation.signal.throwIfAborted();
+          if (withdrawn || response.status === 409) {
+            this.clearArtemisInvitation();
+            this.artemisStatus = withdrawn
+              ? {type: 'success', message: 'pin.artemis_withdrawn'}
+              : {type: 'warning', message: 'pin.artemis_unavailable'};
+          } else {
+            this.artemisStatus = {type: 'danger', message: 'pin.artemis_withdraw_failure'};
+          }
+        } catch {
+          if (!operation.signal.aborted) {
+            this.artemisStatus = {type: 'danger', message: 'pin.artemis_withdraw_failure'};
+          }
+        } finally {
+          if (this.artemisOperation === operation) {
+            this.artemisOperation = null;
+          }
+        }
+      },
+
+      beginArtemisOperation() {
+        // Keep the generation available for an explicit withdrawal retry.
+        this.clearArtemisCredentials();
+        this.artemisStatus = null;
+        this.artemisOperation = new AbortController();
+        return this.artemisOperation;
+      },
+
+      updateArtemisDisplay() {
+        this.updateArtemisCountdown();
+        const credentials = this.artemisInvitation?.credentials;
+        this.artemisQrImage = '';
+        this.artemisLink = credentials ? artemisPairingLink(this.artemisHost, this.artemisPortOverride, this.artemisGamePort, credentials) : '';
+        if (!this.artemisLink) {
+          return;
+        }
+        try {
+          this.artemisQrImage = artemisQrDataUrl(this.artemisLink);
+          this.artemisQrRevision += 1;
+        } catch {
+          // The typed credentials and link remain available if encoding fails.
+        }
+      },
+
+      updateArtemisCountdown() {
+        window.clearTimeout(this.artemisTimer);
+        if (!this.artemisInvitation) {
+          return;
+        }
+        const {credentials, steadyDeadline, wallDeadline} = this.artemisInvitation;
+        // Wall time accounts for sleep on platforms where the steady clock pauses.
+        const remaining = Math.min(steadyDeadline - performance.now(), wallDeadline - Date.now());
+        if (remaining <= 0) {
+          this.clearArtemisInvitation();
+          if (credentials) {
+            this.artemisStatus = {type: 'warning', message: 'pin.artemis_expired'};
+          }
+          return;
+        }
+        this.artemisSecondsLeft = Math.ceil(remaining / 1000);
+        this.artemisTimer = window.setTimeout(this.updateArtemisCountdown, Math.ceil(remaining % 1000 || 1000));
+      },
+
+      clearArtemisInvitation() {
+        window.clearTimeout(this.artemisTimer);
+        this.artemisTimer = null;
+        this.clearArtemisCredentials();
+        this.artemisInvitation = null;
+        this.artemisSecondsLeft = 0;
+      },
+
+      clearArtemisCredentials() {
+        if (this.artemisInvitation) {
+          this.artemisInvitation.credentials = null;
+        }
+        this.artemisLink = '';
+        this.artemisQrImage = '';
+      },
+
+      resetArtemis() {
+        this.artemisOperation?.abort();
+        this.artemisOperation = null;
+        this.clearArtemisInvitation();
+        this.artemisStatus = null;
+      },
+
+      guardArtemisLink(event) {
+        this.updateArtemisCountdown();
+        if (event.currentTarget.getAttribute('href') !== this.artemisLink) {
+          event.preventDefault();
+        }
+      },
+
+      handleArtemisQrError(event) {
+        if (event.currentTarget === this.$refs.artemisQr && event.currentTarget.getAttribute('src') === this.artemisQrImage) {
+          this.artemisQrImage = '';
+        }
+      },
     }
   }
 </script>

@@ -215,6 +215,14 @@ namespace nvhttp {
   };
 
   /**
+   * @brief Admission method for a GameStream pairing handshake.
+   */
+  enum class pairing_origin_e {
+    manual_pin,  ///< The client uses the conventional PIN approval flow.
+    one_time_code,  ///< The client claimed an Artemis invitation.
+  };
+
+  /**
    * @brief Shared result used to return the completed pairing outcome to a PIN submitter.
    */
   struct pairing_completion_t {
@@ -257,7 +265,32 @@ namespace nvhttp {
      */
     PAIR_PHASE last_phase = PAIR_PHASE::NONE;
     bool failed = false;  ///< Whether protocol validation failed and the session must be removed.
+    pairing_origin_e origin = pairing_origin_e::manual_pin;  ///< Whether a new manual request may replace this attempt.
   };
+
+  /**
+   * @brief Credentials returned to the administrator when issuing one Artemis invitation.
+   */
+  struct otp_credentials_t {
+    std::string pin;  ///< Four numeric digits, including any leading zero.
+    std::string passphrase;  ///< Fresh hexadecimal passphrase for the Artemis proof.
+    std::string generation_id;  ///< Opaque identifier used to withdraw this invitation.
+    std::chrono::seconds expires_in;  ///< Maximum remaining validity at issuance.
+  };
+
+  /**
+   * @brief Generate a new Artemis invitation and atomically replace any unclaimed invitation.
+   * @param name Optional administrator-supplied display label.
+   * @return New credentials, or an empty value if issuance is unavailable.
+   */
+  std::optional<otp_credentials_t> issue_one_time_pairing(std::string name);
+
+  /**
+   * @brief Withdraw the matching invitation while it is still unclaimed and unexpired.
+   * @param generation_id Opaque identifier returned during issuance.
+   * @return Whether the invitation was withdrawn.
+   */
+  bool withdraw_one_time_pairing(std::string_view generation_id);
 
   /**
    * @brief Operator-visible context for a pairing request awaiting PIN approval.
@@ -302,30 +335,21 @@ namespace nvhttp {
   bool is_valid_pairing_name(std::string_view name);
 
   /**
+   * @brief Validate a nonempty Artemis invitation label for length and control bytes.
+   * @param name Label supplied by the administrator.
+   * @return Whether the name can be used for an invitation.
+   */
+  bool is_valid_otp_pairing_name(std::string_view name);
+
+  /**
    * @brief Insert a newly created pairing session into bounded pending storage.
    *
    * @param sess Pairing session to insert.
    * @param pairing_id Receives the unguessable approval identifier on success.
+   * @param replace_abandoned_manual Whether to replace a prior manual handshake past PIN approval.
    * @return Status describing whether the session was inserted.
    */
-  pair_session_insert_e insert_pair_session(pair_session_t sess, std::string &pairing_id);
-
-  /**
-   * @brief Evict an abandoned in-progress pairing session for a client.
-   *
-   * A fresh `getservercert` request means the client abandoned its previous handshake and
-   * started over: the phase machine never accepts `getservercert` twice for one session, so
-   * the old handshake cannot resume. Evicting it lets the retry proceed instead of failing
-   * with 409 until the session expires. Sessions still waiting for operator PIN approval
-   * (`last_phase == NONE`) are left untouched, so a pending approval cannot be displaced
-   * by a stray `getservercert`. Eviction completes the old session as failed, waking any
-   * PIN submitter waiting on it, and orphans no live HTTP response: the response is
-   * consumed when PIN approval advances the session past the certificate phase.
-   *
-   * @param unique_id Client-provided pairing-session identifier.
-   * @return `true` when an in-progress session was evicted.
-   */
-  bool evict_abandoned_pair_session(const std::string &unique_id);
+  pair_session_insert_e insert_pair_session(pair_session_t sess, std::string &pairing_id, bool replace_abandoned_manual = false);
 
   /**
    * @brief Remove pairing sessions whose completion deadline has passed.
@@ -551,6 +575,30 @@ namespace nvhttp {
       std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Response> response,
       std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTP>::Request> request
     );
+
+    /**
+     * @brief Set the listener availability used by the real invitation operations.
+     * @param running Whether the local pairing fixture is accepting requests.
+     */
+    void set_otp_listener_running(bool running);
+
+    /**
+     * @brief Override the pairing registry's monotonic clock in isolated fixtures.
+     * @param now Fixed timestamp, or no value to restore the system monotonic clock.
+     */
+    void set_pairing_time(std::optional<std::chrono::steady_clock::time_point> now);
+
+    /**
+     * @brief Override the random source used when minting an invitation.
+     * @param generate Fixture generator, or null to restore OpenSSL.
+     */
+    void set_otp_random(bool (*generate)(unsigned char *, int));
+
+    /**
+     * @brief Observe the delivery failure callback for a real one-time pairing response.
+     * @param observe Receives a failure callback for later invocation outside the registry lock.
+     */
+    void set_otp_delivery_failure_observer(std::function<void(std::function<void()>)> observe);
 
     /**
      * @brief Clear in-memory paired-client records without changing persisted state.

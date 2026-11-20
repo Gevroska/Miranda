@@ -32,6 +32,10 @@ if(SUNSHINE_LLVM_COVERAGE)
 else()
     set(CMAKE_CXX_FLAGS "-fprofile-arcs -ftest-coverage -ggdb -O0")
     set(CMAKE_C_FLAGS "-fprofile-arcs -ftest-coverage -ggdb -O0")
+    # GCC can default to non-atomic counters even when tests run multiple threads.
+    add_compile_options(
+            "$<$<COMPILE_LANG_AND_ID:C,GNU>:-fprofile-update=atomic>"
+            "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-fprofile-update=atomic>")
 endif()
 
 set(SUNSHINE_TEST_GCOV_ROOT

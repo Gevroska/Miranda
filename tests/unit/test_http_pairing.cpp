@@ -4,21 +4,34 @@
  */
 
 // test includes
+#include "../certificate_test_utils.h"
 #include "../tests_common.h"
+#include "../tests_log_checker.h"
 
 // standard includes
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <format>
+#include <fstream>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // lib includes
+#include <boost/property_tree/xml_parser.hpp>
+#include <openssl/x509v3.h>
 #include <Simple-Web-Server/client_http.hpp>
+#include <Simple-Web-Server/client_https.hpp>
+#include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
@@ -420,9 +433,12 @@ namespace {
       original_pin_stdin_ = config::sunshine.flags[config::flag::PIN_STDIN];
       original_ping_timeout_ = config::stream.ping_timeout;
       config::sunshine.flags[config::flag::PIN_STDIN] = false;
+      setup(PRIVATE_KEY, PUBLIC_CERT);
 
       server_ = std::make_unique<SimpleWeb::Server<SimpleWeb::HTTP>>();
       server_->config.port = 0;
+      server_->config.address = "127.0.0.1";
+      server_->config.thread_pool_size = 2;
       server_->config.reuse_address = true;
       server_->config.timeout_request = 5;
       server_->config.timeout_content = 5;
@@ -438,14 +454,16 @@ namespace {
       }
       ASSERT_NE(port_, 0) << "Pairing test server failed to start";
 
-      client_ = std::make_unique<SimpleWeb::Client<SimpleWeb::HTTP>>(std::format("localhost:{}", port_.load()));
-      client_->config.timeout = 5;
+      nvhttp::test_support::set_otp_listener_running(true);
     }
 
     /**
      * @brief Stop the endpoint and restore pairing configuration.
      */
     void TearDown() override {
+      nvhttp::test_support::set_otp_listener_running(false);
+      nvhttp::test_support::set_otp_random(nullptr);
+      nvhttp::test_support::set_pairing_time(std::nullopt);
       expire_pair_sessions(std::chrono::steady_clock::time_point::max());
       if (server_) {
         server_->stop();
@@ -453,7 +471,6 @@ namespace {
       if (server_thread_.joinable()) {
         server_thread_.join();
       }
-      client_.reset();
       server_.reset();
       config::sunshine.flags[config::flag::PIN_STDIN] = original_pin_stdin_;
       config::stream.ping_timeout = original_ping_timeout_;
@@ -467,23 +484,125 @@ namespace {
      * @param salt Hexadecimal PIN salt.
      * @return Request target for the local pairing endpoint.
      */
-    static std::string server_certificate_target(const std::string_view unique_id, const std::string_view salt = "ff5dc6eda99339a8a0793e216c4257c4") {
+    static std::string server_certificate_target(const std::string_view unique_id, const std::string_view salt = "ff5dc6eda99339a8a0793e216c4257c4", const std::string_view certificate = PUBLIC_CERT) {
       return std::format(
         "/pair?uniqueid={}&phrase=getservercert&clientcert={}&salt={}&devicename=TestClient",
         unique_id,
-        util::hex_vec(PUBLIC_CERT, true),
+        util::hex_vec(certificate, true),
         salt
       );
     }
 
     /**
-     * @brief Read the response body from the local pairing endpoint.
+     * @brief Read the response from the local pairing endpoint.
      *
      * @param target Request target including query parameters.
-     * @return XML response body.
+     * @return Response with headers and XML body.
+     */
+    auto exchange(const std::string_view target, const SimpleWeb::CaseInsensitiveMultimap &headers = {}) {
+      SimpleWeb::Client<SimpleWeb::HTTP> client {std::format("127.0.0.1:{}", port_.load())};
+      client.config.timeout = 5;
+      return client.request("GET", std::string {target}, "", headers);
+    }
+
+    /**
+     * @brief Read just the XML response body from the local pairing endpoint.
      */
     std::string request(const std::string_view target) {
-      return client_->request("GET", std::string {target})->content.string();
+      return exchange(target)->content.string();
+    }
+
+    static constexpr auto otp_salt = "FF5DC6EDA99339A8A0793E216C4257C4";
+
+    /**
+     * @brief Reproduce the client proof independently over the literal salt text.
+     */
+    static std::string otp_proof(const otp_credentials_t &code, const std::string_view salt = otp_salt) {
+      return util::hex_vec(SimpleWeb::Crypto::sha256(code.pin + std::string {salt} + code.passphrase), true);
+    }
+
+    /**
+     * @brief Build an Artemis-style initial request including conventional client metadata.
+     */
+    static std::string otp_target(const otp_credentials_t &code, const std::string_view id, const std::string_view cert = PUBLIC_CERT) {
+      return server_certificate_target(id, otp_salt, cert) + "&uuid=fixture-request&otpauth=" + otp_proof(code);
+    }
+
+    /**
+     * @brief Check whether a response acknowledges its GameStream pairing phase.
+     */
+    static bool paired(const std::string_view body) {
+      return body.contains("<paired>1</paired>");
+    }
+
+    /**
+     * @brief Complete the actual HTTP certificate phases from the client side.
+     */
+    void complete_one_time_handshake(const otp_credentials_t &credentials, const std::string &id, const crypto::creds_t &client, const std::string_view expected_host_certificate, const bool expect_saved) {
+      const auto decode_xml = [](const std::string &body) {
+        boost::property_tree::ptree tree;
+        std::istringstream input {body};
+        boost::property_tree::read_xml(input, tree);
+        return tree;
+      };
+      const auto certificate_response = exchange(otp_target(credentials, id, client.x509));
+      const auto certificate_body = certificate_response->content.string();
+      const auto length = certificate_response->header.find("Content-Length");
+      ASSERT_NE(length, certificate_response->header.end());
+      EXPECT_EQ(length->second, std::to_string(certificate_body.size()));
+      const auto certificate_phase = decode_xml(certificate_body);
+      ASSERT_EQ(certificate_phase.get("root.paired", 0), 1);
+      const auto server_pem = util::from_hex_vec(certificate_phase.get<std::string>("root.plaincert"), true);
+      ASSERT_TRUE(server_pem == expected_host_certificate);
+      EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(client.x509));
+
+      // The client derives its AES key from binary salt and verifies the server's signed secret.
+      const auto salt = util::from_hex<std::array<std::uint8_t, 16>>(otp_salt, true);
+      const auto key = crypto::gen_aes_key(salt, credentials.pin);
+      crypto::cipher::ecb_t cipher {key, false};
+      std::vector<std::uint8_t> encrypted;
+      const auto client_challenge = "0123456789abcdef";
+      ASSERT_EQ(cipher.encrypt(client_challenge, encrypted), 0);
+      const auto phase_prefix = "/pair?uniqueid=" + id + "&";
+      const auto challenge_phase = decode_xml(request(phase_prefix + "clientchallenge=" + util::hex_vec(encrypted, true)));
+      ASSERT_EQ(challenge_phase.get("root.paired", 0), 1);
+      std::vector<std::uint8_t> decrypted;
+      ASSERT_EQ(cipher.decrypt(util::from_hex_vec(challenge_phase.get<std::string>("root.challengeresponse"), true), decrypted), 0);
+      ASSERT_EQ(decrypted.size(), 48);
+      const std::string_view host_hash {reinterpret_cast<const char *>(decrypted.data()), 32};
+      const std::string_view host_challenge {reinterpret_cast<const char *>(decrypted.data()) + 32, 16};
+
+      const std::string client_secret = "fixture-secret01";
+      const auto client_certificate = crypto::x509(client.x509);
+      ASSERT_TRUE(client_certificate);
+      const auto client_cert_signature = crypto::signature(client_certificate);
+      auto client_message = std::string {host_challenge};
+      client_message.append(client_cert_signature.begin(), client_cert_signature.end());
+      client_message.append(client_secret);
+      ASSERT_EQ(cipher.encrypt(SimpleWeb::Crypto::sha256(client_message), encrypted), 0);
+      const auto host_secret_phase = decode_xml(request(phase_prefix + "serverchallengeresp=" + util::hex_vec(encrypted, true)));
+      ASSERT_EQ(host_secret_phase.get("root.paired", 0), 1);
+      const auto host_reply = util::from_hex_vec(host_secret_phase.get<std::string>("root.pairingsecret"), true);
+      ASSERT_GT(host_reply.size(), 16);
+      const auto host_secret = std::string_view {host_reply}.substr(0, 16);
+      const auto host_signature = std::string_view {host_reply}.substr(16);
+      const auto host_certificate = crypto::x509(server_pem);
+      ASSERT_TRUE(host_certificate);
+      ASSERT_TRUE(crypto::verify256(host_certificate, host_secret, host_signature));
+      const auto host_cert_signature = crypto::signature(host_certificate);
+      auto host_message = std::string {client_challenge};
+      host_message.append(host_cert_signature.begin(), host_cert_signature.end());
+      host_message.append(host_secret);
+      EXPECT_TRUE(host_hash == SimpleWeb::Crypto::sha256(host_message));
+
+      const auto signature = crypto::sign256(crypto::pkey(client.pkey), client_secret);
+      ASSERT_FALSE(signature.empty());
+      auto signed_secret = client_secret;
+      signed_secret.append(signature.begin(), signature.end());
+      const auto final_phase = decode_xml(request(phase_prefix + "clientpairingsecret=" + util::hex_vec(signed_secret, true)));
+      EXPECT_EQ(final_phase.get("root.paired", -1), expect_saved ? 1 : 0);
+      EXPECT_FALSE(paired(request(otp_target(credentials, id, client.x509))));
+      EXPECT_EQ(nvhttp::test_support::authorize_client_certificate(client.x509), expect_saved);
     }
 
     /**
@@ -503,13 +622,367 @@ namespace {
 
   private:
     std::unique_ptr<SimpleWeb::Server<SimpleWeb::HTTP>> server_;  ///< Local pairing HTTP server.
-    std::unique_ptr<SimpleWeb::Client<SimpleWeb::HTTP>> client_;  ///< Client connected to the local server.
     std::jthread server_thread_;  ///< Thread running the local server event loop.
     std::atomic<unsigned short> port_ {0};  ///< Ephemeral port assigned to the local server.
     bool original_pin_stdin_;  ///< Console-PIN flag restored after each test.
     std::chrono::milliseconds original_ping_timeout_;  ///< Configured client timeout restored after each test.
   };
 }  // namespace
+
+TEST_F(PairingHttpHandlerTest, OneTimeWireValidationPrecedesManualPinAndPreservesValidInvitation) {
+  nvhttp::test_support::set_otp_random([](unsigned char *output, int size) {
+    std::fill_n(output, size, size == 2 ? 0 : 0xAB);
+    return true;
+  });
+  const auto invitation = issue_one_time_pairing({});
+  ASSERT_TRUE(invitation);
+  ASSERT_TRUE(invitation->pin == "0000");
+  config::sunshine.flags[config::flag::PIN_STDIN] = true;
+  std::istringstream empty_input;
+  const cin_buffer_guard input_guard {empty_input.rdbuf()};
+
+  const auto manual = server_certificate_target("otp-wire", otp_salt);
+  const auto start = otp_target(*invitation, "otp-wire");
+  const auto proof = otp_proof(*invitation);
+  const auto otp_key = "&otpauth=";
+  const std::array invalid {
+    manual + "&otpauth",
+    manual + otp_key,
+    manual + otp_key + proof + "&OTPAuth=" + proof,
+    manual + otp_key + proof + "&PHRASE=getservercert",
+    manual + otp_key + proof + "&UNIQUEID=duplicate",
+    manual + otp_key + proof + "&CLIENTCERT=00",
+    manual + otp_key + proof + "&SALT=" + otp_salt,
+    manual + otp_key + proof + "&clientchallenge=00",
+    manual + otp_key + proof.substr(1),
+    manual + otp_key + std::string(64, 'z'),
+    manual + otp_key + proof + "%00",
+    manual + otp_key + proof + "AA",
+    manual + otp_key + otp_proof(*invitation, "ff5dc6eda99339a8a0793e216c4257c4"),
+    server_certificate_target("otp-wire", "FF5DC6EDA99339A8A0793E216C4257C%00") + otp_key + proof,
+    server_certificate_target("otp-wire", otp_salt, std::string(PUBLIC_CERT) + "trailing") + otp_key + proof,
+    server_certificate_target("otp-wire", otp_salt, "invalid PEM") + otp_key + proof,
+    server_certificate_target("otp-wire", otp_salt, std::string(16 * 1024 + 1, 'x')) + otp_key + proof,
+    server_certificate_target("otp-wire%00", otp_salt) + otp_key + proof,
+    server_certificate_target("", otp_salt) + otp_key + proof,
+    server_certificate_target(std::string(129, 'i'), otp_salt) + otp_key + proof,
+    std::string {"/pair?uniqueid=otp-wire&phrase=pairchallenge"} + otp_key + proof,
+  };
+  for (const auto &target : invalid) {
+    const auto body = request(target);
+    EXPECT_TRUE(body.contains("<paired>0</paired>"));
+    EXPECT_TRUE(body.contains("One-time pairing request rejected"));
+    EXPECT_FALSE(body.contains("plaincert"));
+  }
+  EXPECT_TRUE(get_pending_pairings().empty());
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(PUBLIC_CERT));
+  EXPECT_TRUE(paired(request(start)));
+  EXPECT_FALSE(paired(request(start)));
+  EXPECT_FALSE(withdraw_one_time_pairing(invitation->generation_id));
+  EXPECT_TRUE(get_pending_pairings().empty());
+}
+
+TEST_F(PairingHttpHandlerTest, OneTimeExpiryAndShutdownNeverRearmAnInvitation) {
+  using namespace std::chrono_literals;
+  const auto now = std::chrono::steady_clock::now();
+  nvhttp::test_support::set_pairing_time(now);
+  const auto expiry = issue_one_time_pairing({});
+  ASSERT_TRUE(expiry);
+  nvhttp::test_support::set_pairing_time(now + 180s);
+  EXPECT_FALSE(paired(request(otp_target(*expiry, "expired-otp"))));
+  EXPECT_FALSE(withdraw_one_time_pairing(expiry->generation_id));
+
+  const auto admitted = issue_one_time_pairing({});
+  ASSERT_TRUE(admitted);
+  nvhttp::test_support::set_pairing_time(now + 360s - 1ms);
+  EXPECT_TRUE(paired(request(otp_target(*admitted, "deadline-otp"))));
+  nvhttp::test_support::set_pairing_time(now + 360s);
+  EXPECT_FALSE(paired(request("/pair?uniqueid=deadline-otp&clientchallenge=00000000000000000000000000000000")));
+  EXPECT_FALSE(paired(request(otp_target(*admitted, "new-otp"))));
+
+  const auto abandoned = issue_one_time_pairing({});
+  ASSERT_TRUE(abandoned);
+  ASSERT_TRUE(paired(request(otp_target(*abandoned, "abandoned-otp"))));
+  const auto unclaimed = issue_one_time_pairing({});
+  ASSERT_TRUE(unclaimed);
+  nvhttp::test_support::set_otp_listener_running(false);
+  EXPECT_FALSE(issue_one_time_pairing({}));
+  nvhttp::test_support::set_otp_listener_running(true);
+  EXPECT_FALSE(paired(request(otp_target(*unclaimed, "unclaimed-otp"))));
+  EXPECT_FALSE(paired(request("/pair?uniqueid=abandoned-otp&clientchallenge=00000000000000000000000000000000")));
+  const auto after_restart = issue_one_time_pairing({});
+  ASSERT_TRUE(after_restart);
+  EXPECT_TRUE(paired(request(otp_target(*after_restart, "abandoned-otp"))));
+}
+
+TEST_F(PairingHttpHandlerTest, OneTimeClaimsCannotEvictManualAttemptsOrExceedTheSharedLimit) {
+  const auto invitation = issue_one_time_pairing({});
+  ASSERT_TRUE(invitation);
+  std::vector<std::string> manual_ids(MAX_PENDING_PAIRING_SESSIONS);
+  for (std::size_t index = 0; index < manual_ids.size(); ++index) {
+    ASSERT_EQ(insert_pair_session(pending_session(std::format("manual-{}", index), "Client", "192.0.2.10"), manual_ids[index]), pair_session_insert_e::ADDED);
+  }
+  EXPECT_FALSE(paired(request(otp_target(*invitation, "capacity-otp"))));
+  ASSERT_TRUE(cancel_pairing(manual_ids.back()));
+  EXPECT_FALSE(paired(request(otp_target(*invitation, "manual-0"))));
+  EXPECT_EQ(get_pending_pairings().size(), manual_ids.size() - 1);
+  ASSERT_TRUE(paired(request(otp_target(*invitation, "capacity-otp"))));
+  EXPECT_TRUE(request(server_certificate_target("capacity-otp")).contains("status_code=\"409\""));
+  EXPECT_TRUE(request(server_certificate_target("over-capacity")).contains("status_code=\"503\""));
+  const auto replacement = issue_one_time_pairing({});
+  ASSERT_TRUE(replacement);
+  EXPECT_FALSE(paired(request(otp_target(*replacement, "capacity-otp"))));
+  EXPECT_TRUE(cancel_pairing(manual_ids.front()));
+  // A terminal phase failure releases the admitted slot without rearming the first invitation.
+  EXPECT_FALSE(paired(request("/pair?uniqueid=capacity-otp&clientpairingsecret=00")));
+  EXPECT_FALSE(paired(request(otp_target(*invitation, "cannot-reuse"))));
+  EXPECT_TRUE(paired(request(otp_target(*replacement, "capacity-otp"))));
+}
+
+TEST_F(PairingHttpHandlerTest, ConcurrentOneTimeClaimsUseTheInvitationOnlyOnce) {
+  for (const auto second_id : {"concurrent-b", "concurrent-a"}) {
+    const auto invitation = issue_one_time_pairing({});
+    ASSERT_TRUE(invitation);
+    std::barrier start {3};
+    auto claim = [&](const char *id) {
+      return std::async(std::launch::async, [&, id]() {
+        start.arrive_and_wait();
+        return paired(request(otp_target(*invitation, id)));
+      });
+    };
+    auto first = claim("concurrent-a");
+    auto second = claim(second_id);
+    start.arrive_and_wait();
+    EXPECT_EQ(static_cast<int>(first.get()) + static_cast<int>(second.get()), 1);
+    EXPECT_FALSE(withdraw_one_time_pairing(invitation->generation_id));
+    EXPECT_TRUE(get_pending_pairings().empty());
+    expire_pair_sessions(std::chrono::steady_clock::time_point::max());
+  }
+}
+
+TEST_F(PairingHttpHandlerTest, ConcurrentWithdrawalAndClaimHaveOneWinner) {
+  const auto invitation = issue_one_time_pairing({});
+  ASSERT_TRUE(invitation);
+  std::barrier start {3};
+  auto claim = std::async(std::launch::async, [&]() {
+    start.arrive_and_wait();
+    return paired(request(otp_target(*invitation, "withdraw-race")));
+  });
+  auto withdrawal = std::async(std::launch::async, [&]() {
+    start.arrive_and_wait();
+    return withdraw_one_time_pairing(invitation->generation_id);
+  });
+  start.arrive_and_wait();
+  EXPECT_NE(claim.get(), withdrawal.get());
+  const auto replacement = issue_one_time_pairing({});
+  ASSERT_TRUE(replacement);
+  EXPECT_FALSE(withdraw_one_time_pairing(invitation->generation_id));
+  EXPECT_TRUE(withdraw_one_time_pairing(replacement->generation_id));
+}
+
+TEST_F(PairingHttpHandlerTest, OneTimeCertificatePreparationFailureConsumesTheInvitation) {
+  const auto invitation = issue_one_time_pairing({});
+  ASSERT_TRUE(invitation);
+  setup(PRIVATE_KEY, "");
+  EXPECT_FALSE(paired(request(otp_target(*invitation, "unavailable-certificate"))));
+  setup(PRIVATE_KEY, PUBLIC_CERT);
+  EXPECT_FALSE(paired(request(otp_target(*invitation, "unavailable-certificate"))));
+  EXPECT_FALSE(withdraw_one_time_pairing(invitation->generation_id));
+  const auto replacement = issue_one_time_pairing({});
+  ASSERT_TRUE(replacement);
+  EXPECT_TRUE(paired(request(otp_target(*replacement, "unavailable-certificate"))));
+}
+
+TEST_F(PairingHttpHandlerTest, OneTimeDeliveryFailureRemovesOnlyTheOriginalClaim) {
+  std::mutex callback_mutex;
+  std::function<void()> failure;
+  nvhttp::test_support::set_otp_delivery_failure_observer([&](auto notify) {
+    std::scoped_lock lock {callback_mutex};
+    failure = std::move(notify);
+  });
+  auto clear_observer = util::fail_guard([]() {
+    nvhttp::test_support::set_otp_delivery_failure_observer({});
+  });
+  const auto take_failure = [&]() {
+    std::scoped_lock lock {callback_mutex};
+    return std::exchange(failure, std::function<void()> {});
+  };
+
+  constexpr auto id = "otp-delivery-fixture";
+  constexpr auto challenge = "/pair?uniqueid=otp-delivery-fixture&clientchallenge=00000000000000000000000000000000";
+  const auto first = issue_one_time_pairing({});
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(paired(request(otp_target(*first, id))));
+  auto fail_first = take_failure();
+  ASSERT_TRUE(fail_first);
+  fail_first();
+  EXPECT_FALSE(paired(request(challenge)));
+  EXPECT_FALSE(paired(request(otp_target(*first, id))));
+
+  const auto second = issue_one_time_pairing({});
+  ASSERT_TRUE(second);
+  ASSERT_TRUE(paired(request(otp_target(*second, id))));
+  auto late_failure = take_failure();
+  ASSERT_TRUE(late_failure);
+  EXPECT_FALSE(paired(request("/pair?uniqueid=otp-delivery-fixture&clientpairingsecret=00")));
+  const auto replacement = issue_one_time_pairing({});
+  ASSERT_TRUE(replacement);
+  ASSERT_TRUE(paired(request(otp_target(*replacement, id))));
+  late_failure();
+  EXPECT_TRUE(paired(request(challenge)));
+}
+
+TEST_F(PairingHttpHandlerTest, PairingRequestDiagnosticsOmitSyntheticWireValues) {
+  constexpr auto certificate_marker = "fixture-only-certificate-log-marker";
+  constexpr auto proof_marker = "fixture-only-proof-log-marker";
+  constexpr auto header_marker = "fixture-only-pairing-header-log-marker";
+  const SimpleWeb::CaseInsensitiveMultimap headers {{"X-Fixture-Diagnostic", header_marker}};
+  config::sunshine.flags[config::flag::PIN_STDIN] = true;
+  std::istringstream input {"4321\n"};
+  const cin_buffer_guard input_guard {input.rdbuf()};
+  const auto manual_target = server_certificate_target("pairing-log-fixture", otp_salt, certificate_marker);
+  EXPECT_TRUE(paired(exchange(manual_target, headers)->content.string()));
+  EXPECT_FALSE(paired(exchange(manual_target + "&otpauth=" + proof_marker, headers)->content.string()));
+  EXPECT_TRUE(log_checker::line_contains("test_sunshine.log", "GameStream pairing request"));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", certificate_marker));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", util::hex_vec(std::string_view {certificate_marker}, true)));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", proof_marker));
+  EXPECT_FALSE(log_checker::line_contains("test_sunshine.log", header_marker));
+}
+
+TEST_F(PairingHttpHandlerTest, OneTimeSignedHandshakePersistsExactlyTwoZeroGrantClientsAndVerifiesHttps) {
+  const auto file_prefix = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "otp-handshake-fixture";
+  const auto state_file = file_prefix.string() + ".json";
+  const auto host_cert_file = file_prefix.string() + "-host-cert.pem";
+  const auto host_key_file = file_prefix.string() + "-host-key.pem";
+  const auto client_cert_file = file_prefix.string() + "-client-cert.pem";
+  const auto client_key_file = file_prefix.string() + "-client-key.pem";
+  const auto original_state_file = config::nvhttp.file_state;
+  const auto original_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+  auto restore_state = util::fail_guard([&]() {
+    nvhttp::test_support::reset_client_state();
+    config::nvhttp.file_state = original_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
+    for (const auto &file : {state_file, host_cert_file, host_key_file, client_cert_file, client_key_file}) {
+      std::error_code ec;
+      std::filesystem::remove(file, ec);
+    }
+  });
+  nvhttp::test_support::reset_client_state();
+  config::sunshine.flags[config::flag::FRESH_STATE] = false;
+  config::nvhttp.file_state = state_file;
+  std::error_code cleanup_error;
+  std::filesystem::remove(state_file, cleanup_error);
+  ASSERT_FALSE(cleanup_error);
+
+  // Use a different common name so hostname verification must match the DNS SAN on every OpenSSL version.
+  auto host = crypto::gen_creds("Sunshine OTP fixture host", 2048);
+  auto host_certificate = crypto::x509(host.x509);
+  auto host_key = crypto::pkey(host.pkey);
+  ASSERT_TRUE(host_certificate);
+  ASSERT_TRUE(host_key);
+  util::safe_ptr<X509_EXTENSION, &X509_EXTENSION_free> localhost_san {
+    X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, "DNS:localhost")
+  };
+  ASSERT_TRUE(localhost_san);
+  ASSERT_EQ(X509_add_ext(host_certificate.get(), localhost_san.get(), -1), 1);
+  ASSERT_GT(X509_sign(host_certificate.get(), host_key.get(), EVP_sha256()), 0);
+  host.x509 = crypto::pem(host_certificate);
+  ASSERT_FALSE(host.x509.empty());
+  setup(host.pkey, host.x509);
+
+  const auto first = test_utils::certificates::generate_ca_credentials("First OTP fixture client");
+  const auto second = test_utils::certificates::generate_ca_credentials("Second OTP fixture client");
+  const auto unrelated = test_utils::certificates::generate_ca_credentials("Unrelated OTP fixture client");
+  const auto first_invitation = issue_one_time_pairing("First labelled client");
+  ASSERT_TRUE(first_invitation);
+  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*first_invitation, "first-fixture", first, host.x509, true));
+  EXPECT_EQ(get_all_clients().size(), 1);
+
+  config::nvhttp.file_state = state_file + "/missing/state.json";
+  const auto failed_save = issue_one_time_pairing({});
+  ASSERT_TRUE(failed_save);
+  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*failed_save, "second-fixture", second, host.x509, false));
+  EXPECT_EQ(get_all_clients().size(), 1);
+  EXPECT_FALSE(withdraw_one_time_pairing(failed_save->generation_id));
+  config::nvhttp.file_state = state_file;
+
+  const auto second_invitation = issue_one_time_pairing({});
+  ASSERT_TRUE(second_invitation);
+  ASSERT_NO_FATAL_FAILURE(complete_one_time_handshake(*second_invitation, "second-fixture", second, host.x509, true));
+  std::ifstream saved {state_file};
+  ASSERT_TRUE(saved.good());
+  const auto records = nlohmann::json::parse(saved).at("root").at("named_devices");
+  saved.close();
+  for (const auto &record : records) {
+    EXPECT_EQ(record.at("permissions").get<std::string>(), "0");
+  }
+  nvhttp::test_support::reset_client_state();
+  nvhttp::test_support::reload_client_state();
+  const auto clients = get_all_clients();
+  ASSERT_EQ(clients.size(), 2);
+  EXPECT_EQ(clients[0].at("name"), "First labelled client");
+  EXPECT_EQ(clients[1].at("name"), "Artemis");
+  const auto first_uuid = clients[0].at("uuid").get<std::string>();
+  const auto second_uuid = clients[1].at("uuid").get<std::string>();
+  EXPECT_NE(first_uuid, second_uuid);
+  auto first_certificate = crypto::x509(first.x509);
+  auto second_certificate = crypto::x509(second.x509);
+  ASSERT_TRUE(first_certificate);
+  ASSERT_TRUE(second_certificate);
+  EXPECT_TRUE(get_cert_by_uuid(first_uuid) == crypto::pem(first_certificate));
+  EXPECT_TRUE(get_cert_by_uuid(second_uuid) == crypto::pem(second_certificate));
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(unrelated.x509));
+
+  std::ofstream {host_cert_file} << host.x509;
+  std::ofstream {host_key_file} << host.pkey;
+  std::shared_ptr<SimpleWeb::ScopeRunner> scope;
+  auto tls_server = nvhttp::test_support::make_https_server(host_cert_file, host_key_file, scope, true);
+  bool host_audio = false;
+  nvhttp::test_support::set_gamestream_routes(*tls_server, host_audio);
+  tls_server->config.address = "127.0.0.1";
+  tls_server->config.port = 0;
+  tls_server->config.timeout_request = 5;
+  tls_server->config.timeout_content = 5;
+  std::atomic<unsigned short> tls_port {0};
+  std::jthread listener {[&]() {
+    tls_server->start([&](unsigned short port) {
+      tls_port = port;
+    });
+  }};
+  auto stop_server = util::fail_guard([&]() {
+    tls_server->stop();
+    listener.join();
+  });
+  for (int attempt = 0; attempt < 100 && tls_port == 0; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds {10});
+  }
+  ASSERT_NE(tls_port, 0);
+  const auto tls_request = [&](const crypto::creds_t &client, const std::string &target) {
+    std::ofstream {client_cert_file} << client.x509;
+    std::ofstream {client_key_file} << client.pkey;
+    SimpleWeb::Client<SimpleWeb::HTTPS> https_client {std::format("localhost:{}", tls_port.load()), true, client_cert_file, client_key_file, host_cert_file};
+    https_client.config.timeout = 5;
+    return https_client.request("GET", target, "", {{"Connection", "close"}})->content.string();
+  };
+  const auto final_path = "/pair?uniqueid=testing&phrase=pairchallenge";
+  EXPECT_TRUE(paired(tls_request(first, final_path)));
+  EXPECT_TRUE(paired(tls_request(second, final_path)));
+  EXPECT_TRUE(tls_request(unrelated, final_path).contains("status_code=\"401\""));
+  for (const auto &credentials : {first, second}) {
+    const auto server_info = tls_request(credentials, "/serverinfo");
+    EXPECT_TRUE(server_info.contains("<Permission>0</Permission>"));
+    EXPECT_TRUE(server_info.contains("<currentgame>0</currentgame>"));
+    constexpr auto launch_target = "/launch?rikey=00112233445566778899aabbccddeeff&rikeyid=1&appid=7&localAudioPlayMode=0";
+    for (const auto &target : {"/applist", "/appasset?appid=7", launch_target}) {
+      EXPECT_TRUE(tls_request(credentials, target).contains("status_code=\"403\"")) << target;
+    }
+  }
+  ASSERT_TRUE(update_client(first_uuid, std::nullopt, permissions::list));
+  ASSERT_TRUE(current_client(first_uuid, first.x509));
+  EXPECT_EQ(current_client(first_uuid, first.x509)->permissions, permissions::list);
+  EXPECT_EQ(current_client(second_uuid, second.x509)->permissions, 0U);
+}
 
 TEST_F(PairingHttpHandlerTest, ImmediateRequestsReturnExpectedStatus) {
   EXPECT_NE(request("/pair"sv).find("status_code=\"400\""), std::string::npos);
@@ -628,6 +1101,10 @@ TEST_F(PairingHttpHandlerTest, RetriedGetservercertReplacesAbandonedHandshake) {
   }
   EXPECT_TRUE(get_pending_pairings().empty());
 
+  const auto invitation = issue_one_time_pairing({});
+  ASSERT_TRUE(invitation);
+  EXPECT_FALSE(paired(request(otp_target(*invitation, "retry"))));
+
   // A fresh getservercert for the same client replaces the abandoned handshake instead
   // of failing with 409 until the session expires.
   std::packaged_task<std::string()> retry_request_task {[this]() {
@@ -642,6 +1119,7 @@ TEST_F(PairingHttpHandlerTest, RetriedGetservercertReplacesAbandonedHandshake) {
   EXPECT_FALSE(pin_result.get());  // The evicted handshake's waiter is woken with failure.
   EXPECT_TRUE(cancel_pairing(second_pairing_id));
   EXPECT_NE(retry_response.get().find("cancelled by operator"), std::string::npos);
+  EXPECT_TRUE(paired(request(otp_target(*invitation, "retry"))));
 }
 
 TEST_F(PairingHttpHandlerTest, ConsolePinCompletesOrRejectsTheCertificatePhase) {
@@ -650,7 +1128,13 @@ TEST_F(PairingHttpHandlerTest, ConsolePinCompletesOrRejectsTheCertificatePhase) 
 
   std::istringstream input {"5338\n0000\n"};
   const cin_buffer_guard input_guard {input.rdbuf()};
-  EXPECT_NE(request(server_certificate_target("console-success")).find("status_code=\"200\""), std::string::npos);
+  const auto response = exchange(server_certificate_target("console-success"));
+  const auto body = response->content.string();
+  const auto length = response->header.find("Content-Length");
+  ASSERT_NE(length, response->header.end());
+  EXPECT_EQ(length->second, std::to_string(body.size()));
+  EXPECT_TRUE(body.contains("status_code=\"200\""));
+  EXPECT_TRUE(body.contains(util::hex_vec(PUBLIC_CERT, true)));
   EXPECT_NE(request(server_certificate_target("console-failure", "00")).find("status_code=\"400\""), std::string::npos);
 }
 

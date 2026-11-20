@@ -18,6 +18,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -973,25 +974,33 @@ namespace {
     EXPECT_FALSE(rtsp_stream::test_support::token_authorized(second));
   }
 
-  /**
-   * @brief Exercise real selector admission without media workers using a captured empty-command app.
-   */
+  /** @brief Check the XML failure result and absence of admission details. */
+  void expect_stream_rejection(std::string_view response, std::string_view route, int status) {
+    EXPECT_TRUE(response.contains("status_code=\"" + std::to_string(status) + "\"")) << response;
+    EXPECT_TRUE(response.contains(route == "/resume" ? "<resume>0</resume>" : "<gamesession>0</gamesession>"));
+    EXPECT_FALSE(response.contains("sessionUrl0"));
+    EXPECT_FALSE(response.contains("AppTitle"));
+  }
+
+  /** @brief Exercise real selector admission without media workers using a captured empty-command app. */
   class HttpsApplicationIdentityTest: public HttpsClientIdentityTest {
   protected:
     proc::proc_t previous_proc;
     std::string previous_file;
     proc::catalog::json initial;
     std::pair<int, std::string> selected;
-    int source_preparations = 0;
-    int source_rollbacks = 0;
-    int encoder_probes = 0;
+    std::atomic_int source_preparations {0};
+    std::atomic_int source_rollbacks {0};
+    std::atomic_int encoder_probes {0};
     std::atomic_bool existing_viewer {false};
+    int previous_encryption = 0;
 
     void SetUp() override {
       HttpsClientIdentityTest::SetUp();
       previous_proc = std::move(proc::proc);
       proc::proc = proc::proc_t {};
       previous_file = config::stream.file_apps;
+      previous_encryption = config::stream.lan_encryption_mode;
       config::stream.file_apps = (std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "https_application_catalog.json").string();
       std::ofstream {config::stream.file_apps} << R"({"env":{},"apps":[{"name":"Active"},{"name":"Other"}]})";
       const auto loaded = proc::read_catalog(config::stream.file_apps);
@@ -1028,6 +1037,7 @@ namespace {
       std::filesystem::remove(config::stream.file_apps);
       config::stream.file_apps = previous_file;
       HttpsClientIdentityTest::TearDown();
+      config::stream.lan_encryption_mode = previous_encryption;
     }
 
     std::string exchange(const std::string &path) {
@@ -1036,8 +1046,8 @@ namespace {
       return read_response(*client);
     }
 
-    std::string stream_path(const std::string &route, const std::string &selectors) const {
-      return route + "?rikey=00112233445566778899aabbccddeeff&rikeyid=1&corever=1&localAudioPlayMode=0" + selectors;
+    std::string stream_path(const std::string &route, const std::string &selectors, const char *options = "&corever=1&localAudioPlayMode=0") const {
+      return route + "?rikey=00112233445566778899aabbccddeeff&rikeyid=1" + options + selectors;
     }
   };
 
@@ -1076,13 +1086,13 @@ namespace {
       EXPECT_EQ(token->client_cert, credentials_a.x509);
       EXPECT_FALSE(token->joining);  // No media source exists; the source hook must still run.
       EXPECT_GT(source_preparations, 0);
-      EXPECT_EQ(encoder_probes, source_preparations);
+      EXPECT_EQ(encoder_probes, source_preparations.load());
       EXPECT_TRUE(rtsp_stream::test_support::token_authorized(token));
       EXPECT_EQ(proc::proc.active_identity(), selected);
       EXPECT_EQ(proc::proc.get_last_run_app_name(), "Active");
       rtsp_stream::stop_application({});
     }
-    const auto prepared_before_denial = source_preparations;
+    const auto prepared_before_denial = source_preparations.load();
     const auto other = initial["apps"][1]["uuid"].get<std::string>();
     EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + other)).contains("status_code=\"403\""));
     EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
@@ -1093,27 +1103,127 @@ namespace {
   TEST_F(HttpsApplicationIdentityTest, FakeExistingViewerJoinPreservesSourceAndApplication) {
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view));
     existing_viewer = true;
-    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + selected.second)).contains("status_code=\"200\""));
-    const auto token = rtsp_stream::test_support::pending_launch();
-    ASSERT_TRUE(token);
-    EXPECT_TRUE(token->joining);
-    EXPECT_EQ(token->appid, selected.first);
-    EXPECT_EQ(token->app_uuid, selected.second);
+    const auto instance = proc::proc.lifetime_snapshot().instance;
+    const auto numeric = "&appid=" + std::to_string(selected.first);
+    for (const auto &route : {"/launch", "/resume"}) {
+      SCOPED_TRACE(route);
+      const auto selectors = route == std::string_view {"/launch"} ? numeric : numeric + "&appuuid=" + selected.second;
+      const auto response = exchange(stream_path(route, selectors + "&virtualDisplay=1&mode=1280x720x120&hdrMode=1"));
+      ASSERT_TRUE(response.contains("status_code=\"200\"")) << response;
+      const auto token = rtsp_stream::test_support::pending_launch();
+      ASSERT_TRUE(token);
+      EXPECT_TRUE(token->joining);
+      EXPECT_EQ(token->appid, selected.first);
+      EXPECT_EQ(token->app_uuid, selected.second);
+      EXPECT_EQ(proc::proc.lifetime_snapshot().instance, instance);
+      rtsp_stream::launch_session_clear(token->id);
+    }
     EXPECT_EQ(source_preparations, 0);
     EXPECT_EQ(encoder_probes, 0);
+    EXPECT_EQ(source_rollbacks, 0);
     EXPECT_EQ(proc::proc.active_identity(), selected);
-    rtsp_stream::stop_application({});
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
     const auto other = initial["apps"][1]["uuid"].get<std::string>();
-    EXPECT_TRUE(exchange(stream_path("/launch", "&appid=-1&appuuid=" + other)).contains("status_code=\"503\""));
+    const auto conflicting = exchange(stream_path("/launch", "&appid=-1&appuuid=" + other + "&virtualDisplay=bad"));
+    expect_stream_rejection(conflicting, "/launch", 503);
+    EXPECT_FALSE(conflicting.contains(other));
     EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, instance);
     EXPECT_EQ(source_preparations, 0);
     EXPECT_EQ(encoder_probes, 0);
   }
 
+  TEST_F(HttpsApplicationIdentityTest, FreshVirtualIntentRequiresManagedBackendBeforeLegacySideEffects) {
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::view));
+    const auto instance = proc::proc.lifetime_snapshot().instance;
+    const auto selector = "&appid=" + std::to_string(selected.first);
+    for (const auto &route : {"/launch", "/resume"}) {
+      SCOPED_TRACE(route);
+      const auto response = exchange(stream_path(route, selector + "&ViRtUaLdIsPlAy=%31", "&corever=1&localAudioPlayMode=1"));
+      expect_stream_rejection(response, route, 503);
+      EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+      EXPECT_EQ(proc::proc.lifetime_snapshot().instance, instance);
+    }
+    const auto other = initial["apps"][1]["uuid"].get<std::string>();
+    const auto replacement = stream_path("/launch", "&appuuid=" + other + "&virtualDisplay=1", "&corever=1&localAudioPlayMode=1");
+    expect_stream_rejection(exchange(replacement), "/launch", 403);
+    ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+    expect_stream_rejection(exchange(replacement), "/launch", 503);
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, instance);
+    EXPECT_EQ(source_preparations, 0);
+    EXPECT_EQ(encoder_probes, 0);
+    EXPECT_EQ(source_rollbacks, 0);
+
+    config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_MANDATORY;
+    expect_stream_rejection(exchange(stream_path("/resume", selector + "&virtualDisplay=0", "&corever=0&localAudioPlayMode=1")), "/resume", 403);
+    const auto response = exchange(stream_path("/resume", selector + "&virtualDisplay=0", "&corever=1"));
+    ASSERT_TRUE(response.contains("status_code=\"200\"")) << response;
+    const auto token = rtsp_stream::test_support::pending_launch();
+    ASSERT_TRUE(token);
+    EXPECT_FALSE(token->host_audio);
+    EXPECT_FALSE(token->joining);
+    EXPECT_EQ(source_preparations, 1);
+    EXPECT_EQ(encoder_probes, 1);
+    rtsp_stream::launch_session_clear(token->id);
+
+    proc::proc.terminate();
+    expect_stream_rejection(exchange(stream_path("/launch", selector + "&virtualDisplay=1")), "/launch", 503);
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    EXPECT_EQ(proc::proc.active_identity().first, 0);
+    EXPECT_EQ(source_preparations, 1);
+    EXPECT_EQ(encoder_probes, 1);
+    EXPECT_EQ(source_rollbacks, 0);
+  }
+
+  TEST_F(HttpsApplicationIdentityTest, MalformedVirtualIntentPreservesEarlierAdmissionErrors) {
+    config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_MANDATORY;
+    const auto instance = proc::proc.lifetime_snapshot().instance;
+    const auto selector = "&appid=" + std::to_string(selected.first);
+    const auto other = initial["apps"][1]["uuid"].get<std::string>();
+    for (const auto &route : {"/launch", "/resume"}) {
+      SCOPED_TRACE(route);
+      for (const auto grant : {0U, permissions::list}) {
+        ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, grant));
+        const auto response = exchange(stream_path(route, selector + "&virtualDisplay=true"));
+        expect_stream_rejection(response, route, 403);
+        EXPECT_FALSE(response.contains("Active"));
+        EXPECT_FALSE(response.contains(selected.second));
+      }
+      ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
+      expect_stream_rejection(exchange(stream_path(route, "&appuuid=33333333-3333-3333-3333-333333333333&virtualDisplay=true")), route, 404);
+      const auto conflict = exchange(stream_path(route, selector + "&appuuid=" + other + "&virtualDisplay=1"));
+      expect_stream_rejection(conflict, route, 400);
+      EXPECT_FALSE(conflict.contains(other));
+      expect_stream_rejection(exchange(stream_path(route, selector + "&virtualDisplay=true", "&corever=0&localAudioPlayMode=1")), route, 403);
+      for (const auto &option : {
+             "&virtualDisplay",
+             "&virtualDisplay=",
+             "&virtualDisplay=01",
+             "&virtualDisplay=true",
+             "&virtualDisplay=-1",
+             "&virtualDisplay=1%20",
+             "&virtualDisplay=1%00",
+             "&virtualDisplay=9999999999999999999999",
+             "&virtualDisplay=1&virtualDisplay=1",
+             "&virtualDisplay=1&VIRTUALDISPLAY=0"
+           }) {
+        SCOPED_TRACE(option);
+        const auto response = exchange(stream_path(route, selector + option));
+        expect_stream_rejection(response, route, 400);
+        EXPECT_FALSE(response.contains(selected.second));
+        EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+      }
+    }
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, instance);
+    EXPECT_EQ(source_preparations, 0);
+    EXPECT_EQ(encoder_probes, 0);
+    EXPECT_EQ(source_rollbacks, 0);
+  }
+
   TEST_F(HttpsApplicationIdentityTest, RejectedSelectorMatrixLeavesNoUsableAdmission) {
     ASSERT_TRUE(nvhttp::update_client(uuid_a, std::nullopt, permissions::launch));
-    const auto prepared_before_denial = source_preparations;
+    const auto prepared_before_denial = source_preparations.load();
     for (const auto &route : {"/launch", "/resume"}) {
       for (const auto &selectors : {
              "&appid=-1",
@@ -1167,7 +1277,7 @@ namespace {
     ASSERT_TRUE(nvhttp::unpair_client(uuid_a));
     const auto repaired = nvhttp::test_support::add_client("repaired selector fixture", credentials_a.x509, true);
     ASSERT_TRUE(nvhttp::update_client(repaired, std::nullopt, permissions::launch));
-    const auto path = stream_path("/launch", "&appid=-1&appuuid=" + selected.second + "&uniqueid=" + repaired);
+    const auto path = stream_path("/launch", "&appid=-1&appuuid=" + selected.second + "&uniqueid=" + repaired + "&virtualDisplay=true");
     send(*original, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     EXPECT_TRUE(read_response(*original).contains("status_code=\"401\""));
     EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
@@ -1181,13 +1291,32 @@ namespace {
     std::shared_future<void> gate;
     std::promise<void> began;
     std::atomic_int begins {0};
+    std::atomic_int probes {0};
+    std::atomic_bool fail_virtual {false};
+
+    /** @brief Copy every acquisition request, including a failed attempt. */
+    std::vector<display_policy::source_request_t> requests() const {
+      std::lock_guard lock {mutex};
+      return recorded_requests;
+    }
 
     bool begin(const display_policy::source_request_t &request, std::uint64_t generation, std::uint64_t epoch) override {
+      {
+        std::lock_guard lock {mutex};
+        recorded_requests.push_back(request);
+      }
       if (++begins == 1) {
         began.set_value();
       }
       if (gate.valid()) {
         gate.wait_for(5s);
+      }
+      if (fail_virtual && request.virtual_display) {
+        std::lock_guard lock {mutex};
+        state = {};
+        state.generation = generation;
+        state.phase = rtsp_stream::source_backend_status_t::phase_e::failed;
+        return false;
       }
       auto source = std::make_shared<rtsp_stream::capture_source_t>();
       source->kind = request.virtual_display ? rtsp_stream::capture_source_t::kind_e::owned_virtual : rtsp_stream::capture_source_t::kind_e::native;
@@ -1224,6 +1353,7 @@ namespace {
     }
 
     int probe(const rtsp_stream::capture_source_t &, std::shared_ptr<rtsp_stream::capture_pin_t>) override {
+      ++probes;
       return 200;
     }
 
@@ -1246,6 +1376,7 @@ namespace {
 
   private:
     mutable std::mutex mutex;
+    std::vector<display_policy::source_request_t> recorded_requests;
     rtsp_stream::source_backend_status_t state;
   };
 
@@ -1261,6 +1392,9 @@ namespace {
       previous_file = config::stream.file_apps;
       directory = std::filesystem::path {SUNSHINE_TEST_BIN_DIR} / "p3c_managed_https";
       previous_timeout = config::stream.ping_timeout;
+      previous_display = config::video.dd;
+      config::video.dd.configuration_option = config::video_t::dd_t::config_option_e::disabled;
+      config::video.dd.force_virtual = false;
       std::filesystem::create_directories(directory);
       gate = directory / "release";
       entered = directory / "entered";
@@ -1342,6 +1476,7 @@ namespace {
       }
       config::stream.file_apps = previous_file;
       config::stream.ping_timeout = previous_timeout;
+      config::video.dd = std::move(previous_display);
       HttpsClientIdentityTest::TearDown();
     }
 
@@ -1351,20 +1486,27 @@ namespace {
       return client;
     }
 
-    std::string launch_path(const std::string &uuid) const {
-      return "/launch?rikey=00112233445566778899aabbccddeeff&rikeyid=1&corever=1&localAudioPlayMode=0&mode=1920x1080x60&appid=-1&appuuid=" + uuid;
+    std::string launch_path(const std::string &uuid, const char *route = "/launch") const {
+      return std::string {route} + "?rikey=00112233445566778899aabbccddeeff&rikeyid=1&corever=1&localAudioPlayMode=0&mode=1920x1080x60&appid=-1&appuuid=" + uuid;
     }
 
-    bool drain_source() {
+    template<class Predicate>
+    bool wait_for_source(Predicate complete) {
       const auto deadline = std::chrono::steady_clock::now() + 3s;
       while (std::chrono::steady_clock::now() < deadline) {
         rtsp_stream::test_support::poll_source();
-        if (!rtsp_stream::source_snapshot().managed) {
+        if (complete(rtsp_stream::source_snapshot())) {
           return true;
         }
         std::this_thread::yield();
       }
       return false;
+    }
+
+    bool drain_source() {
+      return wait_for_source([](const auto &source) {
+        return !source.managed;
+      });
     }
 
     bool wait_for_file(const std::filesystem::path &file) {
@@ -1381,6 +1523,7 @@ namespace {
     proc::proc_t previous_proc;
     std::string previous_file, command, undo_command, wait_command;
     decltype(config::stream.ping_timeout) previous_timeout;
+    decltype(config::video.dd) previous_display;
     std::filesystem::path directory, gate, entered, script, undo_script;
     proc::catalog::json initial;
     std::pair<int, std::string> app_a, app_b;
@@ -1391,6 +1534,138 @@ namespace {
     std::shared_ptr<managed_http_backend_t> backend;
     std::unique_ptr<platf::deinit_t> owner;
   };
+
+  TEST_F(ManagedHttpsProcessTest, FreshVirtualIntentSelectsSourceAndZeroPreservesHostForce) {
+    config::video.dd.config_revert_on_disconnect = true;
+    const auto info = read_response(*begin_request("/serverinfo"));
+    EXPECT_TRUE(info.contains("status_code=\"200\""));
+    EXPECT_FALSE(info.contains("VirtualDisplayCapable"));
+    EXPECT_FALSE(info.contains("VirtualDisplayDriverReady"));
+
+    struct intent_case_t {
+      const char *route;
+      const char *option;
+      bool force_virtual;
+      bool virtual_source;
+    };
+
+    int acquisitions = 0;
+    for (const auto &test : {
+           intent_case_t {"/launch", "", false, false},
+           intent_case_t {"/resume", "&virtualDisplay=0", false, false},
+           intent_case_t {"/launch", "&virtualDisplay=1", false, true},
+           intent_case_t {"/resume", "&VIRTUALDISPLAY=%31", false, true},
+           intent_case_t {"/launch", "&virtualDisplay=0", true, true}
+         }) {
+      SCOPED_TRACE(test.route);
+      SCOPED_TRACE(test.option);
+      config::video.dd.force_virtual = test.force_virtual;
+      const auto response = read_response(*begin_request(launch_path(app_a.second, test.route) + test.option));
+      ASSERT_TRUE(response.contains("status_code=\"200\"")) << response;
+      EXPECT_TRUE(response.contains("sessionUrl0"));
+      const auto token = rtsp_stream::test_support::pending_launch();
+      ASSERT_TRUE(token);
+      ASSERT_TRUE(token->source);
+      EXPECT_FALSE(token->joining);
+      EXPECT_EQ(token->source->kind, test.virtual_source ? rtsp_stream::capture_source_t::kind_e::owned_virtual : rtsp_stream::capture_source_t::kind_e::native);
+      const auto requests = backend->requests();
+      ASSERT_EQ(requests.size(), static_cast<std::size_t>(++acquisitions));
+      EXPECT_EQ(requests.back().virtual_display, test.virtual_source);
+      EXPECT_EQ(backend->probes, acquisitions);
+      rtsp_stream::launch_session_clear(token->id);
+      ASSERT_TRUE(drain_source());
+    }
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_EQ(undo_count->load(), 0);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, VirtualPreparationFailureGrantsNoNativeFallback) {
+    backend->fail_virtual = true;
+    expect_stream_rejection(read_response(*begin_request(launch_path(app_a.second) + "&virtualDisplay=1")), "/launch", 503);
+    ASSERT_TRUE(drain_source());
+    if (const auto failed = rtsp_stream::test_support::pending_launch()) {
+      EXPECT_FALSE(rtsp_stream::test_support::token_authorized(failed));
+      EXPECT_FALSE(rtsp_stream::test_support::claim_launch(failed));
+    }
+    const auto requests = backend->requests();
+    ASSERT_EQ(requests.size(), 1U);
+    EXPECT_TRUE(requests.front().virtual_display);
+    EXPECT_EQ(backend->probes, 0);
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_EQ(undo_count->load(), 0);
+  }
+
+  TEST_F(ManagedHttpsProcessTest, VirtualIntentJoinsPreserveReadyAndRetainedSources) {
+    config::video.dd.config_revert_on_disconnect = false;
+    const auto executes = std::make_shared<std::atomic_int>(0);
+    proc::test_support::set_execute_entry_hook([executes]() {
+      ++*executes;
+    });
+    const auto response = read_response(*begin_request(launch_path(app_a.second) + "&virtualDisplay=1"));
+    ASSERT_TRUE(response.contains("status_code=\"200\"")) << response;
+    const auto first = rtsp_stream::test_support::pending_launch();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(rtsp_stream::test_support::claim_launch(first));
+    ASSERT_TRUE(rtsp_stream::test_support::start_media(first, true));
+    auto release_viewer = util::fail_guard([&]() {
+      rtsp_stream::test_support::release_media(first);
+    });
+    rtsp_stream::launch_session_clear(first->id);
+    const auto original = rtsp_stream::source_snapshot();
+    ASSERT_TRUE(original.request);
+    ASSERT_TRUE(original.source);
+    ASSERT_TRUE(original.request->virtual_display);
+    ASSERT_EQ(original.media_pins, 1U);
+    const auto initial_requests = backend->requests();
+    ASSERT_EQ(initial_requests.size(), 1U);
+    EXPECT_EQ(initial_requests.front(), *original.request);
+
+    const auto join_args = "?rikey=00112233445566778899aabbccddeeff&rikeyid=2&corever=1&localAudioPlayMode=1&mode=1280x720x120&hdrMode=1&appid=" + std::to_string(app_a.first) + "&appuuid=" + app_a.second;
+    expect_stream_rejection(read_response(*begin_request("/launch" + join_args + "&virtualDisplay=0&VIRTUALDISPLAY=0", true)), "/launch", 400);
+    const auto conflict = read_response(*begin_request(launch_path(app_b.second) + "&virtualDisplay=bad", true));
+    expect_stream_rejection(conflict, "/launch", 503);
+    EXPECT_FALSE(conflict.contains(app_b.second));
+    EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+    ASSERT_TRUE(nvhttp::update_client(uuid_b, std::nullopt, permissions::view));
+    for (const auto &route : {"/launch", "/resume"}) {
+      SCOPED_TRACE(route);
+      const auto joined = read_response(*begin_request(route + join_args + "&virtualDisplay=0", true));
+      ASSERT_TRUE(joined.contains("status_code=\"200\"")) << joined;
+      const auto token = rtsp_stream::test_support::pending_launch();
+      ASSERT_TRUE(token);
+      EXPECT_TRUE(token->joining);
+      EXPECT_EQ(token->client_uuid, uuid_b);
+      EXPECT_EQ(token->fps, 120);
+      EXPECT_TRUE(token->enable_hdr);
+      EXPECT_EQ(token->source, original.source);
+      EXPECT_EQ(token->source_generation, first->source_generation);
+      EXPECT_EQ(rtsp_stream::source_snapshot().request, original.request);
+      EXPECT_EQ(rtsp_stream::source_snapshot().media_pins, 1U);
+      EXPECT_TRUE(rtsp_stream::test_support::token_authorized(first));
+      rtsp_stream::launch_session_clear(token->id);
+    }
+    EXPECT_EQ(backend->requests(), initial_requests);
+    EXPECT_EQ(backend->probes, 1);
+
+    rtsp_stream::test_support::release_media(first);
+    release_viewer.disable();
+    ASSERT_TRUE(wait_for_source([](const auto &source) {
+      return source.retained;
+    }));
+    const auto resumed = read_response(*begin_request("/resume" + join_args + "&virtualDisplay=0", true));
+    ASSERT_TRUE(resumed.contains("status_code=\"200\"")) << resumed;
+    const auto retained = rtsp_stream::source_snapshot();
+    ASSERT_TRUE(retained.source);
+    EXPECT_EQ(retained.request, original.request);
+    EXPECT_EQ(retained.source->kind, original.source->kind);
+    EXPECT_EQ(retained.source->generation, original.source->generation);
+    EXPECT_NE(retained.source->epoch, original.source->epoch);
+    EXPECT_EQ(backend->requests(), initial_requests);
+    EXPECT_EQ(backend->probes, 2);
+    EXPECT_EQ(executes->load(), 0);
+    EXPECT_EQ(proc::proc.lifetime_snapshot().instance, a_instance);
+    EXPECT_EQ(undo_count->load(), 0);
+  }
 
   TEST_F(ManagedHttpsProcessTest, RemovedSelectedAppBeforeExecutePreservesOriginalIncarnationAndUndo) {
     std::promise<void> release;
