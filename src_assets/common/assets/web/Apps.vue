@@ -11,9 +11,13 @@
       <!-- Left side actions -->
       <div class="d-flex align-items-center gap-2">
         <!-- Add new application -->
-        <button class="btn btn-primary" @click="newApp">
+        <button ref="addAppButton" class="btn btn-primary" :disabled="appMutationsBlocked" @click="newApp">
           <layers-plus :size="18" class="icon"></layers-plus>
           {{ $t('apps.add_new') }}
+        </button>
+        <button v-if="apps.length >= 2" ref="reorderAppsButton" class="btn btn-outline-secondary text-nowrap" type="button"
+                :disabled="!canReorderApps" @click="openOrderDialog">
+          {{ $t('apps.reorder_apps') }}
         </button>
       </div>
       <!-- Right side actions -->
@@ -44,6 +48,13 @@
 
     <!-- Apps Grid -->
     <div v-if="catalogError" class="alert alert-danger">{{ catalogError }}</div>
+    <div v-if="orderReloadMessage && !orderDraft" class="alert alert-warning d-flex flex-wrap align-items-center gap-2" role="alert">
+      <span>{{ $t(orderReloadMessage) }}</span>
+      <button ref="reloadOrderApps" class="btn btn-outline-secondary" type="button"
+              :disabled="orderBusy" @click="reloadOrderCatalog">
+        {{ $t(orderBusy ? '_common.loading' : 'apps.reorder_reload_apps') }}
+      </button>
+    </div>
     <p v-if="displayedApps.length && !shortcutHost" class="small text-muted">{{ $t('apps.artemis_host_unavailable') }}</p>
     <p v-else-if="displayedApps.some(row => row.shortcut)" class="small text-muted">{{ $t('apps.artemis_stop_help') }}</p>
     <div class="row g-3" v-if="displayedApps.length > 0">
@@ -52,7 +63,7 @@
           <div class="app-poster-container">
             <img
               v-if="app['image-path']"
-              :src="'/api/covers/' + index"
+              :src="'/api/covers/' + app.uuid"
               class="app-poster"
               :alt="app.name"
               @error="handleImageError"
@@ -88,11 +99,11 @@
             </div>
             <p v-else-if="shortcutHost" class="small text-muted mb-2">{{ $t('apps.artemis_app_unavailable') }}</p>
             <div class="mt-auto d-flex gap-2">
-              <button class="btn btn-sm btn-primary flex-fill" @click="editApp(index)">
+              <button class="btn btn-sm btn-primary flex-fill" :disabled="appMutationsBlocked" @click="editApp(index)">
                 <edit :size="16" class="icon"></edit>
                 {{ $t('apps.edit') }}
               </button>
-              <button class="btn btn-sm btn-danger" @click="showDeleteModal(index)">
+              <button class="btn btn-sm btn-danger" :disabled="appMutationsBlocked" @click="showDeleteModal(index)">
                 <trash-2 :size="16" class="icon"></trash-2>
               </button>
             </div>
@@ -114,6 +125,56 @@
         <p class="text-muted">{{ $t('apps.no_applications') }}</p>
       </div>
     </div>
+
+    <dialog ref="orderDialog" class="app-order-dialog p-0 border rounded bg-body text-body shadow"
+            aria-labelledby="appOrderTitle" @cancel.prevent="closeOrderDialog">
+      <form v-if="orderDraft" class="d-flex flex-column" @submit.prevent="saveAppOrder">
+        <div class="p-3 border-bottom">
+          <h2 id="appOrderTitle" class="h5 mb-0" tabindex="-1" autofocus>{{ $t('apps.reorder_apps') }}</h2>
+        </div>
+        <div class="p-3 overflow-auto">
+          <div v-if="orderError || (orderReloadMessage && !orderBusy)" class="alert alert-danger" role="alert">
+            {{ orderError || $t(orderReloadMessage) }}
+          </div>
+          <ol class="list-group list-group-numbered" role="list">
+            <li v-for="(row, index) in orderDraft.rows" :key="row.uuid"
+                class="list-group-item d-flex align-items-center gap-2">
+              <div class="flex-grow-1 text-break">
+                <div>{{ row.name }}</div>
+                <code v-if="orderDraft.nameCounts.get(row.name) > 1" class="small">{{ row.uuid }}</code>
+              </div>
+              <div class="btn-group flex-shrink-0">
+                <button class="btn btn-sm btn-outline-secondary" type="button"
+                        :aria-label="$t('apps.reorder_move_up', { name: row.name, position: index + 1 })"
+                        :disabled="index === 0 || orderBusy || !!orderReloadMessage"
+                        @click="moveOrderApp(index, -1, $event.currentTarget)">
+                  <arrow-up :size="16" class="icon" aria-hidden="true"></arrow-up>
+                </button>
+                <button class="btn btn-sm btn-outline-secondary" type="button"
+                        :aria-label="$t('apps.reorder_move_down', { name: row.name, position: index + 1 })"
+                        :disabled="index === orderDraft.rows.length - 1 || orderBusy || !!orderReloadMessage"
+                        @click="moveOrderApp(index, 1, $event.currentTarget)">
+                  <arrow-down :size="16" class="icon" aria-hidden="true"></arrow-down>
+                </button>
+              </div>
+            </li>
+          </ol>
+        </div>
+        <div class="d-flex justify-content-end gap-2 p-3 border-top">
+          <button class="btn btn-secondary" type="button" :disabled="orderBusy" @click="closeOrderDialog">
+            {{ $t('_common.cancel') }}
+          </button>
+          <button v-if="orderReloadMessage" class="btn btn-primary" type="button"
+                  :disabled="orderBusy" @click="reloadOrderCatalog">
+            {{ $t(orderBusy ? '_common.loading' : 'apps.reorder_reload_apps') }}
+          </button>
+          <button v-else class="btn btn-primary" type="submit"
+                  :disabled="!orderChanged || orderBusy || !catalogCurrent">
+            {{ $t(orderBusy ? 'apps.reorder_saving' : '_common.save') }}
+          </button>
+        </div>
+      </form>
+    </dialog>
 
     <!-- Edit / Add Application modal -->
     <div class="modal fade" ref="editModal" tabindex="-1" aria-labelledby="appEditModalLabel"
@@ -723,6 +784,12 @@
         catalogRevision: "",
         catalogError: "",
         catalogRequest: null,
+        catalogCurrent: false,
+        catalogWriting: false,
+        orderDraft: null,
+        orderBusy: false,
+        orderError: "",
+        orderReloadMessage: "",
         shortcutHost: null,
         deleteError: "",
         version: null,
@@ -739,6 +806,18 @@
       documentationBaseUrl() {
         const docsVersion = this.installedVersionNotStable ? 'master' : 'latest'
         return `https://docs.lizardbyte.dev/projects/sunshine/${docsVersion}`
+      },
+      canReorderApps() {
+        return this.catalogCurrent && typeof this.catalogRevision === 'string' && !!this.catalogRevision &&
+          this.apps.length >= 2 && this.apps.every(app => isArtemisUuid(app.uuid)) &&
+          !this.catalogWriting && !this.coverFinderBusy && !this.orderReloadMessage;
+      },
+      appMutationsBlocked() {
+        return !!(this.orderDraft || this.orderReloadMessage);
+      },
+      orderChanged() {
+        const draft = this.orderDraft;
+        return !!draft && draft.rows.some((row, index) => row.uuid !== draft.initialOrder[index]);
       },
       displayedApps() {
         let list = this.apps.map((app, index) => ({ app, index }));
@@ -813,8 +892,15 @@
         .then((r) => this.githubVersion = new SunshineVersion(r, null))
         .catch((e) => console.error(e));
     },
+    beforeUnmount() {
+      this.catalogRequest = null;
+      this.orderBusy = false;
+      this.orderDraft = null;
+      if (this.$refs.orderDialog.open) this.$refs.orderDialog.close();
+    },
     methods: {
       newApp() {
+        if (this.appMutationsBlocked) return;
         this.editForm = {
           name: "",
           output: "",
@@ -834,6 +920,7 @@
         this.openEditModal();
       },
       editApp(id) {
+        if (this.appMutationsBlocked) return;
         this.editForm = structuredClone(toRaw(this.apps[id]));
         this.editForm.index = id;
         if (this.editForm["force-virtual-display"] === undefined) {
@@ -861,10 +948,11 @@
         this.openEditModal();
       },
       showDeleteModal(id) {
+        if (this.appMutationsBlocked) return;
         this.deleteTarget = { uuid: this.apps[id].uuid, name: this.apps[id].name };
         this.deleteError = "";
         this.$nextTick(() => {
-          Modal.getOrCreateInstance(this.$refs.deleteModal).show();
+          if (!this.appMutationsBlocked) Modal.getOrCreateInstance(this.$refs.deleteModal).show();
         });
       },
       closeDeleteModal() {
@@ -874,12 +962,13 @@
       async loadApps() {
         const request = Symbol();
         this.catalogRequest = request;
+        this.catalogCurrent = false;
         this.catalogError = "";
         this.shortcutHost = null;
         try {
-          const response = await fetch("./api/apps");
+          const response = await fetch("./api/apps", { cache: 'no-store' });
           const result = await response.json();
-          if (this.catalogRequest !== request) return;
+          if (this.catalogRequest !== request) return false;
           if (!response.ok || result.status === false || !Array.isArray(result.apps)) {
             throw new Error(result.error || this.$t("apps.catalog_error"));
           }
@@ -888,10 +977,97 @@
           if (isArtemisUuid(result.host_uuid)) {
             this.shortcutHost = { uuid: result.host_uuid, name: result.host_name };
           }
+          this.catalogCurrent = true;
+          return true;
         } catch (error) {
           if (this.catalogRequest === request) {
             this.catalogError = error.message || this.$t("apps.catalog_error");
           }
+          return false;
+        } finally {
+          if (this.catalogRequest === request) this.catalogRequest = null;
+        }
+      },
+      openOrderDialog() {
+        if (this.orderDraft || !this.canReorderApps) return;
+
+        const rows = this.apps.map(({ name, uuid }) => ({ name: name || this.$t('apps.reorder_unnamed_app'), uuid }));
+        const nameCounts = new Map();
+        for (const { name } of rows) nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+        this.orderDraft = { rows, nameCounts, initialOrder: rows.map(row => row.uuid), revision: this.catalogRevision };
+        this.orderError = "";
+        const draft = this.orderDraft;
+        this.$nextTick(() => {
+          if (this.orderDraft === draft) this.$refs.orderDialog.showModal();
+        });
+      },
+      closeOrderDialog() {
+        if (this.orderBusy || !this.orderDraft) return;
+        this.$refs.orderDialog.close();
+        this.orderDraft = null;
+        this.restoreOrderFocus();
+      },
+      restoreOrderFocus() {
+        this.$nextTick(() => {
+          if (this.orderDraft) return;
+          const reorder = this.$refs.reorderAppsButton;
+          const button = this.$refs.reloadOrderApps ?? (reorder?.disabled === false ? reorder : this.$refs.addAppButton);
+          button?.focus();
+        });
+      },
+      moveOrderApp(index, offset, button) {
+        const draft = this.orderDraft;
+        if (!draft || this.orderBusy || this.orderReloadMessage) return;
+        const target = index + offset;
+        if (target < 0 || target >= draft.rows.length) return;
+
+        const [row] = draft.rows.splice(index, 1);
+        draft.rows.splice(target, 0, row);
+        this.$nextTick(() => {
+          if (this.orderDraft !== draft) return;
+          const focusButton = button.disabled ? (button.previousElementSibling ?? button.nextElementSibling) : button;
+          focusButton.focus();
+        });
+      },
+      async reloadOrderCatalog() {
+        if (this.orderBusy) return;
+        this.orderBusy = true;
+        const loaded = await this.loadApps();
+        if (!this.orderBusy) return;
+        this.orderBusy = false;
+        if (loaded) {
+          this.orderReloadMessage = "";
+          if (this.orderDraft) this.closeOrderDialog();
+          else this.restoreOrderFocus();
+        }
+      },
+      async saveAppOrder() {
+        if (!this.orderChanged || this.orderBusy || !this.catalogCurrent || this.orderReloadMessage) return;
+        const draft = this.orderDraft;
+        this.orderBusy = true;
+        this.orderError = "";
+        const response = await apiFetch('./api/apps/order', {
+          method: 'PUT',
+          redirect: 'error',
+          headers: {
+            'Content-Type': 'application/json',
+            'If-Match': draft.revision,
+          },
+          body: JSON.stringify({ order: draft.rows.map(row => row.uuid) }),
+        }).catch(() => null);
+        if (this.orderDraft !== draft) return;
+
+        this.orderBusy = false;
+        // An intermediary can return an error after the host committed the order.
+        if (!response || response.status === 408 || response.status >= 500) {
+          this.orderReloadMessage = 'apps.reorder_unknown';
+        } else if (response.status === 200) {
+          this.orderReloadMessage = 'apps.reorder_saved_reload';
+          await this.reloadOrderCatalog();
+        } else if (response.status === 409) {
+          this.orderReloadMessage = 'apps.reorder_conflict';
+        } else {
+          this.orderError = this.$t('apps.reorder_error', { status: response.status });
         }
       },
       downloadArtemisShortcut(app) {
@@ -913,6 +1089,8 @@
         }
       },
       async confirmDelete() {
+        if (this.appMutationsBlocked || this.catalogWriting) return;
+        this.catalogWriting = true;
         this.deleteError = "";
         try {
           const response = await apiFetch("./api/apps/" + this.deleteTarget.uuid, {
@@ -929,6 +1107,8 @@
           document.location.reload();
         } catch (error) {
           this.deleteError = error.message || this.$t("apps.catalog_error");
+        } finally {
+          this.catalogWriting = false;
         }
       },
       addPrepCmd() {
@@ -971,6 +1151,7 @@
           .finally(() => this.coverSearching = false);
       },
       useCover(cover) {
+        if (this.appMutationsBlocked) return;
         this.coverFinderBusy = true;
         apiFetch("./api/covers/upload", {
           method: "POST",
@@ -1094,6 +1275,7 @@
         });
       },
       async save() {
+        if (this.appMutationsBlocked || this.catalogWriting) return;
         this.editFormError = "";
         this.editForm["image-path"] = this.editForm["image-path"].toString().replaceAll('"', '');
 
@@ -1105,6 +1287,7 @@
           return;
         }
 
+        this.catalogWriting = true;
         try {
           const response = await apiFetch("./api/apps", {
             method: "POST",
@@ -1121,6 +1304,8 @@
           document.location.reload();
         } catch (error) {
           this.editFormError = error.message || this.$t("apps.catalog_error");
+        } finally {
+          this.catalogWriting = false;
         }
       },
       handleImageError(event) {
@@ -1146,7 +1331,7 @@
       openEditModal() {
         // Use $nextTick because if the edit version of the modal is created too early, it breaks...
         this.$nextTick(() => {
-          Modal.getOrCreateInstance(this.$refs.editModal).show();
+          if (!this.appMutationsBlocked) Modal.getOrCreateInstance(this.$refs.editModal).show();
         });
       },
       closeEditModal() {
@@ -1172,3 +1357,17 @@
     },
   }
 </script>
+
+<style scoped>
+  .app-order-dialog {
+    width: min(36rem, calc(100% - 2rem));
+  }
+
+  .app-order-dialog form {
+    max-height: calc(100dvh - 2rem - 2px);
+  }
+
+  .app-order-dialog::backdrop {
+    background: rgb(0 0 0 / 50%);
+  }
+</style>
