@@ -878,7 +878,7 @@ TEST_F(PairingHttpHandlerTest, OneTimeSignedHandshakePersistsExactlyTwoZeroGrant
   // Use a different common name so hostname verification must match the DNS SAN on every OpenSSL version.
   auto host = crypto::gen_creds("Sunshine OTP fixture host", 2048);
   auto host_certificate = crypto::x509(host.x509);
-  const auto host_key = crypto::pkey(host.pkey);
+  auto host_key = crypto::pkey(host.pkey);
   ASSERT_TRUE(host_certificate);
   ASSERT_TRUE(host_key);
   util::safe_ptr<X509_EXTENSION, &X509_EXTENSION_free> localhost_san {
