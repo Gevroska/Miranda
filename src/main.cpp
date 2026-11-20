@@ -477,6 +477,8 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  nvhttp::initialize_state();
+
   std::unique_ptr<platf::deinit_t> mDNS;
   auto sync_mDNS = std::async(std::launch::async, [&mDNS]() {
     mDNS = platf::publish::start();

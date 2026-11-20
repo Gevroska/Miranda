@@ -125,7 +125,7 @@ jobs:
 
             # fix git safe.directory issues
             git config --global --add safe.directory "*"
-          sync: nfs  # sshfs is used for build-deps; however it's much slower than nfs
+          sync: rsync  # Use the guest filesystem for advisory directory locks in host identity tests.
 
       - name: Configure
         shell: freebsd {0}

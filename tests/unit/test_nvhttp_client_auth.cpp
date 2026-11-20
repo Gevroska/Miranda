@@ -8,11 +8,15 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <memory>
+#include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -28,13 +32,20 @@
   #include <WinSock2.h>
   #include <Windows.h>
 // clang-format on
+#else
+  #include <fcntl.h>
+  #include <sys/file.h>
+  #include <unistd.h>
 #endif
 
 // local includes
+#include <src/app_catalog.h>
 #include <src/config.h>
 #include <src/httpcommon.h>
 #include <src/nvhttp.h>
 #include <src/rtsp.h>
+#include <src/utility.h>
+#include <src/uuid.h>
 
 namespace fs = std::filesystem;
 
@@ -53,6 +64,7 @@ protected:
     drain_owner(rtsp_stream::test_support::start_owner());
     original_state_file = config::nvhttp.file_state;
     original_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    original_host_id = http::unique_id;
     state_file = fs::path {SUNSHINE_TEST_BIN_DIR} / "client_authorization_state.json";
 
     config::nvhttp.file_state = state_file.string();
@@ -68,6 +80,7 @@ protected:
    */
   void TearDown() override {
     http::test_support::set_state_update_hook({});
+    http::test_support::set_state_replace_hook({});
 #ifdef _WIN32
     http::test_support::set_state_file_hook({});
 #endif
@@ -77,6 +90,9 @@ protected:
     fs::remove(state_file, remove_error);
 
     config::nvhttp.file_state = original_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = true;
+    nvhttp::initialize_state();
+    http::unique_id = original_host_id;
     config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
     BaseTest::TearDown();
   }
@@ -91,11 +107,456 @@ protected:
     owner.reset();
   }
 
+  static std::string read_state() {
+    std::ifstream file {config::nvhttp.file_state, std::ios::binary};
+    return {std::istreambuf_iterator<char> {file}, std::istreambuf_iterator<char> {}};
+  }
+
+  static void write_state(std::string_view bytes) {
+    std::ofstream {config::nvhttp.file_state, std::ios::binary} << bytes;
+  }
+
 private:
   fs::path state_file;  ///< Task-specific persisted state fixture.
   std::string original_state_file;  ///< State-file setting restored after each test.
+  std::string original_host_id;  ///< Previous GameStream identifier restored after each test.
   bool original_fresh_state;  ///< Fresh-state flag restored after each test.
 };
+
+TEST_F(ClientAuthorizationTest, MissingHostUuidPersistsBeforePairingAndSurvivesRestart) {
+  ASSERT_FALSE(fs::exists(config::nvhttp.file_state));
+
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  const auto first_id = http::unique_id;
+  EXPECT_EQ(*nvhttp::shortcut_host_uuid(), first_id);
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+  const auto bytes = read_state();
+  const nlohmann::json expected {{"root", {{"uniqueid", first_id}}}};
+  EXPECT_EQ(nlohmann::json::parse(bytes), expected);
+
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(*nvhttp::shortcut_host_uuid(), first_id);
+  EXPECT_EQ(http::unique_id, first_id);
+  EXPECT_EQ(read_state(), bytes);
+}
+
+TEST_F(ClientAuthorizationTest, ReadOnlyHostIdentityPreservesExactBytesAndCase) {
+  constexpr std::string_view id = "aB123456-ABcd-4111-8222-00EF12345678";
+  const auto bytes = std::string {"  { \"root\": { \"uniqueid\": \""} + std::string {id} + "\" } }  \n";
+  write_state(bytes);
+  const fs::path path {config::nvhttp.file_state};
+#ifdef _WIN32
+  const auto attributes = GetFileAttributesW(path.c_str());
+  ASSERT_NE(attributes, INVALID_FILE_ATTRIBUTES);
+  ASSERT_NE(SetFileAttributesW(path.c_str(), attributes | FILE_ATTRIBUTE_READONLY), FALSE);
+  const auto restore = util::fail_guard([&]() {
+    EXPECT_NE(SetFileAttributesW(path.c_str(), attributes), FALSE);
+  });
+#else
+  const auto permissions = fs::status(path).permissions();
+  fs::permissions(path, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write, fs::perm_options::remove);
+  const auto restore = util::fail_guard([&]() {
+    std::error_code error;
+    fs::permissions(path, permissions, error);
+    EXPECT_FALSE(error);
+  });
+#endif
+  int writes = 0;
+  http::test_support::set_state_update_hook([&]() {
+    ++writes;
+  });
+
+  nvhttp::initialize_state();
+  http::test_support::set_state_update_hook({});
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(*nvhttp::shortcut_host_uuid(), id);
+  EXPECT_EQ(http::unique_id, id);
+  EXPECT_EQ(read_state(), bytes);
+  EXPECT_EQ(writes, 0);
+}
+
+TEST_F(ClientAuthorizationTest, MissingHostUuidPreservesCredentialsAndExistingPairings) {
+  const auto paired = test_utils::certificates::generate_ca_credentials("Named fixture client");
+  const auto legacy = test_utils::certificates::generate_ca_credentials("Legacy fixture client");
+  const auto uuid = nvhttp::test_support::add_client("named", paired.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  ASSERT_EQ(http::save_user_creds(config::nvhttp.file_state, "fixture administrator", "fixture password"), 0);
+  auto original = nlohmann::ordered_json::parse(read_state());
+  original["foreign"] = nlohmann::ordered_json::parse(R"([null,false,[],{"nested":9007199254740993}])");
+  original["root"]["foreign"] = "root value";
+  original["root"]["named_devices"][0]["foreign"] = nlohmann::ordered_json::array({true, 2.5});
+  original["root"]["devices"] = nlohmann::ordered_json::array({{{"uniqueid", "legacy"}, {"certs", nlohmann::ordered_json::array({legacy.x509})}}});
+  original["root"].erase("uniqueid");
+  write_state(original.dump());
+  nvhttp::test_support::reset_client_state();
+
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  auto saved = nlohmann::ordered_json::parse(read_state());
+  EXPECT_EQ(saved["root"]["uniqueid"], http::unique_id);
+  saved["root"].erase("uniqueid");
+  EXPECT_TRUE(saved == original);
+  const auto client = nvhttp::current_client(uuid, paired.x509);
+  ASSERT_TRUE(client);
+  EXPECT_EQ(client->permissions, permissions::view);
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(legacy.x509));
+}
+
+TEST_F(ClientAuthorizationTest, MissingHostUuidPreservesCredentialOnlyState) {
+  ASSERT_EQ(http::save_user_creds(config::nvhttp.file_state, "fixture administrator", "fixture password"), 0);
+  const auto original = nlohmann::ordered_json::parse(read_state());
+  ASSERT_FALSE(original.contains("root"));
+
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  auto saved = nlohmann::ordered_json::parse(read_state());
+  EXPECT_EQ(saved["root"], (nlohmann::ordered_json {{"uniqueid", http::unique_id}}));
+  saved.erase("root");
+  EXPECT_TRUE(saved == original);
+}
+
+TEST_F(ClientAuthorizationTest, HostIdentityBootstrapAcceptsLegacyEmptyDeviceCollection) {
+  write_state(R"({"root":{"named_devices":"","devices":"","foreign":true}})");
+
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  const auto saved = nlohmann::ordered_json::parse(read_state());
+  EXPECT_EQ(saved["root"]["uniqueid"], http::unique_id);
+  EXPECT_EQ(saved["root"]["named_devices"], "");
+  EXPECT_EQ(saved["root"]["devices"], "");
+  EXPECT_TRUE(saved["root"]["foreign"].get<bool>());
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+}
+
+#ifndef _WIN32
+TEST_F(ClientAuthorizationTest, ReadOnlyCredentialStateKeepsItsBytesAndAnEphemeralHostIdentity) {
+  constexpr std::string_view original = R"({"username":"fixture","salt":"fixture","password":"fixture","foreign":true})";
+  write_state(original);
+  const fs::path path {config::nvhttp.file_state};
+  fs::permissions(path, fs::perms::owner_read);
+  bool prepared_temporary = false;
+  http::test_support::set_state_update_hook([&]() {
+    prepared_temporary = true;
+  });
+
+  nvhttp::initialize_state();
+  http::test_support::set_state_update_hook({});
+  EXPECT_TRUE(proc::catalog::canonical_uuid(http::unique_id));
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_FALSE(prepared_temporary);
+  EXPECT_TRUE(read_state() == original);
+  EXPECT_EQ(fs::status(path).permissions(), fs::perms::owner_read);
+}
+#endif
+
+TEST_F(ClientAuthorizationTest, InvalidHostStateAndFreshStateLeaveShortcutsUnavailable) {
+  for (const auto bytes : {
+         "",
+         "{",
+         R"({"root":[]})",
+         R"({"root":{"uniqueid":null}})",
+         R"({"root":{"uniqueid":"aB123456-ABcd-4111-8222-00EF1234567G"}})"
+       }) {
+    SCOPED_TRACE(bytes);
+    write_state(bytes);
+    nvhttp::initialize_state();
+    EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+    EXPECT_EQ(read_state(), bytes);
+  }
+  EXPECT_EQ(http::unique_id, "aB123456-ABcd-4111-8222-00EF1234567G");
+
+  constexpr std::string_view ordinary = R"({"root":{"uniqueid":"aB123456-ABcd-4111-8222-00EF12345678"}})";
+  write_state(ordinary);
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  config::sunshine.flags[config::flag::FRESH_STATE] = true;
+  http::unique_id = "14a88f00-5a44-4e23-a562-9c50e16fec9f";
+  nvhttp::initialize_state();
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(http::unique_id, "14a88f00-5a44-4e23-a562-9c50e16fec9f");
+  EXPECT_EQ(read_state(), ordinary);
+
+  config::sunshine.flags[config::flag::FRESH_STATE] = false;
+  ASSERT_TRUE(fs::remove(config::nvhttp.file_state));
+  ASSERT_TRUE(fs::create_directory(config::nvhttp.file_state));
+  nvhttp::initialize_state();
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_TRUE(fs::is_directory(config::nvhttp.file_state));
+}
+
+TEST_F(ClientAuthorizationTest, InvalidPairingStateKeepsOriginalBytesAndUsesAnEphemeralIdentity) {
+  for (const auto bytes : {
+         R"({"root":{"named_devices":false}})",
+         R"({"root":{"named_devices":{}}})",
+         R"({"root":{"named_devices":[{"name":"incomplete"}]}})"
+       }) {
+    SCOPED_TRACE(bytes);
+    write_state(bytes);
+    nvhttp::initialize_state();
+    EXPECT_TRUE(proc::catalog::canonical_uuid(http::unique_id));
+    EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+    EXPECT_EQ(read_state(), bytes);
+    EXPECT_TRUE(nvhttp::get_all_clients().empty());
+  }
+}
+
+TEST_F(ClientAuthorizationTest, MiskeyedPairingCollectionCannotRestoreAuthority) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Malformed collection fixture");
+  constexpr auto uuid = "42bded4a-4c4e-45b2-9e07-58c2f20e7cee";
+  const nlohmann::ordered_json device {
+    {"name", "Synthetic client"},
+    {"cert", credentials.x509},
+    {"uuid", uuid},
+    {"enabled", "true"},
+    {"permissions", std::to_string(permissions::launch)},
+  };
+  const auto bytes = nlohmann::ordered_json {{"root", {{"named_devices", {{"miskeyed", device}}}}}}.dump();
+  write_state(bytes);
+
+  nvhttp::initialize_state();
+  EXPECT_TRUE(proc::catalog::canonical_uuid(http::unique_id));
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+  EXPECT_FALSE(nvhttp::current_client(uuid, credentials.x509));
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+  EXPECT_TRUE(read_state() == bytes);
+}
+
+TEST_F(ClientAuthorizationTest, IdlessPairingMigrationValidatesEnableFlagsAndGrantMasks) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Enable flag fixture");
+  constexpr auto uuid = "4d5a49eb-1ee7-4611-8400-382a16681826";
+  nlohmann::ordered_json device {
+    {"name", "Synthetic client"},
+    {"cert", credentials.x509},
+    {"uuid", uuid},
+    {"permissions", std::to_string(permissions::launch)},
+  };
+  const auto state = [&]() {
+    return nlohmann::ordered_json {{"root", {{"named_devices", nlohmann::ordered_json::array({device})}}}};
+  };
+  const auto expect_refused = [&]() {
+    const auto bytes = state().dump();
+    write_state(bytes);
+
+    nvhttp::initialize_state();
+    EXPECT_TRUE(proc::catalog::canonical_uuid(http::unique_id));
+    EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+    EXPECT_TRUE(nvhttp::get_all_clients().empty());
+    EXPECT_FALSE(nvhttp::current_client(uuid, credentials.x509));
+    EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+    EXPECT_TRUE(read_state() == bytes);
+  };
+  for (const auto enabled : {R"("invalid")", "null", "{}", "2", R"("2true")", R"("2 true")", R"(["true"])"}) {
+    SCOPED_TRACE(enabled);
+    device["enabled"] = nlohmann::ordered_json::parse(enabled);
+    expect_refused();
+  }
+
+  device.erase("enabled");
+  for (const auto grant : {"{}", "65536"}) {
+    SCOPED_TRACE(grant);
+    device["permissions"] = nlohmann::ordered_json::parse(grant);
+    expect_refused();
+  }
+  device["permissions"] = std::to_string(permissions::launch);
+  for (const auto disabled : {"false", "0", R"("false")", R"("0")"}) {
+    SCOPED_TRACE(disabled);
+    device["enabled"] = nlohmann::ordered_json::parse(disabled);
+    const auto original = state();
+    write_state(original.dump());
+    nvhttp::initialize_state();
+    ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+    EXPECT_FALSE(nvhttp::current_client(uuid, credentials.x509));
+    EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+    const auto saved = nvhttp::get_all_clients();
+    ASSERT_EQ(saved.size(), 1U);
+    EXPECT_EQ(saved[0]["enabled"], false);
+    EXPECT_EQ(saved[0]["permissions"], permissions::launch);
+    auto committed = nlohmann::ordered_json::parse(read_state());
+    committed["root"].erase("uniqueid");
+    EXPECT_TRUE(committed == original);
+  }
+
+  device.erase("enabled");
+  const auto legacy = state();
+  write_state(legacy.dump());
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  const auto client = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(client);
+  EXPECT_EQ(client->permissions, permissions::launch);
+  auto committed = nlohmann::ordered_json::parse(read_state());
+  committed["root"].erase("uniqueid");
+  EXPECT_TRUE(committed == legacy);
+}
+
+TEST_F(ClientAuthorizationTest, IdentifiedHostKeepsMalformedEnableFlagVisibleButDeniesClientAuthority) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Identified host enable flag fixture");
+  constexpr auto host_uuid = "aB123456-ABcd-4111-8222-00EF12345678";
+  constexpr auto client_uuid = "4d5a49eb-1ee7-4611-8400-382a16681826";
+  const nlohmann::ordered_json device {
+    {"name", "Synthetic client"},
+    {"cert", credentials.x509},
+    {"uuid", client_uuid},
+    {"enabled", "2true"},
+    {"permissions", std::to_string(permissions::launch)},
+  };
+  const auto bytes = nlohmann::ordered_json {{"root", {{"uniqueid", host_uuid}, {"named_devices", nlohmann::ordered_json::array({device})}}}}.dump();
+  write_state(bytes);
+
+  nvhttp::initialize_state();
+  ASSERT_TRUE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(*nvhttp::shortcut_host_uuid(), host_uuid);
+  EXPECT_EQ(http::unique_id, host_uuid);
+  EXPECT_TRUE(read_state() == bytes);
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+  EXPECT_FALSE(nvhttp::current_client(client_uuid, credentials.x509));
+  EXPECT_FALSE(rtsp_stream::authorize_operation(client_uuid, credentials.x509, permissions::launch, []() {
+    ADD_FAILURE() << "Disabled client ran an operation";
+  }));
+  const auto clients = nvhttp::get_all_clients();
+  ASSERT_EQ(clients.size(), 1U);
+  EXPECT_EQ(clients[0]["uuid"], client_uuid);
+  EXPECT_EQ(clients[0]["enabled"], false);
+  EXPECT_EQ(clients[0]["permissions"], permissions::launch);
+}
+
+TEST_F(ClientAuthorizationTest, MiskeyedLegacyCertificateCollectionsCannotRestoreAnIdlessPairing) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Legacy collection fixture");
+  const auto valid_certs = nlohmann::ordered_json::array({credentials.x509});
+  const nlohmann::ordered_json keyed_certs {{"miskeyed", credentials.x509}};
+  const nlohmann::ordered_json legacy_device {{"uniqueid", "legacy device"}, {"certs", valid_certs}};
+  const std::array malformed {
+    nlohmann::ordered_json {{"miskeyed", legacy_device}},
+    nlohmann::ordered_json::array({{{"uniqueid", "legacy device"}, {"certs", keyed_certs}}}),
+  };
+  for (const auto &devices : malformed) {
+    const auto bytes = nlohmann::ordered_json {{"root", {{"devices", devices}}}}.dump();
+    write_state(bytes);
+
+    nvhttp::initialize_state();
+    EXPECT_TRUE(proc::catalog::canonical_uuid(http::unique_id));
+    EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+    EXPECT_TRUE(nvhttp::get_all_clients().empty());
+    EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+    EXPECT_TRUE(read_state() == bytes);
+  }
+}
+
+TEST_F(ClientAuthorizationTest, RefusedHostIdCommitLeavesStateUnchangedAndGameStreamUsable) {
+  constexpr std::string_view original = R"({"root":{"foreign":true},"other":[2,null]})";
+  write_state(original);
+  http::test_support::set_state_update_hook([]() {
+    throw std::runtime_error {"fixture refusal before replacement"};
+  });
+
+  nvhttp::initialize_state();
+  http::test_support::set_state_update_hook({});
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_FALSE(http::unique_id.empty());
+  EXPECT_EQ(read_state(), original);
+}
+
+TEST_F(ClientAuthorizationTest, ConcurrentlyAppearingHostIdentityIsNeverOverwritten) {
+  const auto directory = fs::path {SUNSHINE_TEST_BIN_DIR} / ("host-id-race-" + uuid_util::uuid_t::generate().string());
+  ASSERT_TRUE(fs::create_directory(directory));
+  const auto previous_state_file = std::exchange(config::nvhttp.file_state, (directory / "state.json").string());
+  const auto cleanup = util::fail_guard([&]() {
+    config::nvhttp.file_state = previous_state_file;
+    std::error_code error;
+    fs::remove_all(directory, error);
+    EXPECT_FALSE(error);
+  });
+
+  constexpr std::string_view committed_id = "aB123456-ABcd-4111-8222-00EF12345678";
+  const auto concurrent = nlohmann::ordered_json {{"root", {{"uniqueid", committed_id}}}, {"foreign", true}}.dump();
+  ASSERT_FALSE(fs::exists(config::nvhttp.file_state));
+#ifdef _WIN32
+  http::test_support::set_state_update_hook([&]() {
+    write_state(concurrent);
+  });
+#else
+  http::test_support::set_state_replace_hook([&](const auto &, const auto &, const auto &) -> std::optional<std::uint32_t> {
+    write_state(concurrent);
+    return std::nullopt;
+  });
+#endif
+
+  nvhttp::initialize_state();
+  http::test_support::set_state_update_hook({});
+  http::test_support::set_state_replace_hook({});
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(http::unique_id, committed_id);
+  EXPECT_EQ(read_state(), concurrent);
+
+#ifdef _WIN32
+  // Windows blocks further protected operations on this pathname for the life of the process.
+  nvhttp::initialize_state();
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(http::unique_id, committed_id);
+  EXPECT_EQ(read_state(), concurrent);
+#endif
+}
+
+TEST_F(ClientAuthorizationTest, NondurableStartupCannotSaveOverAnotherHostIdentityOrItsAuthority) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Competing host identity fixture");
+  constexpr auto client_uuid = "4d5a49eb-1ee7-4611-8400-382a16681826";
+  const nlohmann::ordered_json device {
+    {"name", "Synthetic client"},
+    {"cert", credentials.x509},
+    {"uuid", client_uuid},
+    {"enabled", true},
+    {"permissions", permissions::view},
+  };
+  auto document = nlohmann::ordered_json {{"root", {{"named_devices", nlohmann::ordered_json::array({device})}}}, {"foreign", true}};
+  const auto idless_bytes = document.dump();
+  write_state(idless_bytes);
+  http::test_support::set_state_update_hook([]() {
+    throw std::runtime_error {"fixture unavailable startup commit"};
+  });
+  nvhttp::initialize_state();
+  http::test_support::set_state_update_hook({});
+  ASSERT_FALSE(nvhttp::shortcut_host_uuid());
+  ASSERT_TRUE(proc::catalog::canonical_uuid(http::unique_id));
+  const auto before = nvhttp::current_client(client_uuid, credentials.x509);
+  ASSERT_TRUE(before);
+  ASSERT_EQ(before->permissions, permissions::view);
+
+#ifndef _WIN32
+  {
+    const auto parent = fs::path {config::nvhttp.file_state}.parent_path();
+    const auto contender = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(contender, 0);
+    const auto close = util::fail_guard([&]() {
+      ::close(contender);
+    });
+    ASSERT_EQ(::flock(contender, LOCK_EX | LOCK_NB), 0);
+    EXPECT_FALSE(nvhttp::update_client(client_uuid, std::nullopt, permissions::launch));
+    EXPECT_TRUE(read_state() == idless_bytes);
+    const auto during = nvhttp::current_client(client_uuid, credentials.x509);
+    ASSERT_TRUE(during);
+    EXPECT_EQ(during->permissions, before->permissions);
+    EXPECT_EQ(during->revision, before->revision);
+  }
+#endif
+
+  constexpr auto winner = "aB123456-ABcd-4111-8222-00EF12345678";
+  ASSERT_NE(http::unique_id, winner);
+  document["root"]["uniqueid"] = winner;
+  const auto committed = document.dump();
+  write_state(committed);
+  EXPECT_FALSE(nvhttp::update_client(client_uuid, std::nullopt, permissions::launch));
+  EXPECT_FALSE(nvhttp::unpair_client(client_uuid));
+  const auto after = nvhttp::current_client(client_uuid, credentials.x509);
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->permissions, before->permissions);
+  EXPECT_EQ(after->revision, before->revision);
+  EXPECT_TRUE(read_state() == committed);
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+}
 
 TEST_F(ClientAuthorizationTest, CanonicalIdentityFailsClosedAndTracksEnableState) {
   const auto paired_credentials = test_utils::certificates::generate_ca_credentials();
@@ -508,6 +969,67 @@ namespace {
   }
 }  // namespace
 
+TEST_F(ClientAuthorizationTest, FreshStateDeviceAdministrationNeverPersistsPairingsOrGrants) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Ephemeral pairing fixture");
+  constexpr auto ordinary_id = "aB123456-ABcd-4111-8222-00EF12345678";
+  constexpr auto ephemeral_id = "14a88f00-5a44-4e23-a562-9c50e16fec9f";
+  constexpr auto ordinary_client = "4d5a49eb-1ee7-4611-8400-382a16681826";
+  const nlohmann::ordered_json named_device {
+    {"name", "Ordinary device"},
+    {"cert", credentials.x509},
+    {"uuid", ordinary_client},
+    {"enabled", "true"},
+    {"permissions", std::to_string(permissions::launch)},
+  };
+  const auto ordinary = nlohmann::ordered_json {{"root", {{"uniqueid", ordinary_id}, {"named_devices", nlohmann::ordered_json::array({named_device})}}}}.dump();
+  write_state(ordinary);
+  config::sunshine.flags[config::flag::FRESH_STATE] = true;
+  http::unique_id = ephemeral_id;
+  nvhttp::initialize_state();
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+  EXPECT_EQ(http::unique_id, ephemeral_id);
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+  EXPECT_FALSE(nvhttp::current_client(ordinary_client, credentials.x509));
+
+  const auto uuid = nvhttp::test_support::add_client("Ephemeral guest", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  const auto paired = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(paired);
+  EXPECT_EQ(paired->permissions, 0U);
+  EXPECT_FALSE(rtsp_stream::authorize_operation(uuid, credentials.x509, permissions::view, []() {
+  }));
+
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, permissions::view));
+  const auto granted = nvhttp::current_client(uuid, credentials.x509);
+  ASSERT_TRUE(granted);
+  EXPECT_GT(granted->revision, paired->revision);
+  EXPECT_EQ(granted->permissions, permissions::view);
+  const auto token = permission_launch(uuid, credentials.x509);
+  ASSERT_EQ(rtsp_stream::prepare_launch(token, []() {
+              return 200;
+            }),
+            200);
+  ASSERT_TRUE(nvhttp::update_client(uuid, std::nullopt, 0U));
+  EXPECT_FALSE(rtsp_stream::test_support::token_authorized(token));
+  EXPECT_FALSE(rtsp_stream::test_support::pending_launch());
+  EXPECT_TRUE(nvhttp::unpair_client(uuid));
+  EXPECT_FALSE(nvhttp::current_client(uuid, credentials.x509));
+
+  ASSERT_FALSE(nvhttp::test_support::add_client("Another ephemeral guest", credentials.x509, true).empty());
+  EXPECT_TRUE(nvhttp::erase_all_clients());
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+  EXPECT_TRUE(read_state() == ordinary);
+  EXPECT_FALSE(nvhttp::shortcut_host_uuid());
+
+  ASSERT_TRUE(fs::remove(config::nvhttp.file_state));
+  const auto absent = nvhttp::test_support::add_client("Ephemeral guest without ordinary state", credentials.x509, true);
+  ASSERT_FALSE(absent.empty());
+  EXPECT_TRUE(nvhttp::update_client(absent, std::nullopt, permissions::view));
+  EXPECT_TRUE(nvhttp::erase_all_clients());
+  EXPECT_FALSE(fs::exists(config::nvhttp.file_state));
+}
+
 TEST_F(ClientAuthorizationTest, DisplayOnlyEditsPreserveAuthorizationRevisionAndPreparedVideoTokens) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
   const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
@@ -743,6 +1265,7 @@ TEST_F(ClientAuthorizationTest, NativePersistenceOutcomesPreserveOrPublishRealAu
 TEST_F(ClientAuthorizationTest, ReservationsFailExplicitlyInvalidateHeldTokensAndClaimAnnounceOnce) {
   const auto credentials = test_utils::certificates::generate_ca_credentials();
   const auto uuid = nvhttp::test_support::add_client("paired", credentials.x509, true);
+  ASSERT_TRUE(nvhttp::current_client(uuid, credentials.x509));
   int prepared = 0;
   auto denied = permission_launch(uuid, credentials.x509);
   EXPECT_EQ(rtsp_stream::prepare_launch(denied, [&]() {
