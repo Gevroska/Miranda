@@ -81,6 +81,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/source_backend.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/source_startup.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/source_startup.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/recovery_storage.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/recovery_storage.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/src/ViGEmClient.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Client.h"
         "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include/ViGEm/Common.h"
@@ -107,9 +109,11 @@ list(PREPEND PLATFORM_LIBRARIES
         minhook::minhook
         ntdll
         setupapi
+        shell32
         shlwapi
         synchronization.lib
         userenv
+        uuid
         ws2_32
         wsock32
 )
